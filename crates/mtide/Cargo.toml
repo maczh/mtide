@@ -1,0 +1,29 @@
+[package]
+name = "mtide"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+crossterm.workspace = true
+mtide-api = { path = "../mtide-api" }
+mtide-core = { path = "../mtide-core" }
+mtide-tui = { path = "../mtide-tui" }
+mtide-workspace = { path = "../mtide-workspace" }
+mtide-syntax = { path = "../mtide-syntax" }
+mtide-term = { path = "../mtide-term" }
+mtide-vt = { path = "../mtide-vt" }
+mtide-task = { path = "../mtide-task" }
+mtide-git = { path = "../mtide-git" }
+mtide-diff = { path = "../mtide-diff" }
+mtide-search = { path = "../mtide-search" }
+signal-hook.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+unicode-segmentation.workspace = true
+unicode-width.workspace = true
+
+[[bin]]
+name = "mtide"
+path = "src/main.rs"

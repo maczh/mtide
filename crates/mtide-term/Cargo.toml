@@ -1,0 +1,12 @@
+[package]
+name = "mtide-term"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+mtide-vt = { path = "../mtide-vt" }
+nix.workspace = true
+thiserror.workspace = true
+
