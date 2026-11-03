@@ -5,6 +5,7 @@ members = [
     "crates/mtide-core",
     "crates/mtide-search",
     "crates/mtide-syntax",
+    "crates/mtide-lsp",
     "crates/mtide-tui",
     "crates/mtide-workspace",
     "crates/mtide-vt",

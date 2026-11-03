@@ -121,14 +121,14 @@ pub fn search_roots_with_options(
         if token.is_cancelled() {
             break;
         }
-        let rules = IgnoreRules::load(root);
+        let mut rules = IgnoreRules::load(root);
         visit(
             root,
             root,
             &matcher,
             options.max_file_bytes,
             token,
-            &rules,
+            &mut rules,
             &mut results,
         )?;
     }
@@ -147,13 +147,13 @@ pub fn find_files(
     token: &CancellationToken,
 ) -> Result<Vec<PathBuf>, SearchError> {
     let mut scored = Vec::new();
-    let rules = IgnoreRules::load(root);
+    let mut rules = IgnoreRules::load(root);
     find_files_inner(
         root,
         root,
         &query.to_lowercase(),
         token,
-        &rules,
+        &mut rules,
         &mut scored,
     )?;
     scored.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
@@ -183,7 +183,7 @@ fn find_files_inner(
     path: &Path,
     query: &str,
     token: &CancellationToken,
-    rules: &IgnoreRules,
+    rules: &mut IgnoreRules,
     results: &mut Vec<(usize, PathBuf)>,
 ) -> Result<(), SearchError> {
     if token.is_cancelled() {
@@ -220,12 +220,14 @@ fn find_files_inner(
             }
             Err(error) => return Err(error.into()),
         };
+        rules.push_dir(path);
         for entry in entries {
             let Ok(entry) = entry else {
                 continue;
             };
             find_files_inner(root, &entry.path(), query, token, rules, results)?;
         }
+        rules.pop_dir(path);
     } else if metadata.is_file() {
         let name = path
             .strip_prefix(root)
@@ -283,7 +285,7 @@ fn visit(
     matcher: &Matcher,
     max_file_bytes: u64,
     token: &CancellationToken,
-    rules: &IgnoreRules,
+    rules: &mut IgnoreRules,
     results: &mut Vec<SearchMatch>,
 ) -> Result<(), SearchError> {
     if token.is_cancelled() {
@@ -320,6 +322,7 @@ fn visit(
             }
             Err(error) => return Err(error.into()),
         };
+        rules.push_dir(path);
         for entry in entries {
             let Ok(entry) = entry else {
                 continue;
@@ -334,6 +337,7 @@ fn visit(
                 results,
             )?;
         }
+        rules.pop_dir(path);
     } else if metadata.is_file() {
         if max_file_bytes > 0 && metadata.len() > max_file_bytes {
             return Ok(());
@@ -375,47 +379,177 @@ fn visit(
 
 #[derive(Clone, Debug, Default)]
 struct IgnoreRules {
-    patterns: Vec<String>,
+    /// One pattern set per directory that contributed a `.gitignore`, deepest
+    /// last. Nested files override their parents, mirroring git semantics.
+    sets: Vec<IgnoreSet>,
+}
+
+#[derive(Clone, Debug)]
+struct IgnoreSet {
+    base: PathBuf,
+    patterns: Vec<IgnorePattern>,
+}
+
+#[derive(Clone, Debug)]
+struct IgnorePattern {
+    segments: Vec<String>,
+    negated: bool,
+    directory_only: bool,
 }
 
 impl IgnoreRules {
     fn load(root: &Path) -> Self {
-        let Ok(text) = fs::read_to_string(root.join(".gitignore")) else {
-            return Self::default();
+        let mut rules = Self::default();
+        rules.push_dir(root);
+        rules
+    }
+
+    /// Loads `dir/.gitignore` (when present) as the innermost pattern set.
+    fn push_dir(&mut self, dir: &Path) {
+        let Ok(text) = fs::read_to_string(dir.join(".gitignore")) else {
+            return;
         };
-        Self {
-            patterns: text
-                .lines()
-                .map(str::trim)
-                .filter(|line| !line.is_empty() && !line.starts_with('#') && !line.starts_with('!'))
-                .map(|line| {
-                    line.trim_start_matches('/')
-                        .trim_end_matches('/')
-                        .to_owned()
-                })
-                .collect(),
+        let patterns = text
+            .lines()
+            .filter_map(parse_ignore_pattern)
+            .collect::<Vec<_>>();
+        if !patterns.is_empty() {
+            self.sets.push(IgnoreSet {
+                base: dir.to_path_buf(),
+                patterns,
+            });
+        }
+    }
+
+    fn pop_dir(&mut self, dir: &Path) {
+        if self.sets.last().is_some_and(|set| set.base == dir) {
+            self.sets.pop();
         }
     }
 
     fn matches(&self, root: &Path, path: &Path, is_dir: bool) -> bool {
-        let relative = path.strip_prefix(root).unwrap_or(path).to_string_lossy();
-        let file_name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or_default();
-        self.patterns.iter().any(|pattern| {
-            if pattern.ends_with('/') && !is_dir {
-                return false;
+        for set in self.sets.iter().rev() {
+            let Ok(relative) = path.strip_prefix(&set.base) else {
+                continue;
+            };
+            let segments = relative
+                .components()
+                .filter_map(|component| match component {
+                    std::path::Component::Normal(value) => {
+                        Some(value.to_string_lossy().into_owned())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            if segments.is_empty() {
+                continue;
             }
-            let pattern = pattern.trim_end_matches('/');
-            if let Some(suffix) = pattern.strip_prefix("*") {
-                return file_name.ends_with(suffix);
+            for pattern in set.patterns.iter().rev() {
+                if pattern_matches(pattern, &segments, is_dir) {
+                    return !pattern.negated;
+                }
             }
-            pattern == relative
-                || pattern == file_name
-                || relative.starts_with(&format!("{pattern}/"))
-        })
+        }
+        let _ = root;
+        false
     }
+}
+
+fn parse_ignore_pattern(line: &str) -> Option<IgnorePattern> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return None;
+    }
+    let (negated, body) = match trimmed.strip_prefix('!') {
+        Some(rest) => (true, rest),
+        None => (false, trimmed),
+    };
+    let (directory_only, body) = match body.strip_suffix('/') {
+        Some(rest) => (true, rest),
+        None => (false, body),
+    };
+    let body = body.trim_start_matches('/');
+    if body.is_empty() {
+        return None;
+    }
+    Some(IgnorePattern {
+        segments: body.split('/').map(str::to_owned).collect(),
+        negated,
+        directory_only,
+    })
+}
+
+fn pattern_matches(pattern: &IgnorePattern, path: &[String], is_dir: bool) -> bool {
+    let pattern_segments = pattern
+        .segments
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let text = path.iter().map(String::as_str).collect::<Vec<_>>();
+    let single = pattern.segments.len() == 1;
+    let match_here = |candidate: &[&str]| {
+        if single {
+            candidate
+                .last()
+                .is_some_and(|name| glob_segment(pattern_segments[0], name))
+        } else {
+            glob_segments(&pattern_segments, candidate)
+        }
+    };
+    if pattern.directory_only {
+        for depth in 1..=text.len() {
+            let is_leaf = depth == text.len();
+            if match_here(&text[..depth]) && (!is_leaf || is_dir) {
+                return true;
+            }
+        }
+        return false;
+    }
+    match_here(&text)
+}
+
+fn glob_segments(pattern: &[&str], path: &[&str]) -> bool {
+    match (pattern.split_first(), path.split_first()) {
+        (None, None) => true,
+        (None, Some(_)) => false,
+        (Some((&"**", rest)), _) => {
+            glob_segments(rest, path) || (!path.is_empty() && glob_segments(pattern, &path[1..]))
+        }
+        (Some(_), None) => false,
+        (Some((&head, rest)), Some((&name, remaining))) => {
+            glob_segment(head, name) && glob_segments(rest, remaining)
+        }
+    }
+}
+
+fn glob_segment(pattern: &str, text: &str) -> bool {
+    let pattern = pattern.chars().collect::<Vec<_>>();
+    let text = text.chars().collect::<Vec<_>>();
+    let (mut pattern_index, mut text_index) = (0, 0);
+    let mut star: Option<usize> = None;
+    let mut mark = 0;
+    while text_index < text.len() {
+        if pattern_index < pattern.len()
+            && (pattern[pattern_index] == '?' || pattern[pattern_index] == text[text_index])
+        {
+            pattern_index += 1;
+            text_index += 1;
+        } else if pattern_index < pattern.len() && pattern[pattern_index] == '*' {
+            star = Some(pattern_index);
+            pattern_index += 1;
+            mark = text_index;
+        } else if let Some(star_index) = star {
+            pattern_index = star_index + 1;
+            mark += 1;
+            text_index = mark;
+        } else {
+            return false;
+        }
+    }
+    while pattern_index < pattern.len() && pattern[pattern_index] == '*' {
+        pattern_index += 1;
+    }
+    pattern_index == pattern.len()
 }
 
 #[cfg(test)]
@@ -431,6 +565,56 @@ mod tests {
         std::env::temp_dir().join(format!("{name}-{}-{nonce}", std::process::id()))
     }
 
+    #[test]
+    fn fr_sr02_nested_gitignore_and_negation_are_honoured() {
+        let root = std::env::temp_dir().join(format!(
+            "mtide-search-ignore-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("packages").join("a").join("dist")).expect("create fixture");
+        fs::write(root.join(".gitignore"), "*.log\n!keep.log\n").expect("write root ignore");
+        fs::write(
+            root.join("packages").join("a").join(".gitignore"),
+            "dist/\n",
+        )
+        .expect("write nested ignore");
+        fs::write(root.join("debug.log"), "hidden").expect("write log");
+        fs::write(root.join("keep.log"), "kept").expect("write keep");
+        fs::write(
+            root.join("packages").join("a").join("dist").join("out.txt"),
+            "dist",
+        )
+        .expect("write dist");
+        fs::write(root.join("packages").join("a").join("src.rs"), "source").expect("write src");
+
+        let token = CancellationToken::default();
+        let matches = search_roots(std::slice::from_ref(&root), "e", &token).expect("search");
+        let found = matches
+            .iter()
+            .filter(|entry| entry.text.contains('e'))
+            .map(|entry| {
+                entry
+                    .path
+                    .strip_prefix(&root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(
+            found.contains("keep.log"),
+            "negation must re-include the file"
+        );
+        assert!(!found.contains("debug.log"), "root ignore must hide *.log");
+        assert!(
+            !found.iter().any(|path| path.contains("dist")),
+            "nested .gitignore must hide its subtree"
+        );
+        assert!(found.contains("packages/a/src.rs"));
+        let _ = fs::remove_dir_all(&root);
+    }
     #[test]
     fn fr_sr01_finds_text_and_supports_cancellation() {
         let root = unique_fixture("mtide-search");

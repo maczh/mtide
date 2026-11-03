@@ -5,7 +5,7 @@ use std::{
     io::{self, Read},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::mpsc::{self, Receiver},
+    sync::mpsc::{self, Receiver, SyncSender},
     thread,
     time::{Duration, Instant},
 };
@@ -181,6 +181,8 @@ pub struct TaskRun {
     output_text: String,
     problems: Vec<Problem>,
     problem_buffer: String,
+    /// Bytes of an incomplete UTF-8 sequence held over for the next chunk.
+    pending_bytes: Vec<u8>,
     state: TaskState,
     max_output_bytes: usize,
     readers_closed: usize,
@@ -232,7 +234,7 @@ impl TaskRun {
             .stderr
             .take()
             .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "task stderr unavailable"))?;
-        let (sender, output) = mpsc::channel();
+        let (sender, output) = mpsc::sync_channel(256);
         spawn_reader(stdout, sender.clone());
         spawn_reader(stderr, sender);
         Ok(Self {
@@ -242,6 +244,7 @@ impl TaskRun {
             output_text: String::new(),
             problems: Vec::new(),
             problem_buffer: String::new(),
+            pending_bytes: Vec::new(),
             state: TaskState::Running,
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
             readers_closed: 0,
@@ -292,7 +295,7 @@ impl TaskRun {
                 continue;
             }
             bytes += chunk.bytes.len();
-            let text = String::from_utf8_lossy(&chunk.bytes);
+            let text = decode_chunk(&mut self.pending_bytes, &chunk.bytes);
             self.output_text.push_str(&text);
             trim_output(&mut self.output_text, self.max_output_bytes);
             collect_problem_lines(&mut self.problem_buffer, &mut self.problems, &text, false);
@@ -333,6 +336,37 @@ impl TaskRun {
         self.state = TaskState::Cancelled;
         Ok(())
     }
+}
+
+/// Decodes a streamed chunk, holding back an incomplete trailing UTF-8
+/// sequence so multi-byte output split across reads is decoded correctly.
+fn decode_chunk(pending: &mut Vec<u8>, chunk: &[u8]) -> String {
+    let mut buffer = std::mem::take(pending);
+    buffer.extend_from_slice(chunk);
+    let mut text = String::new();
+    let mut rest = buffer.as_slice();
+    loop {
+        match std::str::from_utf8(rest) {
+            Ok(valid) => {
+                text.push_str(valid);
+                rest = &[];
+                break;
+            }
+            Err(error) => {
+                let (valid, after) = rest.split_at(error.valid_up_to());
+                text.push_str(std::str::from_utf8(valid).expect("valid up to error"));
+                match error.error_len() {
+                    Some(length) => rest = &after[length..],
+                    None => {
+                        rest = after;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    *pending = rest.to_vec();
+    text
 }
 
 fn trim_output(output: &mut String, max_bytes: usize) {
@@ -449,29 +483,35 @@ fn parse_problem_line(line: &str) -> Option<Problem> {
         });
     }
 
-    // TypeScript/tsc uses `file(line,column): error ...`.
+    // TypeScript/tsc uses `file(line,column): error ...`. A non-numeric
+    // parenthesis must fall through to the generic matchers below instead of
+    // aborting the whole line.
     if let Some(open) = trimmed.rfind('(') {
         if let Some(close) = trimmed[open..].find("): ") {
             let close = open + close;
-            let (line_number, column) = trimmed[open + 1..close]
+            let location = trimmed[open + 1..close]
                 .split_once(',')
-                .and_then(|(line, column)| Some((line.parse().ok()?, column.parse().ok()?)))?;
-            let file = &trimmed[..open];
-            let message = trimmed[close + 3..].trim();
-            let severity = if message.starts_with("error") {
-                Severity::Error
-            } else if message.starts_with("warning") {
-                Severity::Warning
-            } else {
-                Severity::Info
-            };
-            return Some(Problem {
-                file: Path::new(file).to_path_buf(),
-                line: line_number,
-                column: Some(column),
-                severity,
-                message: message.to_owned(),
-            });
+                .and_then(|(line, column)| {
+                    Some((line.parse().ok()?, column.parse::<usize>().ok()?))
+                });
+            if let Some((line_number, column)) = location {
+                let file = &trimmed[..open];
+                let message = trimmed[close + 3..].trim();
+                let severity = if message.starts_with("error") {
+                    Severity::Error
+                } else if message.starts_with("warning") {
+                    Severity::Warning
+                } else {
+                    Severity::Info
+                };
+                return Some(Problem {
+                    file: Path::new(file).to_path_buf(),
+                    line: line_number,
+                    column: Some(column),
+                    severity,
+                    message: message.to_owned(),
+                });
+            }
         }
     }
 
@@ -536,7 +576,7 @@ fn parse_location(value: &str) -> Option<(&str, usize, Option<usize>)> {
     }
 }
 
-fn spawn_reader<R: Read + Send + 'static>(mut reader: R, sender: mpsc::Sender<OutputChunk>) {
+fn spawn_reader<R: Read + Send + 'static>(mut reader: R, sender: SyncSender<OutputChunk>) {
     thread::spawn(move || {
         let mut buffer = [0_u8; 8192];
         loop {
@@ -703,6 +743,37 @@ mod tests {
         assert!(run.output().contains("before-timeout"));
     }
 
+    #[test]
+    fn fr_bd03_problem_matcher_keeps_non_numeric_parens_from_swallowing_lines() {
+        let problems = parse_problems("src/app.rs:3:1: error: see docs (rustc)\n");
+        assert_eq!(problems.len(), 1);
+        assert_eq!(problems[0].file, PathBuf::from("src/app.rs"));
+        assert_eq!(problems[0].message, "see docs (rustc)");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fr_bd05_task_output_decodes_multibyte_characters_split_across_chunks() {
+        let mut run = TaskRun::start(TaskSpec {
+            label: "utf8".into(),
+            program: "sh".into(),
+            args: vec![
+                "-c".into(),
+                r"printf '\344'; sleep 0.05; printf '\275\240\n'".into(),
+            ],
+            cwd: None,
+            environment: BTreeMap::new(),
+        })
+        .expect("start task");
+        for _ in 0..100 {
+            run.poll().expect("poll task");
+            if !matches!(run.state(), TaskState::Running) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(run.output(), "你\n");
+    }
     #[test]
     fn fr_bd06_result_tree_groups_pass_fail_and_skipped_tests() {
         let tree = parse_result_tree(

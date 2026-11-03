@@ -276,11 +276,7 @@ pub fn collect_context(
         } else {
             root.join(path)
         };
-        if is_sensitive(&absolute)
-            || ignored
-                .iter()
-                .any(|pattern| matches_pattern(pattern, &absolute, root))
-        {
+        if is_sensitive(&absolute) || is_ignored(&ignored, &absolute, root, absolute.is_dir()) {
             context.excluded.push(absolute);
             continue;
         }
@@ -294,35 +290,162 @@ pub fn collect_context(
     Ok(context)
 }
 
+/// Built-in sensitive file list (PRD SEC-03). Matching is deliberately broad:
+/// a false positive only costs the user one manual confirmation, while a false
+/// negative would leak a key to a third-party CLI.
 pub fn is_sensitive(path: &Path) -> bool {
     let name = path
         .file_name()
-        .and_then(|v| v.to_str())
+        .and_then(|value| value.to_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
-    name == ".env" || name.starts_with(".env.") || name.ends_with(".pem") || name.ends_with(".key") || name.starts_with("id_") || name == "credentials" || name == ".netrc" || path.components().any(|part| matches!(part, std::path::Component::Normal(value) if value == ".ssh" || value == ".aws"))
+    name == ".env"
+        || name.starts_with(".env.")
+        || name.ends_with(".pem")
+        || name.ends_with(".key")
+        || name.ends_with(".p12")
+        || name.ends_with(".pfx")
+        || name.ends_with(".kdbx")
+        || name.starts_with("id_")
+        || name.starts_with("credentials")
+        || name == ".netrc"
+        || path.components().any(|part| {
+            matches!(part, std::path::Component::Normal(value)
+                if value == ".ssh" || value == ".aws" || value == ".gnupg")
+        })
 }
 
-fn load_aiignore(root: &Path) -> Vec<String> {
+/// One parsed `.aiignore` rule. The syntax follows gitignore closely enough for
+/// the exclusion contract in PRD AI-10: globs, `**`, directory rules and
+/// negation are all supported, and the last matching rule wins.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct IgnoreRule {
+    segments: Vec<String>,
+    negated: bool,
+    directory_only: bool,
+}
+
+fn load_aiignore(root: &Path) -> Vec<IgnoreRule> {
     fs::read_to_string(root.join(".aiignore"))
-        .map(|text| {
-            text.lines()
-                .map(str::trim)
-                .filter(|line| !line.is_empty() && !line.starts_with('#'))
-                .map(str::to_owned)
-                .collect()
-        })
+        .map(|text| text.lines().filter_map(parse_ignore_rule).collect())
         .unwrap_or_default()
 }
-fn matches_pattern(pattern: &str, path: &Path, root: &Path) -> bool {
-    let relative = path.strip_prefix(root).unwrap_or(path).to_string_lossy();
-    pattern == relative
-        || pattern
-            == path
-                .file_name()
-                .and_then(|v| v.to_str())
-                .unwrap_or_default()
-        || (pattern.ends_with('/') && relative.starts_with(pattern.trim_end_matches('/')))
+
+fn parse_ignore_rule(line: &str) -> Option<IgnoreRule> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return None;
+    }
+    let (negated, body) = match trimmed.strip_prefix('!') {
+        Some(rest) => (true, rest),
+        None => (false, trimmed),
+    };
+    let (directory_only, body) = match body.strip_suffix('/') {
+        Some(rest) => (true, rest),
+        None => (false, body),
+    };
+    let body = body.trim_start_matches('/');
+    if body.is_empty() {
+        return None;
+    }
+    Some(IgnoreRule {
+        segments: body.split('/').map(str::to_owned).collect(),
+        negated,
+        directory_only,
+    })
+}
+
+/// Returns true when `path` must not be sent to an external AI CLI.
+fn is_ignored(rules: &[IgnoreRule], path: &Path, root: &Path, is_directory: bool) -> bool {
+    let relative = path.strip_prefix(root).unwrap_or(path);
+    let segments = relative
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(value) => Some(value.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if segments.is_empty() {
+        return false;
+    }
+    let mut ignored = false;
+    for rule in rules {
+        if rule_matches(rule, &segments, is_directory) {
+            ignored = !rule.negated;
+        }
+    }
+    ignored
+}
+
+fn rule_matches(rule: &IgnoreRule, path: &[String], is_directory: bool) -> bool {
+    let pattern = rule.segments.iter().map(String::as_str).collect::<Vec<_>>();
+    let text = path.iter().map(String::as_str).collect::<Vec<_>>();
+    // A pattern without a slash matches a file name at any depth.
+    let single = rule.segments.len() == 1;
+    let match_depth = |candidate: &[&str]| {
+        if single {
+            candidate
+                .last()
+                .is_some_and(|name| segment_glob(pattern[0], name))
+        } else {
+            match_segments(&pattern, candidate)
+        }
+    };
+    if rule.directory_only {
+        for depth in 1..=text.len() {
+            let is_leaf = depth == text.len();
+            if match_depth(&text[..depth]) && (!is_leaf || is_directory) {
+                return true;
+            }
+        }
+        return false;
+    }
+    match_depth(&text)
+}
+
+fn match_segments(pattern: &[&str], path: &[&str]) -> bool {
+    match (pattern.split_first(), path.split_first()) {
+        (None, None) => true,
+        (None, Some(_)) => false,
+        (Some((&"**", rest)), _) => {
+            match_segments(rest, path) || (!path.is_empty() && match_segments(pattern, &path[1..]))
+        }
+        (Some(_), None) => false,
+        (Some((&head, rest)), Some((&name, remaining))) => {
+            segment_glob(head, name) && match_segments(rest, remaining)
+        }
+    }
+}
+
+/// Glob matching inside a single path segment: `*` and `?` never cross `/`.
+fn segment_glob(pattern: &str, text: &str) -> bool {
+    let pattern = pattern.chars().collect::<Vec<_>>();
+    let text = text.chars().collect::<Vec<_>>();
+    let (mut pattern_index, mut text_index) = (0, 0);
+    let mut star: Option<usize> = None;
+    let mut mark = 0;
+    while text_index < text.len() {
+        if pattern_index < pattern.len()
+            && (pattern[pattern_index] == '?' || pattern[pattern_index] == text[text_index])
+        {
+            pattern_index += 1;
+            text_index += 1;
+        } else if pattern_index < pattern.len() && pattern[pattern_index] == '*' {
+            star = Some(pattern_index);
+            pattern_index += 1;
+            mark = text_index;
+        } else if let Some(star_index) = star {
+            pattern_index = star_index + 1;
+            mark += 1;
+            text_index = mark;
+        } else {
+            return false;
+        }
+    }
+    while pattern_index < pattern.len() && pattern[pattern_index] == '*' {
+        pattern_index += 1;
+    }
+    pattern_index == pattern.len()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -513,6 +636,68 @@ mod tests {
         assert!(builtin_templates().values().all(|value| !value.is_empty()));
     }
 
+    #[test]
+    fn fr_ai10_aiignore_supports_globs_directories_and_negation() {
+        let root = std::env::temp_dir().join(format!("mtide-aiignore-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("logs")).expect("create fixture");
+        fs::write(
+            root.join(".aiignore"),
+            "*.log\nlogs/**\nsecrets/\n!keep.log\n",
+        )
+        .expect("write aiignore");
+        fs::write(root.join("debug.log"), "x").expect("write log");
+        fs::write(root.join("keep.log"), "x").expect("write keep");
+        fs::write(root.join("main.rs"), "fn main() {}").expect("write source");
+        fs::create_dir_all(root.join("logs").join("deep")).expect("create nested dir");
+        fs::write(root.join("logs").join("deep").join("a.txt"), "x").expect("write nested");
+
+        let context = collect_context(
+            &root,
+            &[
+                PathBuf::from("debug.log"),
+                PathBuf::from("keep.log"),
+                PathBuf::from("main.rs"),
+                PathBuf::from("logs/deep/a.txt"),
+            ],
+            None,
+            Vec::new(),
+        )
+        .expect("collect context");
+
+        let sent = context
+            .files
+            .iter()
+            .map(|file| {
+                file.path
+                    .strip_prefix(&root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sent,
+            vec!["keep.log".to_string(), "main.rs".to_string()],
+            "glob, directory rule and negation must all be honoured"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fr_ai10_sensitive_list_covers_key_material_from_the_prd() {
+        for path in [
+            ".env.local",
+            "certs/server.pem",
+            "certs/client.p12",
+            "vault.kdbx",
+            "credentials.json",
+            ".ssh/config",
+        ] {
+            assert!(is_sensitive(Path::new(path)), "{path} must be sensitive");
+        }
+        assert!(!is_sensitive(Path::new("src/credential_helpers.rs")));
+    }
     #[test]
     fn fr_ai06_session_metadata_and_ai11_audit_never_store_source_text() {
         let mut log = AuditLog::default();

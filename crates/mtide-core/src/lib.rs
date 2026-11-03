@@ -289,15 +289,32 @@ pub enum EditError {
     Regex(String),
 }
 
+/// One undoable transaction: the edits that were applied and the edits that
+/// revert them. Storing deltas (instead of whole-document snapshots) keeps the
+/// history proportional to what the user changed rather than to file size.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct Transaction {
+    /// Applied edits, in pre-transaction coordinates, ordered from the end.
+    forward: Vec<Edit>,
+    /// Reverting edits, in post-transaction coordinates, ordered from the end.
+    inverse: Vec<Edit>,
+}
+
+/// Upper bound on retained undo transactions so editing a huge file cannot
+/// grow the heap without limit (PRD NF-04).
+const UNDO_HISTORY_LIMIT: usize = 1000;
+
 #[derive(Debug)]
 pub struct Document {
     id: DocId,
     rope: Rope,
     dirty: bool,
     version: i32,
-    undo: Vec<Rope>,
-    redo: Vec<Rope>,
-    redo_branches: Vec<Vec<Rope>>,
+    undo: Vec<Transaction>,
+    redo: Vec<Transaction>,
+    redo_branches: Vec<Vec<Transaction>>,
+    /// Undo-stack depth recorded at the last save, used for dirty tracking.
+    saved_depth: usize,
 }
 
 impl Document {
@@ -310,6 +327,7 @@ impl Document {
             undo: Vec::new(),
             redo: Vec::new(),
             redo_branches: Vec::new(),
+            saved_depth: 0,
         }
     }
 
@@ -319,8 +337,45 @@ impl Document {
     pub fn text(&self) -> String {
         self.rope.to_string()
     }
+
+    /// Copies a byte range without materialising the whole document.
+    pub fn slice(&self, range: std::ops::Range<usize>) -> String {
+        let start = range.start.min(self.rope.len_bytes());
+        let end = range.end.min(self.rope.len_bytes()).max(start);
+        self.rope.byte_slice(start..end).to_string()
+    }
     pub fn line_count(&self) -> usize {
         self.rope.len_lines()
+    }
+
+    /// Returns a single line (without the trailing newline) without
+    /// materialising the whole document. The editor only ever needs the
+    /// visible window, so this keeps large-file renderers cheap.
+    pub fn line(&self, row: usize) -> Option<String> {
+        (row < self.rope.len_lines()).then(|| self.rope.line(row).to_string())
+    }
+
+    /// Total bytes in the document, without materialising it as a `String`.
+    pub fn len_bytes(&self) -> usize {
+        self.rope.len_bytes()
+    }
+
+    /// Counts conflict markers (<<<<<<<, =======, >>>>>>>) by scanning line
+    /// starts only. Avoids the full String copy a naive text.lines().filter
+    /// would require.
+    pub fn conflict_marker_count(&self) -> usize {
+        let mut count = 0;
+        for index in 0..self.rope.len_lines() {
+            let line = self.rope.line(index);
+            let trimmed = line
+                .chars()
+                .take_while(|character| !character.is_whitespace())
+                .collect::<String>();
+            if trimmed == "<<<<<<<" || trimmed == "=======" || trimmed == ">>>>>>>" {
+                count += 1;
+            }
+        }
+        count
     }
     pub fn line_to_byte(&self, line: usize) -> Option<usize> {
         (line < self.rope.len_lines()).then(|| self.rope.line_to_byte(line))
@@ -692,46 +747,51 @@ impl Document {
     /// Applies all edits as one transaction. The input may be in any order;
     /// edits are applied from the end so earlier byte offsets remain stable.
     pub fn apply(&mut self, edits: &[Edit]) -> Result<(), EditError> {
-        let inverse = self.validate_and_inverse(edits)?;
-        let previous = self.rope.clone();
-        let mut ordered: Vec<&Edit> = edits.iter().collect();
-        ordered.sort_by_key(|edit| std::cmp::Reverse(edit.range.start));
-        for edit in ordered {
+        // Touching edits (an insertion at the start of a replacement, which is
+        // what auto-import completions produce) are coalesced so the result does
+        // not depend on application order.
+        let coalesced = coalesce_edits(edits);
+        let (forward, inverse) = self.validate_and_inverse(&coalesced)?;
+        for edit in &forward {
             self.apply_edit(edit);
         }
-        let _ = inverse;
-        self.undo.push(previous);
+        self.undo.push(Transaction { forward, inverse });
         if !self.redo.is_empty() {
             self.redo_branches.push(std::mem::take(&mut self.redo));
         }
+        self.trim_history();
         self.dirty = true;
         self.version = self.version.saturating_add(1);
         Ok(())
     }
 
     pub fn undo(&mut self) -> Option<()> {
-        let target = self.undo.pop()?;
-        self.redo.push(self.rope.clone());
-        self.restore_text(target);
-        self.dirty = true;
+        let transaction = self.undo.pop()?;
+        for edit in &transaction.inverse {
+            self.apply_edit(edit);
+        }
+        self.redo.push(transaction);
+        self.refresh_dirty();
         self.version = self.version.saturating_add(1);
         Some(())
     }
 
     pub fn redo(&mut self) -> Option<()> {
-        let target = self.redo.pop()?;
-        self.undo.push(self.rope.clone());
-        self.restore_text(target);
-        self.dirty = true;
+        let transaction = self.redo.pop()?;
+        for edit in &transaction.forward {
+            self.apply_edit(edit);
+        }
+        self.undo.push(transaction);
+        self.refresh_dirty();
         self.version = self.version.saturating_add(1);
         Some(())
     }
 
+    /// Records the current content as saved while keeping undo history, so the
+    /// user can still undo edits that predate the save.
     pub fn mark_saved(&mut self) {
-        self.dirty = false;
-        self.undo.clear();
-        self.redo.clear();
-        self.redo_branches.clear();
+        self.saved_depth = self.undo.len();
+        self.refresh_dirty();
     }
 
     pub fn redo_branch_count(&self) -> usize {
@@ -741,23 +801,35 @@ impl Document {
     /// Switches to a preserved post-undo branch. Branches are exposed as a
     /// small explicit API so a command palette can present them later.
     pub fn switch_redo_branch(&mut self, index: usize) -> Option<()> {
-        let (target, empty) = {
+        let (transaction, empty) = {
             let branch = self.redo_branches.get_mut(index)?;
-            let target = branch.pop()?;
-            (target, branch.is_empty())
+            let transaction = branch.pop()?;
+            (transaction, branch.is_empty())
         };
-        self.undo.push(self.rope.clone());
-        self.restore_text(target);
+        for edit in &transaction.forward {
+            self.apply_edit(edit);
+        }
+        self.undo.push(transaction);
         if empty {
             self.redo_branches.remove(index);
         }
-        self.dirty = true;
+        self.trim_history();
+        self.refresh_dirty();
         self.version = self.version.saturating_add(1);
         Some(())
     }
 
-    fn restore_text(&mut self, rope: Rope) {
-        self.rope = rope;
+    /// Drops the oldest transactions once the history limit is exceeded.
+    fn trim_history(&mut self) {
+        let overflow = self.undo.len().saturating_sub(UNDO_HISTORY_LIMIT);
+        if overflow > 0 {
+            self.undo.drain(0..overflow);
+            self.saved_depth = self.saved_depth.saturating_sub(overflow);
+        }
+    }
+
+    fn refresh_dirty(&mut self) {
+        self.dirty = self.undo.len() != self.saved_depth;
     }
 
     fn apply_edit(&mut self, edit: &Edit) {
@@ -767,7 +839,11 @@ impl Document {
         self.rope.insert(start, &edit.insert);
     }
 
-    fn validate_and_inverse(&self, edits: &[Edit]) -> Result<Vec<Edit>, EditError> {
+    /// Validates `edits` and returns them ordered from the end of the buffer
+    /// together with the transaction that reverts them. Both vectors are derived
+    /// from the touched slices only, so a keystroke costs O(edit size) instead of
+    /// O(document size).
+    fn validate_and_inverse(&self, edits: &[Edit]) -> Result<(Vec<Edit>, Vec<Edit>), EditError> {
         let len = self.rope.len_bytes();
         let mut ranges: Vec<Range<usize>> = edits.iter().map(|edit| edit.range.clone()).collect();
         ranges.sort_by_key(|range| range.start);
@@ -779,9 +855,7 @@ impl Document {
                     len,
                 });
             }
-            if !is_rope_grapheme_boundary(&self.rope, range.start)
-                || !is_rope_grapheme_boundary(&self.rope, range.end)
-            {
+            if !self.is_grapheme_boundary(range.start) || !self.is_grapheme_boundary(range.end) {
                 return Err(EditError::InvalidBoundary {
                     start: range.start,
                     end: range.end,
@@ -791,6 +865,7 @@ impl Document {
                 return Err(EditError::Overlap);
             }
         }
+        let mut forward = Vec::with_capacity(edits.len());
         let mut inverse = Vec::with_capacity(edits.len());
         let mut delta: isize = 0;
         for range in &ranges {
@@ -802,34 +877,59 @@ impl Document {
                 range: new_start..new_start + source.insert.len(),
                 insert: self.rope.byte_slice(range.clone()).to_string(),
             });
+            forward.push(source.clone());
             delta += source.insert.len() as isize - (range.end - range.start) as isize;
         }
+        forward.sort_by_key(|edit| std::cmp::Reverse(edit.range.start));
         inverse.sort_by_key(|edit| std::cmp::Reverse(edit.range.start));
-        Ok(inverse)
+        Ok((forward, inverse))
     }
+
+    /// Checks a byte offset against the grapheme clusters of its own line.
+    /// Grapheme clusters never span a line break, so a line-scoped check is
+    /// exact while touching one line instead of the whole document.
+    fn is_grapheme_boundary(&self, byte: usize) -> bool {
+        let len = self.rope.len_bytes();
+        if byte == 0 || byte == len {
+            return true;
+        }
+        if byte > len {
+            return false;
+        }
+        let line = self.rope.byte_to_line(byte);
+        let line_start = self.rope.line_to_byte(line);
+        let line_end = if line + 1 < self.rope.len_lines() {
+            self.rope.line_to_byte(line + 1)
+        } else {
+            len
+        };
+        let segment = self.rope.byte_slice(line_start..line_end).to_string();
+        segment
+            .grapheme_indices(true)
+            .any(|(offset, _)| line_start + offset == byte)
+    }
+}
+
+/// Merges edits that share a boundary into one edit, keeping their order.
+fn coalesce_edits(edits: &[Edit]) -> Vec<Edit> {
+    let mut ordered = edits.to_vec();
+    ordered.sort_by_key(|edit| edit.range.start);
+    let mut merged: Vec<Edit> = Vec::with_capacity(ordered.len());
+    for edit in ordered {
+        if let Some(last) = merged.last_mut() {
+            if last.range.end == edit.range.start {
+                last.insert.push_str(&edit.insert);
+                last.range.end = edit.range.end;
+                continue;
+            }
+        }
+        merged.push(edit);
+    }
+    merged
 }
 
 fn is_grapheme_boundary(text: &str, byte: usize) -> bool {
     byte == 0 || byte == text.len() || text.grapheme_indices(true).any(|(start, _)| start == byte)
-}
-
-fn is_rope_grapheme_boundary(rope: &Rope, byte: usize) -> bool {
-    if byte == 0 || byte == rope.len_bytes() {
-        return true;
-    }
-    let Ok(char_index) = rope.try_byte_to_char(byte) else {
-        return false;
-    };
-    let start = char_index.saturating_sub(16);
-    let end = (char_index + 16).min(rope.len_chars());
-    let sample = rope.slice(start..end).to_string();
-    if sample.is_ascii() {
-        return true;
-    }
-    // Non-ASCII grapheme clusters can span arbitrary numbers of combining
-    // marks or joiners. Use the complete text only for this correctness path;
-    // ASCII-heavy large files stay on the O(log n) rope path above.
-    is_grapheme_boundary(&rope.to_string(), byte)
 }
 
 #[cfg(test)]
@@ -906,6 +1006,26 @@ mod tests {
         assert_eq!(doc.text(), "XaYb🙂");
     }
 
+    #[test]
+    fn fr_ed03_touching_edits_coalesce_and_undo_as_one_transaction() {
+        let mut doc = Document::new(DocId(1), "Str");
+        doc.apply(&[
+            Edit {
+                range: 0..0,
+                insert: "use std::string::String;\n".into(),
+            },
+            Edit {
+                range: 0..3,
+                insert: "String".into(),
+            },
+        ])
+        .expect("insert at the start of a replacement must be allowed");
+        assert_eq!(doc.text(), "use std::string::String;\nString");
+        doc.undo().expect("undo the merged transaction");
+        assert_eq!(doc.text(), "Str");
+        doc.redo().expect("redo the merged transaction");
+        assert_eq!(doc.text(), "use std::string::String;\nString");
+    }
     #[test]
     fn fr_ed03_new_edit_preserves_a_switchable_undo_branch() {
         let mut doc = Document::new(DocId(1), "a");

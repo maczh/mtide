@@ -2,6 +2,13 @@
 //!
 //! The parser intentionally owns no terminal I/O. Bytes from a PTY can be fed
 //! into [`Screen::feed`] and the resulting grid can be rendered by the TUI.
+//!
+//! Correctness priorities follow PRD TR-01: text must not be lost at the right
+//! margin, partial UTF-8 sequences split across PTY reads must not turn into
+//! replacement characters, and erase-line / erase-display modes must honour
+//! their parameters. Control strings (OSC, DCS) are consumed instead of being
+//! printed as text, which is what keeps shell titles and hyperlinks from
+//! corrupting the grid.
 
 use std::fmt;
 use unicode_width::UnicodeWidthChar;
@@ -62,6 +69,10 @@ enum ParserState {
     Ground,
     Escape,
     Csi,
+    /// Consumes a charset designation such as `ESC ( B`.
+    Charset,
+    /// Consumes an OSC / DCS / APC string until BEL or ST.
+    Control,
 }
 
 pub struct Screen {
@@ -73,9 +84,16 @@ pub struct Screen {
     style: Style,
     state: ParserState,
     csi: String,
+    /// Bytes of an incomplete UTF-8 sequence held over for the next feed call.
+    pending_utf8: Vec<u8>,
     alternate: Option<(Vec<Cell>, Cursor, Style)>,
     mouse_reporting: bool,
     bracketed_paste: bool,
+    /// Set when the cursor reached the right margin; the next printable
+    /// character wraps instead of overwriting the last column.
+    wrap_pending: bool,
+    scroll_top: usize,
+    scroll_bottom: usize,
 }
 
 impl fmt::Debug for Screen {
@@ -103,9 +121,13 @@ impl Screen {
             style: Style::default(),
             state: ParserState::Ground,
             csi: String::new(),
+            pending_utf8: Vec::new(),
             alternate: None,
             mouse_reporting: false,
             bracketed_paste: false,
+            wrap_pending: false,
+            scroll_top: 0,
+            scroll_bottom: height,
         }
     }
 
@@ -144,6 +166,10 @@ impl Screen {
         }
         replacement.cursor.row = self.cursor.row.min(replacement.height - 1);
         replacement.cursor.column = self.cursor.column.min(replacement.width - 1);
+        replacement.saved_cursor = self.saved_cursor;
+        replacement.saved_cursor.row = replacement.saved_cursor.row.min(replacement.height - 1);
+        replacement.saved_cursor.column =
+            replacement.saved_cursor.column.min(replacement.width - 1);
         replacement.alternate = self.alternate.take();
         replacement.mouse_reporting = self.mouse_reporting;
         replacement.bracketed_paste = self.bracketed_paste;
@@ -151,8 +177,32 @@ impl Screen {
     }
 
     pub fn feed(&mut self, bytes: &[u8]) {
-        let input = String::from_utf8_lossy(bytes);
-        for character in input.chars() {
+        let mut buffer = std::mem::take(&mut self.pending_utf8);
+        buffer.extend_from_slice(bytes);
+        let mut text = String::new();
+        let mut rest = buffer.as_slice();
+        loop {
+            match std::str::from_utf8(rest) {
+                Ok(valid) => {
+                    text.push_str(valid);
+                    rest = &[];
+                    break;
+                }
+                Err(error) => {
+                    let (valid, after) = rest.split_at(error.valid_up_to());
+                    text.push_str(std::str::from_utf8(valid).expect("valid up to error"));
+                    match error.error_len() {
+                        Some(length) => rest = &after[length..],
+                        None => {
+                            rest = after;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        self.pending_utf8 = rest.to_vec();
+        for character in text.chars() {
             self.feed_character(character);
         }
     }
@@ -161,9 +211,19 @@ impl Screen {
         match self.state {
             ParserState::Ground => match character {
                 '\x1b' => self.state = ParserState::Escape,
-                '\n' => self.line_feed(),
-                '\r' => self.cursor.column = 0,
-                '\x08' => self.cursor.column = self.cursor.column.saturating_sub(1),
+                '\n' => {
+                    self.wrap_pending = false;
+                    self.line_feed();
+                }
+                '\r' => {
+                    self.wrap_pending = false;
+                    self.cursor.column = 0;
+                }
+                '\t' => self.tab_forward(1),
+                '\x08' => {
+                    self.wrap_pending = false;
+                    self.cursor.column = self.cursor.column.saturating_sub(1);
+                }
                 '\x07' => {}
                 character if !character.is_control() => self.put(character),
                 _ => {}
@@ -173,17 +233,35 @@ impl Screen {
                     self.csi.clear();
                     self.state = ParserState::Csi;
                 }
+                ']' | 'P' | 'X' | '^' | '_' => self.state = ParserState::Control,
+                '(' | ')' | '*' | '+' | '-' | '.' | '/' => self.state = ParserState::Charset,
                 '7' => self.saved_cursor = self.cursor,
-                '8' => self.cursor = self.saved_cursor,
+                '8' => {
+                    self.cursor = self.saved_cursor;
+                    self.wrap_pending = false;
+                }
                 'c' => self.reset(),
+                'D' => self.line_feed(),
+                'E' => {
+                    self.line_feed();
+                    self.cursor.column = 0;
+                }
+                'M' => self.reverse_index(),
+                '\\' => self.state = ParserState::Ground,
                 _ => self.state = ParserState::Ground,
+            },
+            ParserState::Charset => self.state = ParserState::Ground,
+            ParserState::Control => match character {
+                '\x07' => self.state = ParserState::Ground,
+                '\x1b' => self.state = ParserState::Escape,
+                _ => {}
             },
             ParserState::Csi => {
                 if ('@'..='~').contains(&character) {
                     let params = std::mem::take(&mut self.csi);
                     self.execute_csi(&params, character);
                     self.state = ParserState::Ground;
-                } else if self.csi.len() < 32 {
+                } else if self.csi.len() < 64 {
                     self.csi.push(character);
                 } else {
                     self.state = ParserState::Ground;
@@ -195,9 +273,14 @@ impl Screen {
 
     fn put(&mut self, character: char) {
         let width = character.width().unwrap_or(1).max(1);
-        if width == 2 && self.cursor.column + 1 >= self.width {
-            self.line_feed();
+        if self.wrap_pending {
+            self.wrap_pending = false;
             self.cursor.column = 0;
+            self.line_feed();
+        }
+        if width == 2 && self.cursor.column + 1 >= self.width {
+            self.cursor.column = 0;
+            self.line_feed();
         }
         let index = self.cursor.row * self.width + self.cursor.column;
         self.cells[index] = Cell {
@@ -212,19 +295,69 @@ impl Screen {
                 continuation: true,
             };
         }
-        self.cursor.column += width;
-        if self.cursor.column >= self.width {
+        let next = self.cursor.column + width;
+        if next >= self.width {
             self.cursor.column = self.width - 1;
+            self.wrap_pending = true;
+        } else {
+            self.cursor.column = next;
+        }
+    }
+
+    fn tab_forward(&mut self, count: usize) {
+        for _ in 0..count.max(1) {
+            let next = (self.cursor.column / 8 + 1) * 8;
+            self.wrap_pending = false;
+            if next >= self.width {
+                self.cursor.column = self.width - 1;
+            } else {
+                self.cursor.column = next;
+            }
         }
     }
 
     fn line_feed(&mut self) {
-        if self.cursor.row + 1 >= self.height {
-            self.cells.copy_within(self.width.., 0);
-            self.cells[(self.height - 1) * self.width..].fill(Cell::default());
+        if self.cursor.row + 1 >= self.scroll_bottom {
+            self.scroll_up(1);
         } else {
             self.cursor.row += 1;
         }
+    }
+
+    fn reverse_index(&mut self) {
+        if self.cursor.row == self.scroll_top {
+            self.scroll_down(1);
+        } else if self.cursor.row > 0 {
+            self.cursor.row -= 1;
+        }
+    }
+
+    fn scroll_up(&mut self, count: usize) {
+        let top = self.scroll_top;
+        let bottom = self.scroll_bottom;
+        if bottom <= top {
+            return;
+        }
+        let count = count.min(bottom - top);
+        let start = top * self.width;
+        let end = bottom * self.width;
+        self.cells
+            .copy_within(start + count * self.width..end, start);
+        self.cells[end - count * self.width..end].fill(Cell::default());
+    }
+
+    fn scroll_down(&mut self, count: usize) {
+        let top = self.scroll_top;
+        let bottom = self.scroll_bottom;
+        if bottom <= top {
+            return;
+        }
+        let count = count.min(bottom - top);
+        let start = top * self.width;
+        let end = bottom * self.width;
+        self.cells
+            .copy_within(start..end - count * self.width, start + count * self.width);
+        self.cells[start..start + count * self.width].fill(Cell::default());
     }
 
     fn execute_csi(&mut self, sequence: &str, command: char) {
@@ -242,11 +375,42 @@ impl Screen {
                 .unwrap_or(default)
         };
         match command {
-            'A' => self.cursor.row = self.cursor.row.saturating_sub(first(1)),
-            'B' => self.cursor.row = (self.cursor.row + first(1)).min(self.height - 1),
-            'C' => self.cursor.column = (self.cursor.column + first(1)).min(self.width - 1),
-            'D' => self.cursor.column = self.cursor.column.saturating_sub(first(1)),
+            'A' => {
+                self.wrap_pending = false;
+                self.cursor.row = self.cursor.row.saturating_sub(first(1));
+            }
+            'B' => {
+                self.wrap_pending = false;
+                self.cursor.row = (self.cursor.row + first(1)).min(self.height - 1);
+            }
+            'C' => {
+                self.wrap_pending = false;
+                self.cursor.column = (self.cursor.column + first(1)).min(self.width - 1);
+            }
+            'D' => {
+                self.wrap_pending = false;
+                self.cursor.column = self.cursor.column.saturating_sub(first(1));
+            }
+            'E' => {
+                self.wrap_pending = false;
+                self.cursor.column = 0;
+                self.cursor.row = (self.cursor.row + first(1)).min(self.height - 1);
+            }
+            'F' => {
+                self.wrap_pending = false;
+                self.cursor.column = 0;
+                self.cursor.row = self.cursor.row.saturating_sub(first(1));
+            }
+            'G' | '`' => {
+                self.wrap_pending = false;
+                self.cursor.column = first(1).saturating_sub(1).min(self.width - 1);
+            }
+            'd' => {
+                self.wrap_pending = false;
+                self.cursor.row = first(1).saturating_sub(1).min(self.height - 1);
+            }
             'H' | 'f' => {
+                self.wrap_pending = false;
                 self.cursor.row = first(1).saturating_sub(1).min(self.height - 1);
                 self.cursor.column = values
                     .get(1)
@@ -256,19 +420,125 @@ impl Screen {
                     .saturating_sub(1)
                     .min(self.width - 1);
             }
-            'J' if values.first().copied().unwrap_or(0) == 2 => self.cells.fill(Cell::default()),
-            'K' => {
-                let start = self.cursor.row * self.width;
-                self.cells[start..start + self.width].fill(Cell::default());
+            'J' => self.erase_display(values.first().copied().unwrap_or(0)),
+            'K' => self.erase_line(values.first().copied().unwrap_or(0)),
+            'X' => {
+                let count = first(1);
+                let start = self.cursor.row * self.width + self.cursor.column;
+                let end = (start + count).min((self.cursor.row + 1) * self.width);
+                self.cells[start..end].fill(Cell::default());
+                self.wrap_pending = false;
+            }
+            'P' => self.delete_characters(first(1)),
+            '@' => self.insert_characters(first(1)),
+            'L' => self.insert_lines(first(1)),
+            'M' => self.delete_lines(first(1)),
+            'S' => self.scroll_up(first(1)),
+            'T' => self.scroll_down(first(1)),
+            'I' => self.tab_forward(first(1)),
+            'Z' => {
+                for _ in 0..first(1) {
+                    let previous = self.cursor.column / 8;
+                    let column = previous.saturating_sub(1) * 8;
+                    self.cursor.column = column.min(self.width - 1);
+                }
+                self.wrap_pending = false;
             }
             'm' => self.apply_sgr(&values),
+            'r' => self.set_scroll_region(&values),
             's' => self.saved_cursor = self.cursor,
-            'u' => self.cursor = self.saved_cursor,
+            'u' => {
+                self.cursor = self.saved_cursor;
+                self.wrap_pending = false;
+            }
             'h' if private && values.contains(&1049) => self.enter_alternate(),
             'l' if private && values.contains(&1049) => self.leave_alternate(),
             'h' if private => self.set_private_modes(&values, true),
             'l' if private => self.set_private_modes(&values, false),
             _ => {}
+        }
+    }
+
+    fn erase_line(&mut self, mode: usize) {
+        let row_start = self.cursor.row * self.width;
+        let row_end = row_start + self.width;
+        let column = self.cursor.column;
+        match mode {
+            1 => self.cells[row_start..row_start + column + 1].fill(Cell::default()),
+            2 => self.cells[row_start..row_end].fill(Cell::default()),
+            _ => self.cells[row_start + column..row_end].fill(Cell::default()),
+        }
+        self.wrap_pending = false;
+    }
+
+    fn erase_display(&mut self, mode: usize) {
+        let index = self.cursor.row * self.width + self.cursor.column;
+        match mode {
+            0 => self.cells[index..].fill(Cell::default()),
+            1 => self.cells[..=index].fill(Cell::default()),
+            _ => self.cells.fill(Cell::default()),
+        }
+        self.wrap_pending = false;
+    }
+
+    fn delete_characters(&mut self, count: usize) {
+        let row_start = self.cursor.row * self.width;
+        let row_end = row_start + self.width;
+        let start = row_start + self.cursor.column;
+        let count = count.min(self.width - self.cursor.column);
+        self.cells.copy_within(start + count..row_end, start);
+        self.cells[row_end - count..row_end].fill(Cell::default());
+    }
+
+    fn insert_characters(&mut self, count: usize) {
+        let row_start = self.cursor.row * self.width;
+        let row_end = row_start + self.width;
+        let start = row_start + self.cursor.column;
+        let count = count.min(self.width - self.cursor.column);
+        self.cells
+            .copy_within(start..row_end - count, start + count);
+        self.cells[start..start + count].fill(Cell::default());
+    }
+
+    fn insert_lines(&mut self, count: usize) {
+        if self.cursor.row < self.scroll_top || self.cursor.row >= self.scroll_bottom {
+            return;
+        }
+        let saved_top = self.scroll_top;
+        self.scroll_top = self.cursor.row;
+        self.scroll_down(count);
+        self.scroll_top = saved_top;
+    }
+
+    fn delete_lines(&mut self, count: usize) {
+        if self.cursor.row < self.scroll_top || self.cursor.row >= self.scroll_bottom {
+            return;
+        }
+        let saved_top = self.scroll_top;
+        self.scroll_top = self.cursor.row;
+        self.scroll_up(count);
+        self.scroll_top = saved_top;
+    }
+
+    fn set_scroll_region(&mut self, values: &[usize]) {
+        let top = values
+            .first()
+            .copied()
+            .filter(|value| *value > 0)
+            .unwrap_or(1)
+            .saturating_sub(1)
+            .min(self.height - 1);
+        let bottom = values
+            .get(1)
+            .copied()
+            .filter(|value| *value > 0)
+            .unwrap_or(self.height)
+            .min(self.height);
+        if top < bottom {
+            self.scroll_top = top;
+            self.scroll_bottom = bottom;
+            self.cursor = Cursor { row: 0, column: 0 };
+            self.wrap_pending = false;
         }
     }
 
@@ -343,6 +613,9 @@ impl Screen {
             self.alternate = Some((primary, self.cursor, self.style));
             self.cursor = Cursor { row: 0, column: 0 };
             self.style = Style::default();
+            self.wrap_pending = false;
+            self.scroll_top = 0;
+            self.scroll_bottom = self.height;
         }
     }
 
@@ -351,6 +624,9 @@ impl Screen {
             self.cells = cells;
             self.cursor = cursor;
             self.style = style;
+            self.wrap_pending = false;
+            self.scroll_top = 0;
+            self.scroll_bottom = self.height;
         }
     }
 
@@ -360,9 +636,14 @@ impl Screen {
         self.saved_cursor = self.cursor;
         self.style = Style::default();
         self.state = ParserState::Ground;
+        self.csi.clear();
+        self.pending_utf8.clear();
         self.alternate = None;
         self.mouse_reporting = false;
         self.bracketed_paste = false;
+        self.wrap_pending = false;
+        self.scroll_top = 0;
+        self.scroll_bottom = self.height;
     }
 }
 
@@ -426,5 +707,101 @@ mod tests {
         screen.feed(b"\x1b[?1000;1006l\x1b[?2004l");
         assert!(!screen.mouse_reporting());
         assert!(!screen.bracketed_paste());
+    }
+
+    #[test]
+    fn fr_tr01_vt_wraps_at_the_right_margin_instead_of_overwriting() {
+        let mut screen = Screen::new(8, 3);
+        screen.feed(b"abcdefghij");
+        assert_eq!(screen.row_text(0), "abcdefgh");
+        assert_eq!(screen.row_text(1), "ij      ");
+        assert_eq!(screen.cursor(), (1, 2));
+    }
+
+    #[test]
+    fn fr_tr01_vt_honours_erase_line_modes() {
+        let mut screen = Screen::new(8, 1);
+        screen.feed(b"hello");
+        screen.feed(b"\x1b[1;3H\x1b[0K");
+        assert_eq!(screen.row_text(0), "he      ");
+
+        screen.feed(b"\x1b[1;1Habcdefg\x1b[1;4H\x1b[1K");
+        assert_eq!(screen.row_text(0), "    efg ");
+
+        screen.feed(b"\x1b[2K");
+        assert_eq!(screen.row_text(0), "        ");
+    }
+
+    #[test]
+    fn fr_tr01_vt_expands_tabs_to_eight_column_stops() {
+        let mut screen = Screen::new(16, 1);
+        screen.feed(b"a\tb");
+        assert_eq!(&screen.row_text(0)[..9], "a       b");
+    }
+
+    #[test]
+    fn fr_tr01_vt_consumes_control_strings_without_printing_them() {
+        let mut screen = Screen::new(16, 1);
+        screen.feed(b"\x1b]0;window title\x07ok");
+        assert!(screen.row_text(0).starts_with("ok"));
+
+        let mut screen = Screen::new(16, 1);
+        screen.feed(b"\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\");
+        assert!(screen.row_text(0).starts_with("link"));
+    }
+
+    #[test]
+    fn fr_tr01_vt_ignores_charset_designation_sequences() {
+        let mut screen = Screen::new(8, 1);
+        screen.feed(b"\x1b(Bok");
+        assert_eq!(screen.row_text(0), "ok      ");
+    }
+
+    #[test]
+    fn fr_tr01_vt_reassembles_utf8_split_across_reads() {
+        let mut screen = Screen::new(8, 1);
+        let bytes = "你".as_bytes();
+        screen.feed(&bytes[..2]);
+        assert_eq!(screen.row_text(0), "        ");
+        screen.feed(&bytes[2..]);
+        assert!(screen.row_text(0).starts_with('你'));
+    }
+
+    #[test]
+    fn fr_tr01_vt_scrolls_only_inside_the_declared_region() {
+        let mut screen = Screen::new(4, 4);
+        screen.feed(b"a\r\nb\r\nc\r\nd");
+        screen.feed(b"\x1b[2;3r");
+        screen.feed(b"\x1b[3;1H\r\nX");
+        assert_eq!(screen.row_text(0), "a   ");
+        assert_eq!(screen.row_text(1), "c   ");
+        assert_eq!(screen.row_text(2), "X   ");
+        assert_eq!(screen.row_text(3), "d   ");
+    }
+
+    #[test]
+    fn fr_tr01_vt_inserts_and_deletes_characters() {
+        let mut screen = Screen::new(8, 1);
+        screen.feed(b"abcdef\x1b[1;3H\x1b[2P");
+        assert_eq!(screen.row_text(0), "abef    ");
+
+        let mut screen = Screen::new(8, 1);
+        screen.feed(b"abcdef\x1b[1;3H\x1b[2@");
+        assert_eq!(screen.row_text(0), "ab  cdef");
+    }
+
+    #[test]
+    fn fr_tr01_vt_inserts_and_deletes_lines_inside_the_region() {
+        let mut screen = Screen::new(4, 4);
+        screen.feed(b"a\r\nb\r\nc\r\nd");
+        screen.feed(b"\x1b[2;1H\x1b[L");
+        assert_eq!(screen.row_text(1), "    ");
+        assert_eq!(screen.row_text(2), "b   ");
+
+        let mut screen = Screen::new(4, 4);
+        screen.feed(b"a\r\nb\r\nc\r\nd");
+        screen.feed(b"\x1b[2;1H\x1b[M");
+        assert_eq!(screen.row_text(1), "c   ");
+        assert_eq!(screen.row_text(2), "d   ");
     }
 }

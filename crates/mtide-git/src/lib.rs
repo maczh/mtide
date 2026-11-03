@@ -95,7 +95,7 @@ pub struct Repository {
 impl Repository {
     pub fn discover(path: &Path) -> Result<Self, GitError> {
         let output = run_git(path, &["rev-parse", "--show-toplevel"])?;
-        let root = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+        let root = normalize_git_path(Path::new(String::from_utf8_lossy(&output.stdout).trim()));
         if root.as_os_str().is_empty() {
             return Err(GitError::NotRepository(path.to_path_buf()));
         }
@@ -997,6 +997,14 @@ impl Repository {
     }
 }
 
+fn normalize_git_path(path: &Path) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    if let Ok(relative) = path.strip_prefix("/private") {
+        return Path::new("/").join(relative);
+    }
+    path.to_path_buf()
+}
+
 fn run_git(cwd: &Path, args: &[&str]) -> Result<std::process::Output, GitError> {
     let mut command = Command::new("git");
     command.current_dir(cwd).args(args);
@@ -1159,78 +1167,110 @@ fn read_pipe<R: Read>(mut reader: R) -> io::Result<Vec<u8>> {
 }
 
 pub fn parse_status(bytes: &[u8]) -> Result<Vec<StatusEntry>, GitError> {
-    let mut entries = Vec::new();
-    for record in bytes
+    let records = bytes
         .split(|byte| *byte == 0)
         .filter(|record| !record.is_empty())
-    {
-        let text = String::from_utf8_lossy(record);
-        let mut fields = text.split(' ');
-        let tag = fields.next().unwrap_or_default();
+        .collect::<Vec<_>>();
+    let mut entries = Vec::new();
+    let mut index = 0;
+    while index < records.len() {
+        let record = records[index];
+        index += 1;
+        let mut rest = record;
+        let (tag, remainder) = split_field(rest).unwrap_or((rest, &[]));
+        rest = remainder;
         match tag {
-            "1" => {
-                let xy = fields.next().unwrap_or("  ");
-                let _submodule = fields.next();
-                for _ in 0..5 {
-                    let _ = fields.next();
-                }
-                let path = fields.collect::<Vec<_>>().join(" ");
-                entries.push(StatusEntry {
-                    path: PathBuf::from(path),
-                    original_path: None,
-                    kind: kind_for_code(
+            b"1" => {
+                let (xy, remainder) = split_field(rest)
+                    .ok_or_else(|| GitError::Command("malformed porcelain record".into()))?;
+                let (_, remainder) = take_fields(remainder, 6)?;
+                rest = remainder;
+                let xy = String::from_utf8_lossy(xy).into_owned();
+                entries.push(status_entry(
+                    rest,
+                    None,
+                    kind_for_code(
                         xy.chars().next().unwrap_or(' '),
                         xy.chars().nth(1).unwrap_or(' '),
                     ),
-                    index_code: xy.chars().next().unwrap_or(' '),
-                    worktree_code: xy.chars().nth(1).unwrap_or(' '),
-                });
+                    &xy,
+                ));
             }
-            "2" => {
-                let xy = fields.next().unwrap_or("  ");
-                let _submodule = fields.next();
-                for _ in 0..5 {
-                    let _ = fields.next();
+            b"2" => {
+                let (xy, remainder) = split_field(rest)
+                    .ok_or_else(|| GitError::Command("malformed porcelain record".into()))?;
+                let (_, remainder) = take_fields(remainder, 7)?;
+                rest = remainder;
+                let xy = String::from_utf8_lossy(xy).into_owned();
+                // With -z the original path follows as its own NUL record.
+                let original = records.get(index).copied();
+                if original.is_some() {
+                    index += 1;
                 }
-                let _score = fields.next();
-                let path = fields.collect::<Vec<_>>().join(" ");
-                // Rename records carry the old path in the next NUL record; the
-                // parser keeps the new path and leaves association to the caller.
-                entries.push(StatusEntry {
-                    path: PathBuf::from(path),
-                    original_path: None,
-                    kind: ChangeKind::Renamed,
-                    index_code: xy.chars().next().unwrap_or(' '),
-                    worktree_code: xy.chars().nth(1).unwrap_or(' '),
-                });
+                entries.push(status_entry(rest, original, ChangeKind::Renamed, &xy));
             }
-            "u" => {
-                let xy = fields.next().unwrap_or("UU");
-                let _ = fields.next();
-                for _ in 0..6 {
-                    let _ = fields.next();
-                }
-                let path = fields.collect::<Vec<_>>().join(" ");
-                entries.push(StatusEntry {
-                    path: PathBuf::from(path),
-                    original_path: None,
-                    kind: ChangeKind::Unmerged,
-                    index_code: xy.chars().next().unwrap_or('U'),
-                    worktree_code: xy.chars().nth(1).unwrap_or('U'),
-                });
+            b"u" => {
+                let (xy, remainder) = split_field(rest)
+                    .ok_or_else(|| GitError::Command("malformed porcelain record".into()))?;
+                let (_, remainder) = take_fields(remainder, 8)?;
+                rest = remainder;
+                let xy = String::from_utf8_lossy(xy).into_owned();
+                entries.push(status_entry(rest, None, ChangeKind::Unmerged, &xy));
             }
-            "?" => entries.push(StatusEntry {
-                path: PathBuf::from(fields.collect::<Vec<_>>().join(" ")),
+            b"?" => entries.push(StatusEntry {
+                path: path_from_bytes(rest),
                 original_path: None,
                 kind: ChangeKind::Untracked,
                 index_code: '?',
                 worktree_code: '?',
             }),
-            "!" => {}
+            b"!" => {}
             _ => {}
         }
     }
     Ok(entries)
+}
+
+/// Splits the first space-delimited field off a porcelain record.
+fn split_field(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
+    let position = bytes.iter().position(|byte| *byte == b' ')?;
+    Some((&bytes[..position], &bytes[position + 1..]))
+}
+
+/// Skips `count` fields and returns the last skipped field plus the remainder.
+/// Porcelain v2 keeps the path as the trailing field so it may contain spaces.
+fn take_fields(bytes: &[u8], count: usize) -> Result<(&[u8], &[u8]), GitError> {
+    let mut rest = bytes;
+    let mut last = &b""[..];
+    for _ in 0..count {
+        let (field, remainder) = split_field(rest)
+            .ok_or_else(|| GitError::Command("malformed porcelain record".into()))?;
+        last = field;
+        rest = remainder;
+    }
+    Ok((last, rest))
+}
+
+fn path_from_bytes(bytes: &[u8]) -> PathBuf {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        PathBuf::from(std::ffi::OsStr::from_bytes(bytes))
+    }
+    #[cfg(not(unix))]
+    {
+        PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
+    }
+}
+
+fn status_entry(path: &[u8], original: Option<&[u8]>, kind: ChangeKind, xy: &str) -> StatusEntry {
+    StatusEntry {
+        path: path_from_bytes(path),
+        original_path: original.map(path_from_bytes),
+        kind,
+        index_code: xy.chars().next().unwrap_or(' '),
+        worktree_code: xy.chars().nth(1).unwrap_or(' '),
+    }
 }
 
 fn kind_for_code(index: char, worktree: char) -> ChangeKind {
@@ -1262,6 +1302,35 @@ mod tests {
         process::Command,
     };
 
+    #[test]
+    fn fr_gt02_porcelain_parser_keeps_paths_with_spaces_and_rename_sources() {
+        let bytes = b"1 .M N... 100644 100644 100644 aaa bbb dir/with  two spaces.rs\0";
+        let entries = parse_status(bytes).expect("parse status");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, PathBuf::from("dir/with  two spaces.rs"));
+        assert_eq!(entries[0].worktree_code, 'M');
+
+        let rename = b"2 R. N... 100644 100644 100644 aaa bbb R100 new/name.rs\0old/name.rs\0";
+        let entries = parse_status(rename).expect("parse rename");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, ChangeKind::Renamed);
+        assert_eq!(entries[0].path, PathBuf::from("new/name.rs"));
+        assert_eq!(
+            entries[0].original_path.as_deref(),
+            Some(Path::new("old/name.rs"))
+        );
+    }
+
+    #[test]
+    fn fr_gt09_porcelain_parser_reads_unmerged_paths_not_object_ids() {
+        let bytes = b"u UU N... 100644 100644 100644 100644 aaa bbb ccc src/conflicted file.rs\0";
+        let entries = parse_status(bytes).expect("parse conflict");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, ChangeKind::Unmerged);
+        assert_eq!(entries[0].path, PathBuf::from("src/conflicted file.rs"));
+        assert_eq!(entries[0].index_code, 'U');
+        assert_eq!(entries[0].worktree_code, 'U');
+    }
     #[cfg(unix)]
     #[test]
     fn fr_gt12_git_command_timeout_kills_child_and_returns_error() {

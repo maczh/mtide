@@ -1,0 +1,10 @@
+roots = [
+    "./crates/mtide-core/src",
+    "/Users/macro/Work/rust/src/github.com/maczh/mtide",
+]
+
+[layout]
+"editor.split" = "false"
+"editor.split.direction" = "vertical"
+keymap = "vscode"
+theme = "retro"

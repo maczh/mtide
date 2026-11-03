@@ -125,6 +125,7 @@ fn check_dependencies() -> Result<(), String> {
         "mtide-workspace",
         "mtide-search",
         "mtide-syntax",
+        "mtide-lsp",
         "mtide-vt",
         "mtide-term",
         "mtide-task",

@@ -10,7 +10,7 @@ use std::{
     io::{self, Read, Write},
     path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, Stdio},
-    sync::mpsc::{self, Receiver},
+    sync::mpsc::{self, Receiver, SyncSender},
     thread,
 };
 use thiserror::Error;
@@ -120,6 +120,8 @@ pub struct TerminalSession {
     pub screen: Screen,
     scrollback: VecDeque<String>,
     partial_line: String,
+    /// Bytes of an incomplete UTF-8 sequence held over for the next read.
+    pending_bytes: Vec<u8>,
     max_scrollback: usize,
     backend: BackendKind,
 }
@@ -170,7 +172,7 @@ impl TerminalSession {
         let stderr = child.stderr.take().ok_or_else(|| {
             io::Error::new(io::ErrorKind::BrokenPipe, "terminal stderr unavailable")
         })?;
-        let (sender, output) = mpsc::channel();
+        let (sender, output) = mpsc::sync_channel(256);
         spawn_reader(stdout, sender.clone());
         spawn_reader(stderr, sender);
         Ok(Self {
@@ -186,6 +188,7 @@ impl TerminalSession {
             screen: Screen::new(width, height),
             scrollback: VecDeque::new(),
             partial_line: String::new(),
+            pending_bytes: Vec::new(),
             max_scrollback: max_scrollback.max(1),
             backend: BackendKind::PipeFallback,
         })
@@ -269,7 +272,7 @@ impl TerminalSession {
         let master = unsafe { std::fs::File::from_raw_fd(pair.master) };
         let reader = master.try_clone()?;
         let input = master.try_clone()?;
-        let (sender, output) = mpsc::channel();
+        let (sender, output) = mpsc::sync_channel(256);
         spawn_reader(reader, sender);
         Ok(Self {
             name,
@@ -284,6 +287,7 @@ impl TerminalSession {
             screen: Screen::new(width, height),
             scrollback: VecDeque::new(),
             partial_line: String::new(),
+            pending_bytes: Vec::new(),
             max_scrollback: max_scrollback.max(1),
             backend: BackendKind::Pty,
         })
@@ -378,13 +382,60 @@ impl TerminalSession {
 
     pub fn terminate(&mut self) -> Result<Option<std::process::ExitStatus>, TerminalError> {
         if self.child.try_wait()?.is_none() {
-            self.child.kill()?;
+            self.kill_tree()?;
         }
         Ok(self.child.wait().ok())
     }
 
+    /// Kills the session and, on Unix PTY sessions, everything in its process
+    /// group so no orphan keeps the terminal device alive (PRD NF-12).
+    fn kill_tree(&mut self) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            if matches!(self.input, SessionInput::Pty(_)) {
+                if let Ok(pid) = i32::try_from(self.child.id()) {
+                    // SAFETY: sending a signal to a negative pid targets the
+                    // child's process group; an error is reported by the return
+                    // value and is harmless here because the direct kill below
+                    // still runs.
+                    unsafe {
+                        nix::libc::kill(-pid, nix::libc::SIGKILL);
+                    }
+                }
+            }
+        }
+        self.child.kill()
+    }
+
+    /// Appends output to the scrollback, decoding UTF-8 incrementally so a
+    /// multi-byte character split across two reads is not mangled.
     fn collect_scrollback(&mut self, chunk: &[u8]) {
-        self.partial_line.push_str(&String::from_utf8_lossy(chunk));
+        let mut buffer = std::mem::take(&mut self.pending_bytes);
+        buffer.extend_from_slice(chunk);
+        let mut text = String::new();
+        let mut rest = buffer.as_slice();
+        loop {
+            match std::str::from_utf8(rest) {
+                Ok(valid) => {
+                    text.push_str(valid);
+                    rest = &[];
+                    break;
+                }
+                Err(error) => {
+                    let (valid, after) = rest.split_at(error.valid_up_to());
+                    text.push_str(std::str::from_utf8(valid).expect("valid up to error"));
+                    match error.error_len() {
+                        Some(length) => rest = &after[length..],
+                        None => {
+                            rest = after;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        self.pending_bytes = rest.to_vec();
+        self.partial_line.push_str(&text);
         let mut complete = Vec::new();
         while let Some(index) = self.partial_line.find('\n') {
             let line = self.partial_line[..index].trim_end_matches('\r').to_owned();
@@ -403,7 +454,7 @@ impl TerminalSession {
 impl Drop for TerminalSession {
     fn drop(&mut self) {
         if self.child.try_wait().ok().flatten().is_none() {
-            let _ = self.child.kill();
+            let _ = self.kill_tree();
         }
         let _ = self.child.wait();
     }
@@ -644,7 +695,7 @@ impl TerminalManager {
     }
 }
 
-fn spawn_reader<R: Read + Send + 'static>(mut reader: R, sender: mpsc::Sender<Vec<u8>>) {
+fn spawn_reader<R: Read + Send + 'static>(mut reader: R, sender: SyncSender<Vec<u8>>) {
     thread::spawn(move || {
         let mut buffer = [0_u8; 8192];
         loop {
@@ -786,6 +837,32 @@ mod tests {
         assert!(panel.is_fullscreen());
         assert!(!panel.toggle_fullscreen());
         assert!(!panel.is_fullscreen());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fr_tr01_scrollback_decodes_utf8_split_across_reads() {
+        let mut session = TerminalSession::spawn(
+            "utf8",
+            "sh",
+            &[
+                "-c".into(),
+                "printf 'a\\344'; sleep 0.05; printf '\\275\\240\\n'".into(),
+            ],
+            None,
+            20,
+            4,
+            10,
+        )
+        .expect("spawn test shell");
+        for _ in 0..100 {
+            session.poll_output();
+            if session.scrollback().any(|line| line == "a你") {
+                break;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(session.scrollback().collect::<Vec<_>>(), vec!["a你"]);
     }
 
     #[cfg(unix)]

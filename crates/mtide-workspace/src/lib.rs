@@ -75,6 +75,9 @@ pub struct SessionTab {
     pub preview: bool,
     #[serde(default)]
     pub dirty: bool,
+    /// First visible line, persisted so reopening a session keeps the viewport.
+    #[serde(default)]
+    pub scroll: usize,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -223,9 +226,14 @@ impl WorkspaceRoots {
         old_len != self.roots.len()
     }
     pub fn roots_for(&self, path: &Path) -> Vec<&Path> {
+        let comparable = path
+            .parent()
+            .and_then(|parent| fs::canonicalize(parent).ok())
+            .and_then(|parent| path.file_name().map(|name| parent.join(name)))
+            .unwrap_or_else(|| path.to_path_buf());
         self.roots
             .iter()
-            .filter(|root| path.starts_with(root))
+            .filter(|root| path.starts_with(root) || comparable.starts_with(root))
             .map(PathBuf::as_path)
             .collect()
     }

@@ -228,23 +228,29 @@ pub fn highlight(line: &str, language: Language) -> Vec<Span> {
                 .any(|range| span.start < range.end && range.start < span.end)
     });
     let mut number_start = None;
+    let push_number = |start: usize, end: usize, spans: &mut Vec<Span>| {
+        // Digits inside a string literal belong to the string, not to a number.
+        if string_ranges
+            .iter()
+            .any(|range| start < range.end && range.start < end)
+        {
+            return;
+        }
+        spans.push(Span {
+            start,
+            end,
+            kind: TokenKind::Number,
+        });
+    };
     for (index, character) in code.char_indices() {
         if character.is_ascii_digit() {
             number_start.get_or_insert(index);
         } else if let Some(start) = number_start.take() {
-            spans.push(Span {
-                start,
-                end: index,
-                kind: TokenKind::Number,
-            });
+            push_number(start, index, &mut spans);
         }
     }
     if let Some(start) = number_start {
-        spans.push(Span {
-            start,
-            end: code.len(),
-            kind: TokenKind::Number,
-        });
+        push_number(start, code.len(), &mut spans);
     }
     if let Some(start) = comment_start {
         spans.push(Span {
@@ -316,6 +322,19 @@ mod tests {
         assert!(!rust_hash.iter().any(|span| span.kind == TokenKind::Comment));
     }
 
+    #[test]
+    fn fr_ln02_digits_inside_string_literals_are_not_number_tokens() {
+        let spans = highlight("let path = \"file42.txt\"; let count = 42;", Language::Rust);
+        assert!(
+            !spans
+                .iter()
+                .any(|span| span.kind == TokenKind::Number && span.start < 23),
+            "digits inside the string literal must not be tokenised as numbers"
+        );
+        assert!(spans
+            .iter()
+            .any(|span| span.kind == TokenKind::Number && span.start > 30));
+    }
     #[test]
     fn fr_ed06_indexes_symbols_for_jump() {
         let symbols = symbols("fn main() {}\nstruct App {}\n", Language::Rust);

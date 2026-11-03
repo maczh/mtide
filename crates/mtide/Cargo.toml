@@ -20,12 +20,18 @@ mtide-diff = { path = "../mtide-diff" }
 mtide-search = { path = "../mtide-search" }
 mtide-ai = { path = "../mtide-ai" }
 mtide-nav = { path = "../mtide-nav" }
+mtide-lsp = { path = "../mtide-lsp" }
 mtide-plugin = { path = "../mtide-plugin" }
+nix.workspace = true
 signal-hook.workspace = true
 thiserror.workspace = true
 toml.workspace = true
 unicode-segmentation.workspace = true
 unicode-width.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+mtide-proc = { path = "../mtide-proc" }
 
 [[bin]]
 name = "mtide"

@@ -14,6 +14,11 @@ use mtide_git::{
     Branch, ChangeKind as GitChangeKind, CommitSummary, GitCancellation, Repository, StashEntry,
     StatusEntry,
 };
+use mtide_lsp::{
+    file_uri, offset_at, parse_completion_result, parse_hover_result, position_at, recipe_for,
+    ClientConfig, ClientEvent, CompletionItem, DiagnosticStore, Lifecycle, LspClient, ProbeResult,
+    ServerSpec,
+};
 use mtide_search::{CancellationToken, SearchMatch, SearchOptions};
 use mtide_task::{ResultStatus, TaskContext, TaskRun, TaskSpec, TaskState};
 use mtide_term::{
@@ -21,9 +26,9 @@ use mtide_term::{
 };
 use mtide_tui::{
     discover_theme_packages, install_panic_hook, layout_with_sidebar, load_theme_package,
-    render_with_options, wrap_line, Action, Cell, CellBuffer, ClipboardHistory, ColorCapability,
-    CommandEntry, CommandRegistry, Keymap, TerminalCapabilities, TerminalGuard, ThemePackage,
-    TuiError,
+    render_with_options, workbench_layout, wrap_line, Action, Cell, CellBuffer, ClipboardHistory,
+    ColorCapability, CommandEntry, CommandRegistry, Keymap, TerminalCapabilities, TerminalGuard,
+    ThemePackage, TuiError,
 };
 use mtide_vt::Color as VtColor;
 use mtide_workspace::{
@@ -37,12 +42,13 @@ use signal_hook::{consts::SIGINT, flag};
 use std::process::Command;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    mpsc::{self, Receiver},
+    mpsc::{self, Receiver, TryRecvError},
     Arc,
 };
 use std::{
     collections::BTreeSet,
-    env, fs, io,
+    env, fs,
+    io::{self, IsTerminal},
     ops::Range,
     path::{Path, PathBuf},
     time::{Duration, Instant},
@@ -85,6 +91,7 @@ type GitStatusResult = (
         Vec<StashEntry>,
         Option<String>,
         usize,
+        bool,
         bool,
     )>,
 );
@@ -161,6 +168,13 @@ struct EditorTab {
     pinned: bool,
     preview: bool,
     dirty: bool,
+    /// Document version the cached `text` was copied from. Syncing a tab on
+    /// every frame must not clone the buffer when nothing changed.
+    text_version: i32,
+    /// First visible line of this tab, restored on tab switch (WS-03).
+    scroll: usize,
+    /// Cursor value the scroll offset was anchored to.
+    scroll_cursor: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -221,9 +235,19 @@ struct App {
     line_ending: LineEnding,
     wrap_width: usize,
     horizontal_scroll: usize,
+    /// First logical line visible in the editor viewport.
+    editor_scroll: usize,
+    /// Cursor position the viewport was last anchored to, so manual scrolling
+    /// is not undone by the next frame.
+    editor_scroll_cursor: usize,
+    /// File the scroll offset belongs to; opening another file starts at the top.
+    editor_scroll_path: Option<PathBuf>,
     large_file_mode: bool,
     watcher: Option<WorkspaceWatcher>,
     external_change: bool,
+    /// Set when the restored session buffer is older than the file on disk.
+    /// Survives tab switches so autosave can never flush the stale copy.
+    stale_restore: bool,
     notification: Option<String>,
     notification_history: Vec<String>,
     notifications_open: bool,
@@ -231,6 +255,9 @@ struct App {
     last_watch_poll: Instant,
     navigation: NavigationStack,
     folded_lines: BTreeSet<usize>,
+    fold_cache: Option<FoldCache>,
+    /// Sticky context rows drawn above the viewport, reused by hit testing.
+    sticky_rows: usize,
     bookmarks: BTreeSet<usize>,
     workspace_roots: Vec<PathBuf>,
     snippet_stops: Vec<(usize, usize)>,
@@ -277,6 +304,23 @@ struct App {
     save_as_input: String,
     sidebar_width: Option<u16>,
     sidebar_dragging: bool,
+    sidebar_expanded: BTreeSet<PathBuf>,
+    sidebar_entries: std::collections::BTreeMap<PathBuf, Vec<SidebarEntry>>,
+    sidebar_selected: Option<PathBuf>,
+    /// Extra rows selected alongside the cursor row (Ctrl/Shift selection).
+    sidebar_multi: BTreeSet<PathBuf>,
+    /// Row a Shift range starts from.
+    sidebar_anchor: Option<PathBuf>,
+    sidebar_scroll: usize,
+    sidebar_focus: bool,
+    sidebar_capacity: usize,
+    quit_requested: bool,
+    /// Column where the tab bar starts on row 1 (kept for hit testing).
+    tab_origin: u16,
+    menu_open: Option<usize>,
+    menu_selected: usize,
+    menu_submenu: bool,
+    menu_submenu_selected: usize,
     task_run: Option<TaskRun>,
     background_tasks: Vec<(TaskRun, Instant)>,
     task_started: Option<Instant>,
@@ -356,6 +400,194 @@ struct App {
     last_git_poll: Instant,
     git_status_job: Option<Receiver<GitStatusResult>>,
     git_status_cancel: Option<GitCancellation>,
+    lsp: Option<LspSession>,
+    lsp_diagnostics: DiagnosticStore,
+    lsp_status: String,
+    lsp_probe_job: Option<Receiver<(&'static str, bool)>>,
+    no_lsp: bool,
+    completion_open: bool,
+    completion_items: Vec<CompletionItem>,
+    completion_incomplete: bool,
+    completion_selected: usize,
+    completion_scroll: usize,
+    completion_prefix: String,
+    completion_anchor: usize,
+    completion_request: Option<u64>,
+    hover_open: bool,
+    hover_lines: Vec<String>,
+    hover_scroll: usize,
+    hover_request: Option<u64>,
+}
+
+/// How a click or key press changes the sidebar selection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SidebarSelect {
+    Replace,
+    Toggle,
+    Extend,
+}
+
+/// Cached syntax facts for the current buffer. `fold_regions` walks the whole
+/// file, so it must not run on every frame: the cache is keyed by document
+/// version, which changes on every edit.
+struct FoldCache {
+    path: Option<PathBuf>,
+    version: i32,
+    language: mtide_syntax::Language,
+    regions: std::sync::Arc<Vec<mtide_syntax::FoldRegion>>,
+    /// start_line -> end_line, for O(log n) lookups while rendering.
+    index: std::sync::Arc<std::collections::BTreeMap<usize, usize>>,
+}
+
+/// One row of the sidebar file tree.
+#[derive(Clone, Debug)]
+struct SidebarEntry {
+    name: String,
+    path: PathBuf,
+    is_dir: bool,
+    depth: usize,
+}
+
+/// One language server session owned by the workbench.
+///
+/// The client is polled from the UI loop; `synced` records the document state
+/// the server currently believes in, which is what makes `didOpen`/`didChange`
+/// idempotent across tab switches and saves.
+struct LspSession {
+    client: LspClient,
+    server: &'static str,
+    language: &'static str,
+    synced: Option<(PathBuf, i32)>,
+}
+
+/// Short label for the status bar and notifications.
+fn state_label(state: Lifecycle) -> &'static str {
+    match state {
+        Lifecycle::Ready => "ready",
+        Lifecycle::Degraded => "degraded",
+        Lifecycle::Initializing | Lifecycle::Spawning => "starting",
+        Lifecycle::Restarting => "restarting",
+        Lifecycle::Crashed => "crashed",
+        Lifecycle::Disabled => "disabled",
+        Lifecycle::Discovered => "idle",
+    }
+}
+
+/// Actions a menu entry can run. Kept as an enum (not strings) so the menu and
+/// the command palette cannot drift apart silently.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MenuAction {
+    NewFile,
+    Save,
+    OpenFolder,
+    Quit,
+    Undo,
+    Redo,
+    Find,
+    ToggleWordWrap,
+    SelectAll,
+    AddCursor,
+    CommandPalette,
+    ToggleSidebar,
+    ToggleTerminal,
+    ZenMode,
+    ToggleDiffSplit,
+    ToggleDiffContext,
+    ToggleDiffWrap,
+    ToggleGitTree,
+    ToggleFileIcons,
+    About,
+}
+
+/// Menu bar labels, in order.
+const MENU_LABELS: [&str; 6] = ["File", "Edit", "Selection", "View", "Options", "Help"];
+
+/// Geometry of each menu label: text plus its inclusive column range on row 0.
+/// Derived from the labels themselves so the bar and the click targets can never
+/// drift apart (they did while the ranges were hard-coded).
+fn menu_bar_positions() -> Vec<(&'static str, u16, u16)> {
+    let mut positions = Vec::with_capacity(MENU_LABELS.len());
+    let mut column = 1_u16;
+    for label in MENU_LABELS {
+        let end = column + label.chars().count() as u16 - 1;
+        positions.push((label, column, end));
+        column = end + 1 + 5;
+    }
+    positions
+}
+
+/// The row-0 menu bar text, padded so each label sits at its computed column.
+fn menu_bar_text() -> String {
+    let mut text = String::new();
+    for (label, start, _) in menu_bar_positions() {
+        while (text.chars().count() as u16) < start {
+            text.push(' ');
+        }
+        text.push_str(label);
+    }
+    text
+}
+
+fn menu_items(menu: usize) -> &'static [(&'static str, MenuAction)] {
+    match menu {
+        0 => &[
+            ("New File", MenuAction::NewFile),
+            ("Save", MenuAction::Save),
+            ("Open Folder", MenuAction::OpenFolder),
+            ("Quit", MenuAction::Quit),
+        ],
+        1 => &[
+            ("Undo", MenuAction::Undo),
+            ("Redo", MenuAction::Redo),
+            ("Find", MenuAction::Find),
+            ("Toggle Word Wrap", MenuAction::ToggleWordWrap),
+        ],
+        2 => &[
+            ("Select All", MenuAction::SelectAll),
+            ("Add Cursor Below", MenuAction::AddCursor),
+        ],
+        3 => &[
+            ("Command Palette", MenuAction::CommandPalette),
+            ("Toggle Sidebar", MenuAction::ToggleSidebar),
+            ("Toggle Terminal", MenuAction::ToggleTerminal),
+            ("Zen Mode", MenuAction::ZenMode),
+        ],
+        4 => &[
+            ("Diff Views", MenuAction::ToggleDiffSplit),
+            ("Git Files", MenuAction::ToggleGitTree),
+        ],
+        _ => &[("About mtide", MenuAction::About)],
+    }
+}
+
+/// Submenu entries for the Options menu; `index` is the parent item.
+fn submenu_items(menu: usize, index: usize) -> &'static [(&'static str, MenuAction)] {
+    if menu != 4 {
+        return &[];
+    }
+    match index {
+        0 => &[
+            ("Split / Unified", MenuAction::ToggleDiffSplit),
+            ("Changes Only / Full File", MenuAction::ToggleDiffContext),
+            ("Wrap Lines", MenuAction::ToggleDiffWrap),
+        ],
+        1 => &[
+            ("Tree / List", MenuAction::ToggleGitTree),
+            ("File Icons", MenuAction::ToggleFileIcons),
+        ],
+        _ => &[],
+    }
+}
+
+/// Maps an editor language to the recipe identifier used by `mtide-lsp`.
+fn lsp_language(path: &Path) -> Option<&'static str> {
+    match mtide_syntax::detect(path) {
+        mtide_syntax::Language::Rust => Some("rust"),
+        mtide_syntax::Language::Go => Some("go"),
+        mtide_syntax::Language::Python => Some("python"),
+        mtide_syntax::Language::JavaScript => Some("typescript"),
+        _ => None,
+    }
 }
 
 impl App {
@@ -575,9 +807,13 @@ impl App {
             line_ending,
             wrap_width: 1,
             horizontal_scroll: 0,
+            editor_scroll: 0,
+            editor_scroll_cursor: 0,
+            editor_scroll_path: None,
             large_file_mode,
             watcher,
             external_change: false,
+            stale_restore: false,
             notification: None,
             notification_history: Vec::new(),
             notifications_open: false,
@@ -585,6 +821,8 @@ impl App {
             last_watch_poll: Instant::now(),
             navigation: NavigationStack::default(),
             folded_lines: BTreeSet::new(),
+            fold_cache: None,
+            sticky_rows: 0,
             bookmarks: BTreeSet::new(),
             workspace_roots: path
                 .as_ref()
@@ -646,6 +884,20 @@ impl App {
             save_as_input: String::new(),
             sidebar_width: None,
             sidebar_dragging: false,
+            sidebar_expanded: BTreeSet::new(),
+            sidebar_entries: std::collections::BTreeMap::new(),
+            sidebar_selected: None,
+            sidebar_multi: BTreeSet::new(),
+            sidebar_anchor: None,
+            sidebar_scroll: 0,
+            sidebar_focus: false,
+            sidebar_capacity: 1,
+            quit_requested: false,
+            tab_origin: 0,
+            menu_open: None,
+            menu_selected: 0,
+            menu_submenu: false,
+            menu_submenu_selected: 0,
             task_run: None,
             background_tasks: Vec::new(),
             task_started: None,
@@ -729,10 +981,35 @@ impl App {
             last_git_poll: Instant::now(),
             git_status_job: None,
             git_status_cancel: None,
+            lsp: None,
+            lsp_diagnostics: DiagnosticStore::default(),
+            lsp_status: "LSP: idle".into(),
+            lsp_probe_job: None,
+            no_lsp: false,
+            completion_open: false,
+            completion_items: Vec::new(),
+            completion_incomplete: false,
+            completion_selected: 0,
+            completion_scroll: 0,
+            completion_prefix: String::new(),
+            completion_anchor: 0,
+            completion_request: None,
+            hover_open: false,
+            hover_lines: Vec::new(),
+            hover_scroll: 0,
+            hover_request: None,
         };
         if restored_dirty {
             app.document.mark_dirty();
-            app.notification = Some("restored unsaved session changes".into());
+            // The snapshot is older than the file on disk. Treat it as an
+            // external conflict so autosave cannot silently overwrite newer
+            // content (PRD ED-11 / EX-03).
+            app.external_change = true;
+            app.stale_restore = true;
+            app.notification = Some(
+                "restored unsaved session changes over a newer file: Ctrl+R reload, Ctrl+Shift+S overwrite"
+                    .into(),
+            );
         }
         if let Some(path) = active_path.as_ref() {
             app.record_recent_file(path);
@@ -786,6 +1063,9 @@ impl App {
             pinned,
             preview,
             dirty: self.document.is_dirty(),
+            text_version: self.document.version(),
+            scroll: self.editor_scroll,
+            scroll_cursor: self.editor_scroll_cursor,
         }
     }
 
@@ -798,20 +1078,43 @@ impl App {
 
     fn sync_current_tab(&mut self) {
         self.ensure_tab_state();
-        let current = self.current_editor_tab();
-        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-            tab.path = current.path;
-            tab.text = current.text;
-            tab.cursor = current.cursor;
-            tab.selection = current.selection;
-            tab.extra_cursors = current.extra_cursors;
-            tab.readonly = current.readonly;
-            tab.baseline = current.baseline;
-            tab.encoding = current.encoding;
-            tab.line_ending = current.line_ending;
-            tab.large_file_mode = current.large_file_mode;
-            tab.folded_lines = current.folded_lines;
-            tab.dirty = current.dirty;
+        // Deliberately not built from `current_editor_tab()`: that clones the
+        // whole buffer, and this runs on every frame.
+        let version = self.document.version();
+        let dirty = self.document.is_dirty();
+        let path = self.path.clone();
+        let cursor = self.cursor;
+        let selection = self.selection;
+        let extra_cursors = self.extra_cursors.clone();
+        let readonly = self.readonly;
+        let baseline = self.baseline.clone();
+        let encoding = self.encoding;
+        let line_ending = self.line_ending;
+        let large_file_mode = self.large_file_mode;
+        let folded_lines = self.folded_lines.clone();
+        let scroll = self.editor_scroll;
+        let scroll_cursor = self.editor_scroll_cursor;
+        let active = self.active_tab;
+        let text = (self.tabs.get(active).map(|tab| tab.text_version) != Some(version))
+            .then(|| self.document.text());
+        if let Some(tab) = self.tabs.get_mut(active) {
+            tab.path = path;
+            if let Some(text) = text {
+                tab.text = text;
+                tab.text_version = version;
+            }
+            tab.cursor = cursor;
+            tab.selection = selection;
+            tab.extra_cursors = extra_cursors;
+            tab.readonly = readonly;
+            tab.baseline = baseline;
+            tab.encoding = encoding;
+            tab.line_ending = line_ending;
+            tab.large_file_mode = large_file_mode;
+            tab.folded_lines = folded_lines;
+            tab.dirty = dirty;
+            tab.scroll = scroll;
+            tab.scroll_cursor = scroll_cursor;
         }
     }
 
@@ -843,6 +1146,9 @@ impl App {
             pinned: tab.pinned,
             preview: tab.preview,
             dirty: tab.dirty,
+            text_version: 1,
+            scroll: tab.scroll,
+            scroll_cursor: cursor,
         }
     }
 
@@ -880,6 +1186,9 @@ impl App {
         self.line_ending = tab.line_ending;
         self.large_file_mode = tab.large_file_mode;
         self.folded_lines = tab.folded_lines;
+        self.editor_scroll = tab.scroll;
+        self.editor_scroll_cursor = tab.scroll_cursor;
+        self.editor_scroll_path = self.path.clone();
         self.watcher = self
             .path
             .as_deref()
@@ -890,7 +1199,9 @@ impl App {
         self.git_counts = (0, 0, 0, 0);
         self.git_status_job = None;
         self.last_git_poll = Instant::now();
-        self.external_change = false;
+        // A stale session restore keeps the conflict flag alive across tab
+        // switches; otherwise autosave could flush the old snapshot.
+        self.external_change = self.stale_restore;
         self.snippet_stops.clear();
         self.snippet_index = 0;
         self.desired_column = self.current_column();
@@ -976,6 +1287,9 @@ impl App {
             pinned,
             preview,
             dirty: false,
+            text_version: 1,
+            scroll: 0,
+            scroll_cursor: 0,
         })
     }
 
@@ -1107,6 +1421,7 @@ impl App {
             self.terminal_panel.sessions.poll_all();
             self.poll_task()?;
             self.poll_git()?;
+            self.poll_lsp();
             self.poll_autosave();
             let (width, height) = terminal::size()?;
             let fullscreen = self.terminal_panel.is_fullscreen();
@@ -1136,7 +1451,12 @@ impl App {
             if event::poll(Duration::from_millis(8))? {
                 match event::read()? {
                     Event::Key(key) if self.handle(key)? => break,
-                    Event::Mouse(mouse) => self.handle_mouse(mouse, width, height),
+                    Event::Mouse(mouse) => {
+                        self.handle_mouse(mouse, width, height);
+                        if self.quit_requested {
+                            break;
+                        }
+                    }
                     Event::Paste(text) => self.handle_terminal_paste(&text)?,
                     _ => {}
                 }
@@ -1155,7 +1475,8 @@ impl App {
             return;
         }
         let geometry = layout_with_sidebar(width, height, !self.zen_mode, self.sidebar_width);
-        let editor_x = geometry.sidebar.map(|(sidebar, _)| sidebar).unwrap_or(0);
+        let workbench = workbench_layout(width, height, self.sidebar_width, Some(8), Some(32));
+        let editor_x = workbench.editor.0;
         let retro_theme = self
             .theme_preview
             .as_deref()
@@ -1205,30 +1526,21 @@ impl App {
                 )
             })
             .collect::<String>();
-        frame.write_str(
-            0,
-            0,
-            &format!(
-                "{} mtide  |  Ctrl-S 保存  Ctrl-Q 退出  Ctrl-Tab 标签  {}{}{}",
-                top_rule,
-                tab_bar,
-                if self.editor_split {
-                    if self.editor_split_horizontal {
-                        "  [split H]"
-                    } else {
-                        "  [split V]"
-                    }
-                } else {
-                    ""
-                },
-                if self.git_editor_diff_mode {
-                    "  [git diff edit]"
-                } else {
-                    ""
-                }
-            ),
-            mtide_api::ColorSlot::Focus,
-        );
+        frame.write_str(0, 0, &menu_bar_text(), ColorSlot::Focus);
+        // Tabs live on the second row, to the right of the sidebar so the file
+        // tree never paints over them and so clicks can be mapped back.
+        let prefix = " mtide  |  ";
+        let mut tab_origin = geometry
+            .sidebar
+            .map(|(sidebar_width, _)| sidebar_width.saturating_add(1))
+            .unwrap_or(0);
+        if tab_origin == 0 {
+            tab_origin = prefix.len() as u16;
+        }
+        frame.write_str(0, 1, &top_rule.repeat(width as usize), ColorSlot::Muted);
+        frame.write_str(0, 1, prefix, ColorSlot::Muted);
+        frame.write_str(tab_origin, 1, &tab_bar, ColorSlot::Default);
+        self.tab_origin = tab_origin;
         if let Some((sidebar_width, sidebar_height)) = geometry.sidebar {
             for row in 1..sidebar_height {
                 frame.write_str(
@@ -1238,21 +1550,7 @@ impl App {
                     mtide_api::ColorSlot::Muted,
                 );
             }
-            frame.write_str(1, 1, "WORKSPACE", mtide_api::ColorSlot::Focus);
-            frame.write_str(1, 2, "▾ [workspace]", mtide_api::ColorSlot::Muted);
-            for (index, root) in self.workspace_roots.iter().take(3).enumerate() {
-                let label = root
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("root");
-                frame.write_str(
-                    3,
-                    3 + index as u16,
-                    &format!("▸ {label}"),
-                    mtide_api::ColorSlot::Default,
-                );
-            }
-            let _ = sidebar_width;
+            self.draw_sidebar(frame, sidebar_height);
         }
         if self.searching {
             frame.write_str(
@@ -1267,23 +1565,29 @@ impl App {
                 mtide_api::ColorSlot::Focus,
             );
         }
-        let text = self.document.text();
-        let lines: Vec<&str> = text.split('\n').collect();
-        let top: u16 = if self.searching { 2 } else { 1 };
+        // Row 0 is the menu bar and row 1 the tab strip.
+        let top: u16 = 2;
         // Keep the editor viewport stable across themes; Retro's key bar is a
         // chrome overlay on the final editor row rather than a layout change.
         let language = self
             .path
             .as_deref()
-            .map(|path| mtide_syntax::detect_with_text(path, &text))
+            .map(mtide_syntax::detect)
             .unwrap_or(mtide_syntax::Language::Rust);
+        let line_count = self.document.line_count();
+        let folds = if self.large_file_mode {
+            std::sync::Arc::new(Vec::new())
+        } else {
+            self.cached_fold_regions(language)
+        };
         let sticky_context = if self.sticky_context && !self.large_file_mode {
-            sticky_context_lines(&text, language, self.current_line(), 2)
+            sticky_context_lines(&folds, self.current_line(), 2)
         } else {
             Vec::new()
         };
+        self.sticky_rows = sticky_context.len();
         for (index, line) in sticky_context.iter().enumerate() {
-            let content = lines.get(*line).copied().unwrap_or_default();
+            let content = self.document.line(*line).unwrap_or_default();
             frame.write_str(
                 editor_x,
                 top.saturating_add(index as u16),
@@ -1293,7 +1597,15 @@ impl App {
         }
         let content_top = top.saturating_add(sticky_context.len() as u16);
         let content_height = height.saturating_sub(content_top + 1) as usize;
-        let wrap_width = geometry.editor.0.saturating_sub(5) as usize;
+        // The Retro key bar is chrome painted over the final row, so that row is
+        // not usable for text: reserve it or the last scrolled line hides
+        // behind the bar. Layout (scrollbar, splits) keeps the full height.
+        let text_height = if retro_theme && height >= 3 {
+            content_height.saturating_sub(1)
+        } else {
+            content_height
+        };
+        let wrap_width = workbench.editor.2.saturating_sub(5) as usize;
         // Keep the width available to keyboard navigation as well as rendering.
         // A zero-width terminal is represented as one logical column.
         self.wrap_width = wrap_width.max(1);
@@ -1302,18 +1614,39 @@ impl App {
                 .current_column()
                 .saturating_sub(self.wrap_width.saturating_sub(1));
         }
+        if self.editor_scroll_path != self.path {
+            self.editor_scroll_path = self.path.clone();
+            self.editor_scroll = 0;
+            self.editor_scroll_cursor = usize::MAX;
+        }
+        self.ensure_cursor_visible(text_height);
+        let first_line = self.editor_scroll.min(line_count.saturating_sub(1));
         let mut visual_row = 0usize;
-        let folds = if self.large_file_mode {
-            Vec::new()
+        let fold_index = if self.large_file_mode {
+            None
         } else {
-            mtide_syntax::fold_regions(&text, language)
+            self.fold_index()
         };
-        for (row, line) in lines.iter().enumerate() {
-            if let Some(region) = folds
-                .iter()
-                .find(|region| region.start_line == row && self.folded_lines.contains(&row))
-            {
-                if visual_row < content_height {
+        // Only the user's own collapsed ranges matter for row visibility, so a
+        // tiny list replaces scanning every region for every row.
+        let folded_ranges = fold_index
+            .as_ref()
+            .map(|index| {
+                self.folded_lines
+                    .iter()
+                    .filter_map(|start| index.get(start).map(|end| (*start, *end)))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let mut row = first_line;
+        while visual_row < text_height && row < line_count {
+            let line = self.document.line(row).unwrap_or_default();
+            let collapsed_end = fold_index
+                .as_ref()
+                .and_then(|index| index.get(&row).copied())
+                .filter(|_| self.folded_lines.contains(&row));
+            if let Some(end_line) = collapsed_end {
+                if visual_row < text_height {
                     frame.write_str(
                         editor_x,
                         visual_row as u16 + content_top,
@@ -1330,24 +1663,25 @@ impl App {
                     }
                     visual_row += 1;
                 }
-                if region.end_line > row {
+                if end_line > row {
+                    row = end_line + 1;
                     continue;
                 }
             }
-            if folds.iter().any(|region| {
-                self.folded_lines.contains(&region.start_line)
-                    && row > region.start_line
-                    && row <= region.end_line
-            }) {
+            if folded_ranges
+                .iter()
+                .any(|(start, end)| row > *start && row <= *end)
+            {
+                row += 1;
                 continue;
             }
             let wrapped_lines = if self.word_wrap && !self.large_file_mode {
-                wrap_line(line, wrap_width)
+                wrap_line(&line, wrap_width)
             } else {
-                vec![horizontal_view(line, self.horizontal_scroll, wrap_width)]
+                vec![horizontal_view(&line, self.horizontal_scroll, wrap_width)]
             };
             for (wrapped_index, wrapped) in wrapped_lines.into_iter().enumerate() {
-                if visual_row >= content_height {
+                if visual_row >= text_height {
                     break;
                 }
                 let label = if wrapped_index == 0 {
@@ -1393,37 +1727,38 @@ impl App {
             if visual_row >= content_height {
                 break;
             }
+            row += 1;
         }
         self.draw_editor_scrollbar(
             frame,
             editor_x,
-            geometry.editor.0,
+            workbench.editor.2,
             content_top as usize,
             content_height,
-            lines.len(),
+            line_count,
         );
-        if self.editor_split && geometry.editor.0 >= 80 {
+        if self.editor_split && workbench.editor.2 >= 80 {
             if self.editor_split_horizontal && content_height >= 8 {
                 self.draw_editor_horizontal_split(
                     frame,
                     editor_x,
-                    geometry.editor.0,
+                    workbench.editor.2,
                     content_top as usize,
                     content_height,
-                    &lines,
+                    line_count,
                 );
             } else {
                 self.draw_editor_split_pane(
                     frame,
                     editor_x,
-                    geometry.editor.0,
+                    workbench.editor.2,
                     content_top as usize,
                     content_height,
-                    &lines,
+                    line_count,
                 );
             }
         }
-        let status = self.status_line(width as usize, text.len());
+        let status = self.status_line(width as usize, self.document.len_bytes());
         frame.write_str(
             0,
             height.saturating_sub(1),
@@ -1433,6 +1768,7 @@ impl App {
         if !self.zen_mode {
             self.draw_task_panel(frame, width, height);
             self.draw_terminal_panel(frame, width, height);
+            self.draw_agent_panel(frame, &workbench);
         }
         if self.command_palette {
             self.draw_command_palette(frame, width, height);
@@ -1485,6 +1821,11 @@ impl App {
         if self.task_output_open {
             self.draw_task_output(frame, width, height);
         }
+        self.draw_completion(frame, width, height);
+        self.draw_hover(frame, width, height);
+        // Menus are the topmost surface: draw them after every panel so the
+        // dropdown is not painted over by the sidebar or the editor.
+        self.draw_menu(frame, width, height);
         if let Some(theme) = &self.theme_preview {
             let message = format!(" Theme preview: {theme} (Enter apply, Esc cancel, ←/→ switch) ");
             frame.write_str(
@@ -1576,7 +1917,7 @@ impl App {
         editor_width: u16,
         top: usize,
         height: usize,
-        lines: &[&str],
+        line_count: usize,
     ) {
         let first_width = editor_width / 2;
         let right_x = editor_x.saturating_add(first_width);
@@ -1602,15 +1943,16 @@ impl App {
         }
         let content_width = right_width.saturating_sub(6) as usize;
         let mut visual_row = 0usize;
-        for (line_number, line) in lines.iter().enumerate() {
+        for line_number in 0..line_count {
+            let line = self.document.line(line_number).unwrap_or_default();
             if visual_row >= height {
                 break;
             }
             let wrapped = if self.word_wrap {
-                wrap_line(line, content_width.max(1))
+                wrap_line(&line, content_width.max(1))
             } else {
                 vec![horizontal_view(
-                    line,
+                    &line,
                     self.horizontal_scroll,
                     content_width.max(1),
                 )]
@@ -1648,7 +1990,7 @@ impl App {
         editor_width: u16,
         top: usize,
         height: usize,
-        lines: &[&str],
+        line_count: usize,
     ) {
         let first_height = height / 2;
         let divider_y = top.saturating_add(first_height) as u16;
@@ -1671,16 +2013,15 @@ impl App {
             ColorSlot::Muted,
         );
         let content_width = editor_width.saturating_sub(6) as usize;
-        for (visual_row, (line_number, line)) in
-            lines.iter().enumerate().enumerate().take(second_height)
-        {
+        for (visual_row, line_number) in (0..line_count).enumerate().take(second_height) {
+            let line = self.document.line(line_number).unwrap_or_default();
             let row_text = if self.word_wrap {
-                wrap_line(line, content_width.max(1))
+                wrap_line(&line, content_width.max(1))
                     .into_iter()
                     .next()
                     .unwrap_or_default()
             } else {
-                horizontal_view(line, self.horizontal_scroll, content_width.max(1))
+                horizontal_view(&line, self.horizontal_scroll, content_width.max(1))
             };
             frame.write_str(
                 editor_x,
@@ -1736,15 +2077,15 @@ impl App {
                 " "
             };
             let availability = if path.exists() { "" } else { " [missing]" };
-            frame.write_str(
+            let selected = index == self.recent_selected;
+            write_list_row(
+                frame,
                 left + 1,
                 top + 1 + index as u16,
                 &format!("{marker} {}{availability}", path.display()),
-                if index == self.recent_selected {
-                    ColorSlot::Focus
-                } else {
-                    ColorSlot::Default
-                },
+                box_width.saturating_sub(2),
+                selected,
+                ColorSlot::Default,
             );
         }
     }
@@ -1789,14 +2130,18 @@ impl App {
             } else {
                 " "
             };
-            frame.write_str(
+            let selected = index == self.file_finder_selected;
+            write_list_row(
+                frame,
                 left + 1,
                 top + 1 + index as u16,
                 &format!("{marker} {}", path.display()),
-                if index == self.file_finder_selected {
-                    ColorSlot::Focus
-                } else {
+                box_width.saturating_sub(2),
+                selected,
+                if selected {
                     ColorSlot::Default
+                } else {
+                    ColorSlot::Muted
                 },
             );
         }
@@ -2490,6 +2835,7 @@ impl App {
                             } else {
                                 cell.style.background
                             }),
+                            reverse: false,
                         },
                     );
                 }
@@ -2498,7 +2844,412 @@ impl App {
         let _ = width;
     }
 
+    fn draw_agent_panel(&self, frame: &mut CellBuffer, layout: &mtide_tui::WorkbenchLayout) {
+        let Some((left, top, panel_width, panel_height)) = layout.agent else {
+            return;
+        };
+        if panel_width < 2 || panel_height < 2 {
+            return;
+        }
+        for row in top..top.saturating_add(panel_height) {
+            frame.write_str(left, row, "│", ColorSlot::Muted);
+        }
+        frame.write_str(
+            left.saturating_add(2),
+            top,
+            "AI AGENT CLI",
+            ColorSlot::Focus,
+        );
+        frame.write_str(
+            left.saturating_add(2),
+            top.saturating_add(1),
+            "Codex",
+            ColorSlot::Default,
+        );
+        frame.write_str(
+            left.saturating_add(2),
+            top.saturating_add(2),
+            "Claude Code",
+            ColorSlot::Muted,
+        );
+        frame.write_str(
+            left.saturating_add(2),
+            top.saturating_add(3),
+            "CodeBuddy",
+            ColorSlot::Muted,
+        );
+        frame.write_str(
+            left.saturating_add(2),
+            top.saturating_add(panel_height.saturating_sub(2)),
+            "session idle · Ctrl+B toggle",
+            ColorSlot::Muted,
+        );
+    }
+
+    fn draw_menu(&self, frame: &mut CellBuffer, width: u16, height: u16) {
+        // The menu bar keeps its title highlighted while its dropdown is open.
+        if let Some(menu) = self.menu_open {
+            let (label, start, end) = menu_bar_positions()[menu.min(MENU_LABELS.len() - 1)];
+            let _ = end;
+            frame.write_str_reverse(start, 0, &format!(" {label} "), ColorSlot::Default);
+        }
+        let Some(menu) = self.menu_open else {
+            return;
+        };
+        let items = menu_items(menu);
+        let x = menu_bar_positions()[menu.min(MENU_LABELS.len() - 1)].1;
+        let inner_width = items
+            .iter()
+            .map(|(label, _)| label.len())
+            .max()
+            .unwrap_or(8)
+            + 6;
+        let box_width = (inner_width as u16).min(width.saturating_sub(x + 1));
+        let box_height = (items.len() as u16 + 2).min(height.saturating_sub(2));
+        if box_width < 6 || box_height < 3 {
+            return;
+        }
+        // Solid surface first: the dropdown must hide the text underneath it.
+        frame.fill_background(x, 2, box_width, box_height, Some(ColorSlot::Terminal));
+        for row in 0..box_height {
+            let line = if row == 0 {
+                format!("┌{}┐", "─".repeat(box_width as usize - 2))
+            } else if row == box_height - 1 {
+                format!("└{}┘", "─".repeat(box_width as usize - 2))
+            } else {
+                format!("│{}│", " ".repeat(box_width as usize - 2))
+            };
+            frame.write_str(x, 2 + row, &line, ColorSlot::Muted);
+        }
+        for (index, (label, _)) in items.iter().enumerate() {
+            let row = 3 + index as u16;
+            if row >= 2 + box_height - 1 {
+                break;
+            }
+            let selected = index == self.menu_selected;
+            let text = format!("{:<width$}", label, width = box_width as usize - 2);
+            if selected {
+                frame.write_str_reverse(x + 1, row, &text, ColorSlot::Default);
+            } else {
+                frame.write_str_styled(
+                    x + 1,
+                    row,
+                    &text,
+                    ColorSlot::Default,
+                    Some(ColorSlot::Terminal),
+                );
+            }
+            if !submenu_items(menu, index).is_empty() {
+                frame.write_str(x + box_width - 2, row, "▸", ColorSlot::Default);
+            }
+        }
+
+        let submenu = submenu_items(menu, self.menu_selected);
+        if self.menu_submenu && !submenu.is_empty() {
+            let sub_x = x + box_width;
+            let sub_width = submenu
+                .iter()
+                .map(|(label, _)| label.len())
+                .max()
+                .unwrap_or(8) as u16
+                + 4;
+            let sub_width = sub_width.min(width.saturating_sub(sub_x));
+            let sub_height = (submenu.len() as u16 + 2).min(height.saturating_sub(3));
+            if sub_width >= 6 && sub_height >= 3 {
+                frame.fill_background(sub_x, 2, sub_width, sub_height, Some(ColorSlot::Terminal));
+                for row in 0..sub_height {
+                    let line = if row == 0 {
+                        format!("┌{}┐", "─".repeat(sub_width as usize - 2))
+                    } else if row == sub_height - 1 {
+                        format!("└{}┘", "─".repeat(sub_width as usize - 2))
+                    } else {
+                        format!("│{}│", " ".repeat(sub_width as usize - 2))
+                    };
+                    frame.write_str(sub_x, 2 + row, &line, ColorSlot::Muted);
+                }
+                for (index, (label, _)) in submenu.iter().enumerate() {
+                    let row = 3 + index as u16;
+                    if row >= 2 + sub_height - 1 {
+                        break;
+                    }
+                    let selected = index == self.menu_submenu_selected;
+                    let text = format!("{:<width$}", label, width = sub_width as usize - 2);
+                    if selected {
+                        frame.write_str_reverse(sub_x + 1, row, &text, ColorSlot::Default);
+                    } else {
+                        frame.write_str_styled(
+                            sub_x + 1,
+                            row,
+                            &text,
+                            ColorSlot::Default,
+                            Some(ColorSlot::Terminal),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn handle_menu_key(&mut self, key: KeyEvent) -> Option<bool> {
+        let menu = self.menu_open?;
+        let submenu = if self.menu_submenu {
+            submenu_items(menu, self.menu_selected)
+        } else {
+            &[]
+        };
+        match key.code {
+            KeyCode::Esc => {
+                if self.menu_submenu {
+                    self.menu_submenu = false;
+                } else {
+                    self.menu_open = None;
+                }
+            }
+            KeyCode::Left => {
+                if self.menu_submenu {
+                    self.menu_submenu = false;
+                } else {
+                    self.menu_open = Some(menu.saturating_sub(1));
+                    self.menu_selected = 0;
+                }
+                self.menu_submenu_selected = 0;
+            }
+            KeyCode::Right => {
+                if self.menu_submenu {
+                    self.menu_submenu = false;
+                } else if !submenu_items(menu, self.menu_selected).is_empty() {
+                    self.menu_submenu = true;
+                    self.menu_submenu_selected = 0;
+                } else {
+                    self.menu_open = Some((menu + 1).min(MENU_LABELS.len() - 1));
+                    self.menu_selected = 0;
+                }
+            }
+            KeyCode::Up => {
+                if self.menu_submenu {
+                    self.menu_submenu_selected = self.menu_submenu_selected.saturating_sub(1);
+                } else {
+                    self.menu_selected = self.menu_selected.saturating_sub(1);
+                    self.menu_submenu = false;
+                }
+            }
+            KeyCode::Down => {
+                if self.menu_submenu {
+                    self.menu_submenu_selected =
+                        (self.menu_submenu_selected + 1).min(submenu.len().saturating_sub(1));
+                } else {
+                    self.menu_selected =
+                        (self.menu_selected + 1).min(menu_items(menu).len().saturating_sub(1));
+                    self.menu_submenu = false;
+                }
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                let action = if self.menu_submenu {
+                    submenu
+                        .get(self.menu_submenu_selected)
+                        .map(|(_, action)| *action)
+                } else if !submenu_items(menu, self.menu_selected).is_empty() {
+                    self.menu_submenu = true;
+                    self.menu_submenu_selected = 0;
+                    None
+                } else {
+                    menu_items(menu)
+                        .get(self.menu_selected)
+                        .map(|(_, action)| *action)
+                };
+                if let Some(action) = action {
+                    self.menu_open = None;
+                    self.menu_submenu = false;
+                    return match self.run_menu_action(action) {
+                        Ok(quit) => quit,
+                        Err(error) => {
+                            self.notification = Some(error.to_string());
+                            Some(false)
+                        }
+                    };
+                }
+            }
+            _ => return Some(false),
+        }
+        Some(false)
+    }
+
+    /// Runs a menu entry. Returns `Some(true)` when the application must exit.
+    fn run_menu_action(&mut self, action: MenuAction) -> Result<Option<bool>, AppError> {
+        match action {
+            MenuAction::NewFile => {
+                self.path = None;
+                self.document = Document::new(DocId(1), "");
+                self.cursor = 0;
+                self.selection = None;
+                self.extra_cursors.clear();
+                self.baseline = None;
+                self.encoding = TextEncoding::Utf8;
+                self.line_ending = LineEnding::Lf;
+                self.editor_scroll = 0;
+                self.notification = Some("new file".into());
+            }
+            MenuAction::Save => self.save()?,
+            MenuAction::OpenFolder => {
+                self.workspace_root_input_open = true;
+                self.workspace_root_input_remove = false;
+                self.workspace_root_input.clear();
+            }
+            MenuAction::Quit => return Ok(Some(true)),
+            MenuAction::Undo => {
+                if !self.readonly {
+                    let _ = self.document.undo();
+                }
+            }
+            MenuAction::Redo => {
+                if !self.readonly {
+                    let _ = self.document.redo();
+                }
+            }
+            MenuAction::Find => {
+                self.searching = true;
+                self.search_query.clear();
+                self.search_matches.clear();
+            }
+            MenuAction::ToggleWordWrap => self.word_wrap = !self.word_wrap,
+            MenuAction::SelectAll => {
+                let length = self.document.text().len();
+                self.selection = Some(Selection::new(0, length));
+                self.cursor = length;
+            }
+            MenuAction::AddCursor => self.add_cursor_below(),
+            MenuAction::CommandPalette => self.open_command_palette(),
+            MenuAction::ToggleSidebar => {
+                self.sidebar_width = if self.sidebar_width.is_some() {
+                    self.sidebar_focus = false;
+                    None
+                } else {
+                    Some(28)
+                };
+            }
+            MenuAction::ToggleTerminal => self.toggle_terminal()?,
+            MenuAction::ZenMode => self.zen_mode = !self.zen_mode,
+            MenuAction::ToggleDiffSplit => self.git_diff_split = !self.git_diff_split,
+            MenuAction::ToggleDiffContext => {
+                self.git_diff_context = if self.git_diff_context == 0 { 3 } else { 0 };
+            }
+            MenuAction::ToggleDiffWrap => self.word_wrap = !self.word_wrap,
+            MenuAction::ToggleGitTree => self.git_tree_mode = !self.git_tree_mode,
+            MenuAction::ToggleFileIcons => self.file_icons = !self.file_icons,
+            MenuAction::About => {
+                self.notification = Some(format!(
+                    "mtide {} — terminal IDE",
+                    env!("CARGO_PKG_VERSION")
+                ));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Handles clicks on an open dropdown or its submenu.
+    fn handle_menu_mouse(&mut self, mouse: MouseEvent, width: u16, height: u16) -> bool {
+        let Some(menu) = self.menu_open else {
+            return false;
+        };
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return false;
+        }
+        let items = menu_items(menu);
+        let x = menu_bar_positions()[menu.min(MENU_LABELS.len() - 1)].1;
+        let box_width = (items
+            .iter()
+            .map(|(label, _)| label.len())
+            .max()
+            .unwrap_or(8) as u16
+            + 6)
+        .min(width.saturating_sub(x + 1));
+        let box_height = (items.len() as u16 + 2).min(height.saturating_sub(2));
+        if box_width >= 6
+            && mouse.column >= x
+            && mouse.column < x + box_width
+            && mouse.row >= 2
+            && mouse.row < 2 + box_height
+        {
+            let index = mouse.row.saturating_sub(3) as usize;
+            if index < items.len() {
+                self.menu_selected = index;
+                self.menu_submenu_selected = 0;
+                self.menu_submenu = !submenu_items(menu, index).is_empty();
+                if !self.menu_submenu {
+                    let action = items[index].1;
+                    self.menu_open = None;
+                    self.apply_menu_action(action);
+                }
+            }
+            return true;
+        }
+        if self.menu_submenu {
+            let submenu = submenu_items(menu, self.menu_selected);
+            let sub_x = x + box_width;
+            let sub_width = (submenu
+                .iter()
+                .map(|(label, _)| label.len())
+                .max()
+                .unwrap_or(8) as u16
+                + 4)
+            .min(width.saturating_sub(sub_x));
+            let sub_height = (submenu.len() as u16 + 2).min(height.saturating_sub(3));
+            if !submenu.is_empty()
+                && sub_width >= 6
+                && mouse.column >= sub_x
+                && mouse.column < sub_x + sub_width
+                && mouse.row >= 2
+                && mouse.row < 2 + sub_height
+            {
+                let index = mouse.row.saturating_sub(3) as usize;
+                if let Some((_, action)) = submenu.get(index).copied() {
+                    self.menu_open = None;
+                    self.menu_submenu = false;
+                    self.apply_menu_action(action);
+                }
+                return true;
+            }
+        }
+        // Clicking anywhere else closes the menu and lets the click through.
+        self.menu_open = None;
+        self.menu_submenu = false;
+        false
+    }
+
+    fn apply_menu_action(&mut self, action: MenuAction) {
+        match self.run_menu_action(action) {
+            Ok(Some(true)) => self.quit_requested = true,
+            Ok(Some(false)) | Ok(None) => {}
+            Err(error) => self.notification = Some(error.to_string()),
+        }
+    }
+
     fn handle_mouse(&mut self, mouse: MouseEvent, width: u16, height: u16) {
+        if self.handle_menu_mouse(mouse, width, height) {
+            return;
+        }
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) && mouse.row == 0 {
+            if let Some(index) = menu_bar_positions()
+                .iter()
+                .position(|(_, start, end)| mouse.column >= *start && mouse.column <= *end)
+            {
+                self.menu_open = Some(index);
+                self.menu_selected = 0;
+                self.menu_submenu = false;
+                self.menu_submenu_selected = 0;
+                return;
+            }
+        }
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            && mouse.row == 1
+            && self.tab_at_column(mouse.column).is_some()
+        {
+            self.handle_editor_mouse(mouse, width, height);
+            return;
+        }
+        if self.handle_sidebar_mouse(mouse, width, height) {
+            return;
+        }
         let terminal_top = height.saturating_sub(height.min(8) + 1);
         if self.terminal_panel.sessions.selected().is_some()
             && (self.terminal_panel.is_focused() || mouse.row > terminal_top)
@@ -2510,7 +3261,7 @@ impl App {
     }
 
     fn tab_at_column(&self, column: u16) -> Option<usize> {
-        let mut offset = 0_u16;
+        let mut offset = self.tab_origin;
         for (index, tab) in self.tabs.iter().enumerate() {
             let title = tab
                 .path
@@ -2548,14 +3299,12 @@ impl App {
     ) -> Option<usize> {
         let geometry = layout_with_sidebar(width, height, !self.zen_mode, self.sidebar_width);
         let editor_x = geometry.sidebar.map(|(sidebar, _)| sidebar).unwrap_or(0);
-        let top: u16 = if self.searching { 2 } else { 1 };
+        let top: u16 = 2;
         if row < top || row >= height.saturating_sub(1) || column < editor_x.saturating_add(5) {
             return None;
         }
-        let line = (row - top) as usize;
-        let text = self.document.text();
-        let contents = text.split('\n').collect::<Vec<_>>();
-        let line_text = contents.get(line).copied().unwrap_or("");
+        let line = (row - top) as usize + self.editor_scroll;
+        let line_text = self.document.line(line).unwrap_or_default();
         let grapheme_column = column
             .saturating_sub(editor_x.saturating_add(5))
             .min(line_text.graphemes(true).count() as u16) as usize;
@@ -2578,33 +3327,22 @@ impl App {
         if editor_width == 0 || column != editor_x.saturating_add(editor_width.saturating_sub(1)) {
             return None;
         }
-        let text = self.document.text();
-        let lines = text.split('\n').collect::<Vec<_>>();
-        let language = self
-            .path
-            .as_deref()
-            .map(|path| mtide_syntax::detect_with_text(path, &text))
-            .unwrap_or(mtide_syntax::Language::Rust);
-        let top: u16 = if self.searching { 2 } else { 1 };
-        let sticky = if self.sticky_context && !self.large_file_mode {
-            sticky_context_lines(&text, language, self.current_line(), 2).len()
-        } else {
-            0
-        };
-        let content_top = top.saturating_add(sticky as u16);
+        // Row 0 is the menu bar and row 1 the tab strip.
+        let top: u16 = 2;
+        let content_top = top.saturating_add(self.sticky_rows as u16);
         let content_height = height.saturating_sub(content_top + 1);
         if content_height == 0 || row < content_top || row >= content_top + content_height {
             return None;
         }
         let relative = (row - content_top) as usize;
-        let last_line = lines.len().saturating_sub(1).max(1);
+        let last_line = self.document.line_count().saturating_sub(1).max(1);
         Some(
             relative.saturating_mul(last_line) / (content_height as usize).saturating_sub(1).max(1),
         )
     }
 
     fn handle_editor_mouse(&mut self, mouse: MouseEvent, width: u16, height: u16) {
-        if mouse.row == 0 && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+        if mouse.row <= 1 && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
             if let Some(index) = self.tab_at_column(mouse.column) {
                 if index != self.active_tab {
                     self.sync_current_tab();
@@ -2674,10 +3412,10 @@ impl App {
                 self.horizontal_scroll = self.horizontal_scroll.saturating_add(3);
             }
             MouseEventKind::ScrollUp => {
-                self.move_vertical(-3);
+                self.scroll_editor(-3);
             }
             MouseEventKind::ScrollDown => {
-                self.move_vertical(3);
+                self.scroll_editor(3);
             }
             _ => {}
         }
@@ -2944,6 +3682,26 @@ impl App {
                 self.task_result_selected = 0;
                 Ok(())
             }
+            "editor.completion" => {
+                self.request_completion();
+                Ok(())
+            }
+            "editor.hover" => {
+                self.request_hover();
+                Ok(())
+            }
+            "view.explorer" => {
+                self.sidebar_focus = true;
+                self.zen_mode = false;
+                if self.sidebar_width.is_none() {
+                    self.sidebar_width = Some(28);
+                }
+                if self.sidebar_selected.is_none() {
+                    self.sidebar_selected = self.workspace_roots.first().cloned();
+                }
+                self.sidebar_reveal_selection();
+                Ok(())
+            }
             "task.output" => {
                 self.task_output_open =
                     self.task_run.is_some() || !self.task_output_history.is_empty();
@@ -3179,24 +3937,21 @@ impl App {
             .enumerate()
             .take(box_height.saturating_sub(2) as usize)
         {
-            let marker = if index == self.command_selected {
-                ">"
-            } else {
-                " "
-            };
-            frame.write_str(
+            let selected = index == self.command_selected;
+            let text = format!(
+                "{} {:<36} {}",
+                if selected { ">" } else { " " },
+                entry.title,
+                entry.shortcut.clone().unwrap_or_default()
+            );
+            write_list_row(
+                frame,
                 left + 1,
                 top + 1 + index as u16,
-                &format!(
-                    "{marker} {:<36} {}",
-                    entry.title,
-                    entry.shortcut.clone().unwrap_or_default()
-                ),
-                if index == self.command_selected {
-                    mtide_api::ColorSlot::Focus
-                } else {
-                    mtide_api::ColorSlot::Default
-                },
+                &text,
+                box_width.saturating_sub(2),
+                selected,
+                mtide_api::ColorSlot::Default,
             );
         }
     }
@@ -3384,14 +4139,10 @@ impl App {
     }
 
     fn draw_task_results(&self, frame: &mut CellBuffer, width: u16, height: u16) {
-        let Some(task) = self.task_run.as_ref() else {
-            return;
-        };
-        let tree = task.result_tree();
-        let mut lines = tree
-            .children
-            .iter()
-            .map(|node| {
+        let mut lines = Vec::new();
+        if let Some(task) = self.task_run.as_ref() {
+            let tree = task.result_tree();
+            lines.extend(tree.children.iter().map(|node| {
                 let marker = match node.status {
                     ResultStatus::Passed => "✓",
                     ResultStatus::Failed => "✗",
@@ -3399,20 +4150,42 @@ impl App {
                     ResultStatus::Running => "…",
                 };
                 format!("{marker} {}", node.name)
-            })
-            .collect::<Vec<_>>();
-        lines.extend(task.problems().iter().map(|problem| {
-            format!(
-                "! {}:{}{} {}",
-                problem.file.display(),
-                problem.line,
-                problem
-                    .column
-                    .map(|column| format!(":{column}"))
-                    .unwrap_or_default(),
-                problem.message
-            )
-        }));
+            }));
+            lines.extend(task.problems().iter().map(|problem| {
+                format!(
+                    "! {}:{}{} {}",
+                    problem.file.display(),
+                    problem.line,
+                    problem
+                        .column
+                        .map(|column| format!(":{column}"))
+                        .unwrap_or_default(),
+                    problem.message
+                )
+            }));
+        }
+        // Language server diagnostics are merged into the same list so one
+        // panel answers "what is broken" regardless of the producer (LN-19).
+        for (path, file) in self.lsp_diagnostics.files() {
+            lines.extend(file.diagnostics.iter().map(|diagnostic| {
+                format!(
+                    "{} {}:{}:{} {}",
+                    match diagnostic.severity {
+                        mtide_lsp::DiagnosticSeverity::Error => "E",
+                        mtide_lsp::DiagnosticSeverity::Warning => "W",
+                        mtide_lsp::DiagnosticSeverity::Information => "i",
+                        mtide_lsp::DiagnosticSeverity::Hint => "h",
+                    },
+                    path.display(),
+                    diagnostic.range.start.line + 1,
+                    diagnostic.range.start.character + 1,
+                    diagnostic.message
+                )
+            }));
+        }
+        if lines.is_empty() && self.task_run.is_none() {
+            return;
+        }
         let box_width = width.saturating_sub(8).clamp(48, 100);
         let visible = lines.len().min(height.saturating_sub(4) as usize);
         let box_height = (visible as u16 + 3).max(3).min(height.saturating_sub(2));
@@ -3434,15 +4207,14 @@ impl App {
         );
         for (index, line) in lines.iter().take(visible).enumerate() {
             let selected = index == self.task_result_selected;
-            frame.write_str(
+            write_list_row(
+                frame,
                 left + 1,
                 top + 1 + index as u16,
                 &format!("{} {line}", if selected { ">" } else { " " }),
-                if selected {
-                    ColorSlot::Focus
-                } else {
-                    ColorSlot::Default
-                },
+                box_width.saturating_sub(2),
+                selected,
+                ColorSlot::Default,
             );
         }
     }
@@ -3694,6 +4466,7 @@ impl App {
                     history_snapshot,
                     history_offset,
                     history_failed,
+                    history_loaded,
                 )) = result
                 {
                     self.git_branch = Some(branch);
@@ -3714,7 +4487,7 @@ impl App {
                                 "Git history changed; refresh before loading more commits".into(),
                             );
                         }
-                    } else {
+                    } else if history_loaded {
                         self.git_history = history;
                         self.git_history_offset = 0;
                     }
@@ -3854,6 +4627,7 @@ impl App {
                         history_snapshot,
                         history_offset,
                         history_failed,
+                        load_history,
                     )
                 });
             let _ = sender.send((root, result));
@@ -4379,6 +5153,7 @@ impl App {
             || !self.document.is_dirty()
             || self.last_autosave.elapsed() < self.autosave_interval
             || self.external_change
+            || self.stale_restore
         {
             return;
         }
@@ -4642,17 +5417,40 @@ impl App {
         self.jump_to_problem_index(0)
     }
 
+    /// Jump targets shared by the problems panel and F4 navigation: task and
+    /// linter problems first, then LSP diagnostics (LN-09/LN-19).
+    fn problem_targets(&self) -> Vec<(PathBuf, usize, Option<usize>)> {
+        let mut targets = self
+            .task_run
+            .as_ref()
+            .map(|task| {
+                task.problems()
+                    .iter()
+                    .map(|problem| (problem.file.clone(), problem.line, problem.column))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for (path, file) in self.lsp_diagnostics.files() {
+            for diagnostic in &file.diagnostics {
+                targets.push((
+                    path.clone(),
+                    diagnostic.range.start.line as usize + 1,
+                    Some(diagnostic.range.start.character as usize + 1),
+                ));
+            }
+        }
+        targets
+    }
+
     fn jump_to_problem_index(&mut self, index: usize) -> Result<(), AppError> {
-        let Some((problem, cwd)) = self.task_run.as_ref().and_then(|task| {
-            task.problems()
-                .get(index)
-                .cloned()
-                .map(|problem| (problem, task.cwd().map(Path::to_path_buf)))
-        }) else {
-            self.notification = Some("no task diagnostics available".into());
+        let Some((target, line, column)) = self.problem_targets().get(index).cloned() else {
+            self.notification = Some("no diagnostics available".into());
             return Ok(());
         };
-        let base = cwd
+        let base = self
+            .task_run
+            .as_ref()
+            .and_then(|task| task.cwd().map(Path::to_path_buf))
             .or_else(|| {
                 self.git_repository
                     .as_ref()
@@ -4666,19 +5464,18 @@ impl App {
             })
             .or_else(|| env::current_dir().ok())
             .unwrap_or_else(|| PathBuf::from("."));
-        let problem_file = problem.file.clone();
-        let path = if problem_file.is_absolute() {
-            problem_file
+        let path = if target.is_absolute() {
+            target
         } else {
-            base.join(problem_file)
+            base.join(target)
         };
         let bytes = read_file_cancellable(&path, 256 * 1024 * 1024, &AtomicBool::new(false))?;
         let (encoding, text) = decode_text(&bytes).ok_or_else(|| AppError::Binary(path.clone()))?;
         let document = Document::new(DocId(1), &text);
         let cursor = document
             .line_column_to_byte(
-                problem.line.saturating_sub(1),
-                problem.column.unwrap_or(1).saturating_sub(1),
+                line.saturating_sub(1),
+                column.unwrap_or(1).saturating_sub(1),
             )
             .unwrap_or(0);
         self.document = document;
@@ -4696,11 +5493,7 @@ impl App {
         self.git_branch = None;
         self.git_counts = (0, 0, 0, 0);
         self.last_git_poll = Instant::now();
-        self.notification = Some(format!(
-            "jumped to {}:{}",
-            problem.file.display(),
-            problem.line
-        ));
+        self.notification = Some(format!("jumped to {}:{}", path.display(), line));
         Ok(())
     }
 
@@ -4730,6 +5523,7 @@ impl App {
                             } else {
                                 cell.style.background
                             }),
+                            reverse: false,
                         },
                     );
                 }
@@ -5785,6 +6579,13 @@ impl App {
         if self.external_change {
             status.push_str("  external-change");
         }
+        if !self.no_lsp {
+            let counts = self.lsp_diagnostics.counts();
+            status.push_str(&format!("  {}", self.lsp_status));
+            if counts.errors > 0 || counts.warnings > 0 {
+                status.push_str(&format!(" {}E {}W", counts.errors, counts.warnings));
+            }
+        }
         if !self.background_tasks.is_empty() {
             status.push_str(&format!("  background:{}", self.background_tasks.len()));
         }
@@ -5873,6 +6674,28 @@ impl App {
     }
 
     fn handle(&mut self, key: KeyEvent) -> Result<bool, AppError> {
+        if self.menu_open.is_some() {
+            return Ok(self.handle_menu_key(key).unwrap_or(false));
+        }
+        if key.modifiers.contains(KeyModifiers::ALT)
+            && !key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::SHIFT)
+        {
+            let menu = match key.code {
+                KeyCode::Char('f') | KeyCode::Char('F') => Some(0),
+                KeyCode::Char('e') | KeyCode::Char('E') => Some(1),
+                KeyCode::Char('v') | KeyCode::Char('V') => Some(3),
+                KeyCode::Char('o') | KeyCode::Char('O') => Some(4),
+                KeyCode::Char('h') | KeyCode::Char('H') => Some(5),
+                _ => None,
+            };
+            if let Some(menu) = menu {
+                self.menu_open = Some(menu);
+                self.menu_selected = 0;
+                self.menu_submenu = false;
+                return Ok(false);
+            }
+        }
         if self.notifications_open {
             if key.code == KeyCode::Esc || key.code == KeyCode::F(8) {
                 self.notifications_open = false;
@@ -5891,6 +6714,76 @@ impl App {
                 }
                 _ => {}
             }
+            return Ok(false);
+        }
+        if self.completion_open {
+            match key.code {
+                KeyCode::Esc => {
+                    self.close_completion();
+                    return Ok(false);
+                }
+                KeyCode::Up => {
+                    self.move_completion_selection(-1);
+                    return Ok(false);
+                }
+                KeyCode::Down => {
+                    self.move_completion_selection(1);
+                    return Ok(false);
+                }
+                KeyCode::PageUp => {
+                    self.move_completion_selection(-8);
+                    return Ok(false);
+                }
+                KeyCode::PageDown => {
+                    self.move_completion_selection(8);
+                    return Ok(false);
+                }
+                KeyCode::Enter | KeyCode::Tab => {
+                    self.accept_completion()?;
+                    return Ok(false);
+                }
+                _ => {}
+            }
+        }
+        if self.hover_open {
+            match key.code {
+                KeyCode::Esc => {
+                    self.hover_open = false;
+                    return Ok(false);
+                }
+                KeyCode::Down => {
+                    self.hover_scroll = (self.hover_scroll + 1).min(self.hover_lines.len());
+                    return Ok(false);
+                }
+                KeyCode::Up => {
+                    self.hover_scroll = self.hover_scroll.saturating_sub(1);
+                    return Ok(false);
+                }
+                _ => {
+                    // Any other key leaves the hover tooltip behind.
+                    self.hover_open = false;
+                }
+            }
+        }
+        if self.sidebar_focus {
+            if let Some(consumed) = self.handle_sidebar_key(key) {
+                return Ok(consumed);
+            }
+        }
+        if key.code == KeyCode::Char('e')
+            && key
+                .modifiers
+                .contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+        {
+            self.sidebar_focus = true;
+            self.zen_mode = false;
+            if self.sidebar_width.is_none() {
+                self.sidebar_width = Some(28);
+            }
+            if self.sidebar_selected.is_none() {
+                self.sidebar_selected = self.workspace_roots.first().cloned();
+            }
+            self.sidebar_reveal_selection();
             return Ok(false);
         }
         if self.terminal_panel.is_focused()
@@ -6273,6 +7166,11 @@ impl App {
             self.switch_tab(1);
             return Ok(false);
         }
+        if key.modifiers.is_empty() && matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) {
+            let delta = if key.code == KeyCode::PageUp { -10 } else { 10 };
+            self.scroll_editor(delta);
+            return Ok(false);
+        }
         if key.code == KeyCode::PageUp && key.modifiers.contains(KeyModifiers::CONTROL) {
             self.switch_tab(-1);
             return Ok(false);
@@ -6290,6 +7188,14 @@ impl App {
                 .contains(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT)
         {
             self.pin_current_tab();
+            return Ok(false);
+        }
+        if key.code == KeyCode::Char(' ') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.request_completion();
+            return Ok(false);
+        }
+        if key.code == KeyCode::Char('i') && key.modifiers == KeyModifiers::CONTROL {
+            self.request_hover();
             return Ok(false);
         }
         if key.code == KeyCode::F(9) {
@@ -7624,10 +8530,12 @@ impl App {
     }
 
     fn current_column(&self) -> usize {
-        let text = self.document.text();
         let line = self.document.byte_to_line(self.cursor).unwrap_or(0);
         let start = self.document.line_to_byte(line).unwrap_or(0);
-        UnicodeSegmentation::graphemes(&text[start..self.cursor], true).count()
+        // Only the current line is needed; copying the whole buffer here made
+        // every frame O(file size).
+        let prefix = self.document.slice(start..self.cursor);
+        UnicodeSegmentation::graphemes(prefix.as_str(), true).count()
     }
 
     fn open_save_as(&mut self) {
@@ -7670,15 +8578,1267 @@ impl App {
         Ok(())
     }
 
-    fn conflict_marker_count(text: &str) -> usize {
-        text.lines()
-            .filter(|line| {
-                let line = line.trim_start();
-                line.starts_with("<<<<<<<")
-                    || line.starts_with("=======")
-                    || line.starts_with(">>>>>>>")
+    /// Drives the language server: starts it lazily, mirrors the current
+    /// document and folds server events into UI state. Called once per frame by
+    /// the event loop; it never waits longer than a single non-blocking poll.
+    fn poll_lsp(&mut self) {
+        if self.no_lsp {
+            self.lsp_status = "LSP:off".into();
+            return;
+        }
+        self.start_lsp_if_needed();
+        self.sync_completion_after_edit();
+        let Some(session) = self.lsp.as_mut() else {
+            return;
+        };
+
+        // Mirror the active document. A server that is still initializing (or
+        // restarting) must not receive didOpen: it has no document store yet.
+        let path = self.path.clone();
+        let version = self.document.version();
+        let usable = session.client.state().is_usable();
+        match (path.as_deref(), session.synced.clone()) {
+            _ if !usable => {}
+            (None, Some((previous, _))) => {
+                let _ = session.client.did_close(&previous);
+                session.synced = None;
+            }
+            (Some(current), Some((previous, _))) if previous != current => {
+                let _ = session.client.did_close(&previous);
+                let text = self.document.text();
+                let _ = session.client.did_open(current, session.language, &text);
+                session.synced = Some((current.to_path_buf(), version));
+            }
+            (Some(current), None) => {
+                let text = self.document.text();
+                let _ = session.client.did_open(current, session.language, &text);
+                session.synced = Some((current.to_path_buf(), version));
+            }
+            (Some(current), Some((_, synced_version))) if synced_version != version => {
+                let text = self.document.text();
+                let _ = session.client.did_change(current, &text);
+                session.synced = Some((current.to_path_buf(), version));
+            }
+            _ => {}
+        }
+        let events = session.client.pump(Duration::from_millis(0));
+        // A restarted server has no document store: force a fresh didOpen.
+        if events
+            .iter()
+            .any(|event| matches!(event, ClientEvent::StateChanged(Lifecycle::Restarting)))
+        {
+            session.synced = None;
+        }
+        let state = session.client.state();
+        let server = session.server;
+        let counts = session.client.diagnostics().counts();
+        self.lsp_status = match state {
+            Lifecycle::Ready if counts.total() == 0 => format!("LSP:{server}"),
+            Lifecycle::Ready => format!("LSP:{server} {}E {}W", counts.errors, counts.warnings),
+            Lifecycle::Degraded => format!("LSP:{server}!degraded"),
+            Lifecycle::Spawning | Lifecycle::Initializing => format!("LSP:{server}…"),
+            Lifecycle::Restarting => format!("LSP:{server}!restarting"),
+            Lifecycle::Crashed => format!("LSP:{server}!crashed"),
+            Lifecycle::Disabled => format!("LSP:{server}!disabled"),
+            Lifecycle::Discovered => "LSP:idle".into(),
+        };
+        for event in events {
+            match event {
+                ClientEvent::Diagnostic {
+                    path,
+                    version,
+                    diagnostics,
+                } => {
+                    self.lsp_diagnostics
+                        .publish(&path, version, server, diagnostics);
+                }
+                ClientEvent::ProtocolError(message) => {
+                    self.notification = Some(format!("LSP protocol error: {message}"));
+                }
+                ClientEvent::StateChanged(Lifecycle::Disabled) => {
+                    self.notification = Some(format!(
+                        "LSP server {server} disabled after repeated failures"
+                    ));
+                }
+                ClientEvent::Response { id, result } if Some(id) == self.completion_request => {
+                    self.completion_request = None;
+                    let (items, incomplete) = parse_completion_result(&result);
+                    self.completion_incomplete = incomplete;
+                    if items.is_empty() {
+                        self.completion_open = false;
+                        self.completion_items.clear();
+                    } else {
+                        self.completion_items = items;
+                        self.completion_open = true;
+                        self.completion_selected = 0;
+                        self.completion_scroll = 0;
+                    }
+                }
+                ClientEvent::Response { id, result } if Some(id) == self.hover_request => {
+                    self.hover_request = None;
+                    self.hover_lines = parse_hover_result(&result)
+                        .map(|text| text.lines().map(str::to_owned).collect::<Vec<_>>())
+                        .unwrap_or_default();
+                    self.hover_open = !self.hover_lines.is_empty();
+                    self.hover_scroll = 0;
+                }
+                ClientEvent::Timeout { id, method } => {
+                    if Some(id) == self.completion_request {
+                        self.completion_request = None;
+                    }
+                    if Some(id) == self.hover_request {
+                        self.hover_request = None;
+                    }
+                    self.notification = Some(format!("LSP request timed out: {method}"));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Starts a server the first time a supported file is opened. The
+    /// availability probe runs on a worker thread so the first frame is never
+    /// blocked by a version probe (PRD NF-01 / A-11).
+    fn start_lsp_if_needed(&mut self) {
+        if self.lsp.is_some() {
+            return;
+        }
+        if let Some(job) = &self.lsp_probe_job {
+            match job.try_recv() {
+                Ok((language, true)) => {
+                    self.lsp_probe_job = None;
+                    self.spawn_lsp_server(language);
+                }
+                Ok((language, false)) => {
+                    self.lsp_probe_job = None;
+                    let hint = recipe_for(language)
+                        .map(|recipe| recipe.install_hint)
+                        .unwrap_or("install the language server");
+                    self.lsp_status = format!("LSP:{language}!missing");
+                    self.notification = Some(format!(
+                        "Language server not installed - run \"{hint}\" to enable it"
+                    ));
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => self.lsp_probe_job = None,
+            }
+            return;
+        }
+        let Some(path) = self.path.clone() else {
+            self.lsp_status = "LSP:no-file".into();
+            return;
+        };
+        let Some(language) = lsp_language(&path) else {
+            self.lsp_status = "LSP:no-recipe".into();
+            return;
+        };
+        let Some(recipe) = recipe_for(language) else {
+            self.lsp_status = "LSP:no-recipe".into();
+            return;
+        };
+        self.lsp_status = format!("LSP:{}…", recipe.server);
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let installed = matches!(mtide_lsp::probe(recipe), ProbeResult::Installed { .. });
+            let _ = sender.send((language, installed));
+        });
+        self.lsp_probe_job = Some(receiver);
+    }
+
+    fn spawn_lsp_server(&mut self, language: &'static str) {
+        let Some(recipe) = recipe_for(language) else {
+            return;
+        };
+        let root = self
+            .workspace_roots
+            .first()
+            .cloned()
+            .or_else(|| {
+                self.path
+                    .as_deref()
+                    .and_then(Path::parent)
+                    .map(Path::to_path_buf)
             })
-            .count()
+            .unwrap_or_else(|| PathBuf::from("."));
+        let spec = ServerSpec {
+            program: recipe.server.to_owned(),
+            args: recipe.args.iter().map(|arg| (*arg).to_owned()).collect(),
+            root: root.clone(),
+        };
+        let config = ClientConfig {
+            server_id: recipe.server.to_owned(),
+            ..ClientConfig::default()
+        };
+        match LspClient::spawn(config, spec) {
+            Ok(mut client) => {
+                if let Err(error) = client.initialize(&root) {
+                    self.notification = Some(format!("LSP initialize failed: {error}"));
+                }
+                self.lsp = Some(LspSession {
+                    client,
+                    server: recipe.server,
+                    language,
+                    synced: None,
+                });
+            }
+            Err(error) => {
+                self.lsp_status = format!("LSP:{}!failed", recipe.server);
+                self.notification = Some(format!("LSP server failed to start: {error}"));
+            }
+        }
+    }
+
+    // --- completion and hover (LN-07 / LN-08) -------------------------------
+
+    fn word_start_at(&self, at: usize) -> usize {
+        let text = self.document.text();
+        text[..at.min(text.len())]
+            .char_indices()
+            .rev()
+            .take_while(|(_, character)| character.is_alphanumeric() || *character == '_')
+            .last()
+            .map(|(offset, _)| offset)
+            .unwrap_or(at)
+    }
+
+    /// Requests completions at the cursor. The request is async; the popup only
+    /// opens when the response arrives, so the UI never blocks on the server.
+    fn request_completion(&mut self) {
+        self.hover_open = false;
+        let Some(path) = self.path.clone() else {
+            return;
+        };
+        let text = self.document.text();
+        let position = position_at(&text, self.cursor);
+        let anchor = self.word_start_at(self.cursor);
+        let Some(session) = self.lsp.as_mut() else {
+            self.notification = Some("completion needs a running language server".into());
+            return;
+        };
+        if !session.client.state().is_usable() {
+            self.notification = Some(format!("LSP is {}", state_label(session.client.state())));
+            return;
+        }
+        let params = serde_json::json!({
+            "textDocument": { "uri": file_uri(&path) },
+            "position": position,
+            "context": { "triggerKind": 1 },
+        });
+        match session.client.request("textDocument/completion", params) {
+            Ok(id) => {
+                self.completion_request = Some(id);
+                self.completion_anchor = anchor;
+                self.completion_prefix = text[anchor..self.cursor].to_owned();
+            }
+            Err(error) => self.notification = Some(format!("completion failed: {error}")),
+        }
+    }
+
+    fn request_hover(&mut self) {
+        self.completion_open = false;
+        let Some(path) = self.path.clone() else {
+            return;
+        };
+        let text = self.document.text();
+        let position = position_at(&text, self.cursor);
+        let Some(session) = self.lsp.as_mut() else {
+            self.notification = Some("hover needs a running language server".into());
+            return;
+        };
+        if !session.client.state().is_usable() {
+            self.notification = Some(format!("LSP is {}", state_label(session.client.state())));
+            return;
+        }
+        let params = serde_json::json!({
+            "textDocument": { "uri": file_uri(&path) },
+            "position": position,
+        });
+        match session.client.request("textDocument/hover", params) {
+            Ok(id) => self.hover_request = Some(id),
+            Err(error) => self.notification = Some(format!("hover failed: {error}")),
+        }
+    }
+
+    fn close_completion(&mut self) {
+        self.completion_open = false;
+        self.completion_items.clear();
+        self.completion_selected = 0;
+        self.completion_scroll = 0;
+        self.completion_prefix.clear();
+    }
+
+    /// Candidate list after client-side prefix filtering. Servers return long
+    /// lists; filtering here keeps typing responsive without a round trip.
+    fn filtered_completions(&self) -> Vec<CompletionItem> {
+        let prefix = self.completion_prefix.to_lowercase();
+        let mut items = self
+            .completion_items
+            .iter()
+            .filter(|item| item.label.to_lowercase().starts_with(&prefix))
+            .cloned()
+            .collect::<Vec<_>>();
+        if items.is_empty() {
+            items = self
+                .completion_items
+                .iter()
+                .filter(|item| item.label.to_lowercase().contains(&prefix))
+                .cloned()
+                .collect();
+        }
+        items
+    }
+
+    /// Keeps the popup aligned with the buffer after an edit. A cursor that
+    /// left the current word closes the popup instead of inserting elsewhere.
+    fn sync_completion_after_edit(&mut self) {
+        if !self.completion_open {
+            return;
+        }
+        let text = self.document.text();
+        if self.cursor < self.completion_anchor || self.cursor > text.len() {
+            self.close_completion();
+            return;
+        }
+        let prefix = text[self.completion_anchor..self.cursor].to_owned();
+        if prefix
+            .chars()
+            .any(|character| !(character.is_alphanumeric() || character == '_'))
+        {
+            self.close_completion();
+            return;
+        }
+        if prefix != self.completion_prefix {
+            self.completion_prefix = prefix;
+            self.completion_selected = 0;
+            self.completion_scroll = 0;
+            if self.filtered_completions().is_empty() && self.completion_incomplete {
+                self.request_completion();
+            }
+        }
+    }
+
+    fn move_completion_selection(&mut self, delta: isize) {
+        let len = self.filtered_completions().len();
+        if len == 0 {
+            return;
+        }
+        let next = (self.completion_selected as isize + delta).clamp(0, len as isize - 1);
+        self.completion_selected = next as usize;
+        let visible = 8usize;
+        if self.completion_selected < self.completion_scroll {
+            self.completion_scroll = self.completion_selected;
+        } else if self.completion_selected >= self.completion_scroll + visible {
+            self.completion_scroll = self.completion_selected + 1 - visible;
+        }
+    }
+
+    /// Applies the selected item as a single undoable transaction: the primary
+    /// edit, the server's additional edits (auto-imports) and the snippet
+    /// tab stops all belong to the same user action.
+    fn accept_completion(&mut self) -> Result<(), AppError> {
+        let Some(item) = self
+            .filtered_completions()
+            .get(self.completion_selected)
+            .cloned()
+        else {
+            self.close_completion();
+            return Ok(());
+        };
+        self.close_completion();
+        if self.readonly {
+            return Ok(());
+        }
+        let text = self.document.text();
+        let (start, end, raw) = match &item.text_edit {
+            Some(edit) => (
+                offset_at(&text, edit.start),
+                offset_at(&text, edit.end),
+                if edit.new_text.is_empty() {
+                    item.insert_text.clone()
+                } else {
+                    edit.new_text.clone()
+                },
+            ),
+            None => (
+                self.completion_anchor,
+                self.cursor,
+                item.insert_text.clone(),
+            ),
+        };
+        let filename = self
+            .path
+            .as_deref()
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str());
+        let (insert, tabstops) = if item.snippet {
+            let expansion = expand_snippet(&raw, filename);
+            (expansion.text, expansion.tabstops)
+        } else {
+            (raw, Vec::new())
+        };
+        // Additional edits come first so that an insertion at the same offset as
+        // the completion range keeps the server's intended order.
+        let mut edits = Vec::with_capacity(item.additional_edits.len() + 1);
+        let mut shift: isize = 0;
+        for extra in &item.additional_edits {
+            let extra_start = offset_at(&text, extra.start);
+            let extra_end = offset_at(&text, extra.end);
+            if extra_start <= start {
+                shift += extra.new_text.len() as isize - (extra_end - extra_start) as isize;
+            }
+            edits.push(Edit {
+                range: extra_start..extra_end,
+                insert: extra.new_text.clone(),
+            });
+        }
+        edits.push(Edit {
+            range: start..end,
+            insert: insert.clone(),
+        });
+        self.document.apply(&edits)?;
+        let base = (start as isize + shift).max(0) as usize;
+        self.cursor = base + insert.len();
+        self.selection = None;
+        if !tabstops.is_empty() {
+            self.snippet_stops = tabstops
+                .into_iter()
+                .map(|(begin, end)| (base + begin, base + end))
+                .collect();
+            self.snippet_index = 0;
+            if let Some((begin, end)) = self.snippet_stops.first().copied() {
+                self.cursor = end;
+                self.selection = (begin != end).then(|| Selection::new(begin, end));
+            }
+        }
+        Ok(())
+    }
+
+    fn draw_completion(&self, frame: &mut CellBuffer, width: u16, height: u16) {
+        if !self.completion_open {
+            return;
+        }
+        let items = self.filtered_completions();
+        if items.is_empty() {
+            return;
+        }
+        let box_width = width.saturating_sub(6).clamp(30, 72);
+        let visible = items.len().min(8);
+        let box_height = (visible as u16 + 2).min(height.saturating_sub(2));
+        let left = width.saturating_sub(box_width) / 2;
+        let top = height.saturating_sub(box_height + 2);
+        for row in 0..box_height {
+            frame.write_str(
+                left,
+                top + row,
+                &" ".repeat(box_width as usize),
+                ColorSlot::Muted,
+            );
+        }
+        frame.write_str(
+            left + 1,
+            top,
+            &format!(
+                " Completions ({} of {}; Enter accept, Esc dismiss) ",
+                items.len(),
+                self.completion_items.len()
+            ),
+            ColorSlot::Focus,
+        );
+        for (offset, item) in items
+            .iter()
+            .skip(self.completion_scroll)
+            .take(visible)
+            .enumerate()
+        {
+            let index = self.completion_scroll + offset;
+            let selected = index == self.completion_selected;
+            let detail = if item.detail.is_empty() {
+                String::new()
+            } else {
+                format!("  {}", item.detail)
+            };
+            let label = format!(
+                "{} {}{}",
+                if selected { ">" } else { " " },
+                item.label,
+                detail
+            );
+            frame.write_str(
+                left + 1,
+                top + 1 + offset as u16,
+                &label,
+                if selected {
+                    ColorSlot::Focus
+                } else {
+                    ColorSlot::Default
+                },
+            );
+        }
+    }
+
+    fn draw_hover(&self, frame: &mut CellBuffer, width: u16, height: u16) {
+        if !self.hover_open || self.hover_lines.is_empty() {
+            return;
+        }
+        let box_width = width.saturating_sub(6).clamp(40, 100);
+        let visible = self
+            .hover_lines
+            .len()
+            .saturating_sub(self.hover_scroll)
+            .min(10);
+        let box_height = (visible as u16 + 2).min(height.saturating_sub(2));
+        let left = width.saturating_sub(box_width) / 2;
+        let top = height.saturating_sub(box_height + 2);
+        for row in 0..box_height {
+            frame.write_str(
+                left,
+                top + row,
+                &" ".repeat(box_width as usize),
+                ColorSlot::Muted,
+            );
+        }
+        frame.write_str(
+            left + 1,
+            top,
+            " Hover (Esc dismiss, ↑/↓ scroll) ",
+            ColorSlot::Focus,
+        );
+        for (offset, line) in self
+            .hover_lines
+            .iter()
+            .skip(self.hover_scroll)
+            .take(visible)
+            .enumerate()
+        {
+            frame.write_str(left + 1, top + 1 + offset as u16, line, ColorSlot::Default);
+        }
+    }
+
+    /// Height of one logical line measured in visual rows.
+    fn visual_line_height(&self, line: &str) -> usize {
+        if self.word_wrap && !self.large_file_mode && self.wrap_width > 0 {
+            wrap_line(line, self.wrap_width).len().max(1)
+        } else {
+            1
+        }
+    }
+
+    /// Keeps the cursor line inside the viewport. The scan is bounded by the
+    /// viewport height, so the cost does not grow with the distance from the
+    /// top of the file (PRD ED-12 / NF-02).
+    fn ensure_cursor_visible(&mut self, content_height: usize) {
+        let line_count = self.document.line_count();
+        if content_height == 0 || line_count == 0 {
+            return;
+        }
+        if self.editor_scroll >= line_count {
+            self.editor_scroll = line_count - 1;
+        }
+        // Only re-anchor when the cursor actually moved: otherwise a manual
+        // scroll (wheel / page keys) would be pulled back on the next frame.
+        if self.cursor == self.editor_scroll_cursor {
+            return;
+        }
+        self.editor_scroll_cursor = self.cursor;
+        let cursor_line = self.current_line().min(line_count - 1);
+        if cursor_line < self.editor_scroll {
+            self.editor_scroll = cursor_line;
+            return;
+        }
+        let mut rows = 0usize;
+        for row in self.editor_scroll..=cursor_line {
+            let line = self.document.line(row).unwrap_or_default();
+            rows += self.visual_line_height(&line);
+            if rows > content_height {
+                break;
+            }
+        }
+        if rows <= content_height {
+            return;
+        }
+        // Scroll the minimum amount that puts the cursor line on the last row.
+        let mut budget = content_height.saturating_sub(1);
+        let mut start = cursor_line;
+        while start > 0 {
+            let prev = self.document.line(start - 1).unwrap_or_default();
+            let height = self.visual_line_height(&prev);
+            if height > budget {
+                break;
+            }
+            budget -= height;
+            start -= 1;
+        }
+        self.editor_scroll = start;
+    }
+
+    /// Scrolls the viewport itself, leaving the cursor where it is.
+    fn scroll_editor(&mut self, delta: isize) {
+        let max = self.document.line_count().saturating_sub(1);
+        self.editor_scroll = if delta.is_negative() {
+            self.editor_scroll.saturating_sub(delta.unsigned_abs())
+        } else {
+            (self.editor_scroll + delta as usize).min(max)
+        };
+        // Treat the scroll as handled so the next frame does not re-anchor.
+        self.editor_scroll_cursor = self.cursor;
+    }
+
+    /// Flattened, currently visible file tree: roots plus expanded children.
+    fn sidebar_rows(&mut self) -> Vec<SidebarEntry> {
+        let roots = self.workspace_roots.clone();
+        let mut rows = Vec::new();
+        for root in roots {
+            let name = root
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| root.display().to_string());
+            let is_dir = root.is_dir();
+            rows.push(SidebarEntry {
+                name,
+                path: root.clone(),
+                is_dir,
+                depth: 0,
+            });
+            if is_dir && self.sidebar_expanded.contains(&root) {
+                self.collect_sidebar_children(&root, 1, &mut rows);
+            }
+        }
+        rows
+    }
+
+    fn collect_sidebar_children(&mut self, dir: &Path, depth: usize, rows: &mut Vec<SidebarEntry>) {
+        if depth > 8 {
+            return;
+        }
+        let entries = self
+            .sidebar_entries
+            .entry(dir.to_path_buf())
+            .or_insert_with(|| read_directory(dir))
+            .clone();
+        for mut entry in entries {
+            entry.depth = depth;
+            let path = entry.path.clone();
+            let is_dir = entry.is_dir;
+            rows.push(entry);
+            if is_dir && self.sidebar_expanded.contains(&path) {
+                self.collect_sidebar_children(&path, depth + 1, rows);
+            }
+        }
+    }
+
+    fn draw_sidebar(&mut self, frame: &mut CellBuffer, sidebar_height: u16) {
+        self.sidebar_capacity = sidebar_height.saturating_sub(3).max(1) as usize;
+        if self.sidebar_focus {
+            frame.write_str_reverse(1, 1, " WORKSPACE ", ColorSlot::Default);
+        } else {
+            frame.write_str(1, 1, "WORKSPACE", ColorSlot::Focus);
+        }
+        if self.workspace_roots.is_empty() {
+            frame.write_str(1, 2, "(no folder open)", ColorSlot::Muted);
+            frame.write_str(1, 3, "File > Open Folder", ColorSlot::Muted);
+            return;
+        }
+        let rows = self.sidebar_rows();
+        let visible = sidebar_height.saturating_sub(2) as usize;
+        if visible == 0 {
+            return;
+        }
+        let max_scroll = rows.len().saturating_sub(visible);
+        self.sidebar_scroll = self.sidebar_scroll.min(max_scroll);
+        for (offset, entry) in rows
+            .iter()
+            .skip(self.sidebar_scroll)
+            .take(visible)
+            .enumerate()
+        {
+            let depth = entry.depth;
+            let selected = self.sidebar_selected.as_deref() == Some(entry.path.as_path());
+            let in_multi = self.sidebar_multi.contains(&entry.path);
+            let marker = if entry.is_dir {
+                if self.sidebar_expanded.contains(&entry.path) {
+                    "▾"
+                } else {
+                    "▸"
+                }
+            } else {
+                file_icon(Some(&entry.path))
+            };
+            let label = format!("{}{} {}", " ".repeat(depth * 2), marker, entry.name);
+            // Cursor row: full reverse. Extra rows: reverse with dim text so
+            // the cursor stays the brightest stop in the selection.
+            let style = if selected {
+                ColorSlot::Default
+            } else if in_multi {
+                ColorSlot::Muted
+            } else if entry.is_dir {
+                ColorSlot::Default
+            } else {
+                ColorSlot::Muted
+            };
+            let highlighted = selected || in_multi;
+            let width = self.sidebar_width.unwrap_or(28).saturating_sub(2).max(8);
+            write_list_row(
+                frame,
+                1,
+                2 + offset as u16,
+                &label,
+                width,
+                highlighted,
+                style,
+            );
+        }
+        if rows.len() > visible {
+            frame.write_str(
+                1,
+                sidebar_height.saturating_sub(1),
+                &format!("{}/{}", self.sidebar_scroll + visible, rows.len()),
+                ColorSlot::Muted,
+            );
+        } else if self.sidebar_selection_size() > 1 {
+            frame.write_str(
+                1,
+                sidebar_height.saturating_sub(1),
+                &format!(
+                    "{} selected · Enter opens all · Esc clears",
+                    self.sidebar_selection_size()
+                ),
+                ColorSlot::Focus,
+            );
+        } else if self.sidebar_focus {
+            frame.write_str(
+                1,
+                sidebar_height.saturating_sub(1),
+                "↑↓ →/← Enter · Ctrl/Shift select",
+                ColorSlot::Muted,
+            );
+        }
+    }
+
+    /// Handles mouse interaction inside the sidebar. Returns true when the event
+    /// was consumed so the editor does not also react to it.
+    fn handle_sidebar_mouse(&mut self, mouse: MouseEvent, width: u16, height: u16) -> bool {
+        let Some((sidebar_width, sidebar_height)) =
+            layout_with_sidebar(width, height, !self.zen_mode, self.sidebar_width).sidebar
+        else {
+            return false;
+        };
+        if mouse.column >= sidebar_width.saturating_sub(1) {
+            return false;
+        }
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.sidebar_focus = true;
+                if mouse.row < 2 || mouse.row >= sidebar_height.saturating_sub(1) {
+                    return true;
+                }
+                let rows = self.sidebar_rows();
+                let index = self.sidebar_scroll + mouse.row.saturating_sub(2) as usize;
+                let Some(entry) = rows.get(index).cloned() else {
+                    return true;
+                };
+                let mode = if mouse.modifiers.contains(KeyModifiers::CONTROL) {
+                    SidebarSelect::Toggle
+                } else if mouse.modifiers.contains(KeyModifiers::SHIFT) {
+                    SidebarSelect::Extend
+                } else {
+                    SidebarSelect::Replace
+                };
+                self.sidebar_select(entry.path.clone(), mode);
+                if entry.is_dir && mode == SidebarSelect::Replace {
+                    if !self.sidebar_expanded.remove(&entry.path) {
+                        self.sidebar_expanded.insert(entry.path.clone());
+                        // Refresh the listing when a folder is opened.
+                        self.sidebar_entries.remove(&entry.path);
+                    } else {
+                        self.sidebar_prune_selection();
+                    }
+                } else if let Err(error) = self.open_file_tab(&entry.path, true) {
+                    self.notification = Some(error.to_string());
+                }
+                true
+            }
+            MouseEventKind::ScrollUp => {
+                self.sidebar_scroll = self.sidebar_scroll.saturating_sub(3);
+                true
+            }
+            MouseEventKind::ScrollDown => {
+                self.sidebar_scroll = self.sidebar_scroll.saturating_add(3);
+                true
+            }
+            _ => true,
+        }
+    }
+
+    /// Selection mode for a sidebar click or key press.
+    fn sidebar_select(&mut self, path: PathBuf, mode: SidebarSelect) {
+        match mode {
+            SidebarSelect::Replace => {
+                self.sidebar_selected = Some(path.clone());
+                self.sidebar_multi.clear();
+                self.sidebar_anchor = Some(path);
+            }
+            SidebarSelect::Toggle => {
+                if self.sidebar_selected.as_ref() != Some(&path)
+                    && !self.sidebar_multi.remove(&path)
+                {
+                    self.sidebar_multi.insert(path.clone());
+                }
+                self.sidebar_selected = Some(path.clone());
+                self.sidebar_anchor = Some(path);
+            }
+            SidebarSelect::Extend => {
+                let rows = self.sidebar_rows();
+                let anchor = self
+                    .sidebar_anchor
+                    .clone()
+                    .or_else(|| self.sidebar_selected.clone())
+                    .unwrap_or_else(|| path.clone());
+                let positions = (
+                    rows.iter().position(|row| row.path == anchor),
+                    rows.iter().position(|row| row.path == path),
+                );
+                match positions {
+                    (Some(from), Some(to)) => {
+                        let (low, high) = if from <= to { (from, to) } else { (to, from) };
+                        self.sidebar_multi = rows[low..=high]
+                            .iter()
+                            .map(|row| row.path.clone())
+                            .filter(|candidate| candidate != &path)
+                            .collect();
+                        self.sidebar_selected = Some(path);
+                        self.sidebar_anchor = Some(anchor);
+                    }
+                    _ => {
+                        self.sidebar_selected = Some(path.clone());
+                        self.sidebar_multi.clear();
+                        self.sidebar_anchor = Some(path);
+                    }
+                }
+            }
+        }
+        self.sidebar_reveal_selection();
+    }
+
+    /// Files in the selection, cursor last so it ends up as the active buffer.
+    fn sidebar_selected_files(&self) -> Vec<PathBuf> {
+        let mut paths = self
+            .sidebar_multi
+            .iter()
+            .filter(|path| path.is_file())
+            .cloned()
+            .collect::<Vec<_>>();
+        if let Some(cursor) = &self.sidebar_selected {
+            if cursor.is_file() && !paths.contains(cursor) {
+                paths.push(cursor.clone());
+            }
+        }
+        paths
+    }
+
+    fn sidebar_selection_size(&self) -> usize {
+        self.sidebar_multi.len() + usize::from(self.sidebar_selected.is_some())
+    }
+
+    /// Moves the sidebar cursor by `delta` rows. `extend` grows the selection
+    /// from the anchor instead of replacing it (Shift+arrow).
+    fn sidebar_move_selection(&mut self, delta: isize, extend: bool) {
+        let rows = self.sidebar_rows();
+        if rows.is_empty() {
+            return;
+        }
+        let current = self
+            .sidebar_selected
+            .as_ref()
+            .and_then(|path| rows.iter().position(|row| &row.path == path))
+            .unwrap_or(0);
+        let next = (current as isize + delta).clamp(0, rows.len() as isize - 1) as usize;
+        let path = rows[next].path.clone();
+        self.sidebar_select(
+            path,
+            if extend {
+                SidebarSelect::Extend
+            } else {
+                SidebarSelect::Replace
+            },
+        );
+    }
+
+    /// Drops selected paths that a collapse just hid. Enter must never open a
+    /// file the user cannot see.
+    fn sidebar_prune_selection(&mut self) {
+        let rows = self.sidebar_rows();
+        let visible = rows
+            .iter()
+            .map(|row| row.path.clone())
+            .collect::<BTreeSet<_>>();
+        self.sidebar_multi.retain(|path| visible.contains(path));
+        // A hidden cursor moves to its nearest visible ancestor (the folder that
+        // was just collapsed) instead of jumping to the top of the tree.
+        if let Some(selected) = self.sidebar_selected.clone() {
+            if !visible.contains(&selected) {
+                self.sidebar_selected = rows
+                    .iter()
+                    .rev()
+                    .find(|row| row.is_dir && selected.starts_with(&row.path))
+                    .map(|row| row.path.clone())
+                    .or_else(|| rows.first().map(|row| row.path.clone()));
+            }
+        }
+        // A hidden anchor would silently turn the next Shift+click into a
+        // single selection, so re-anchor on the surviving cursor row.
+        if self
+            .sidebar_anchor
+            .as_ref()
+            .is_some_and(|anchor| !visible.contains(anchor))
+        {
+            self.sidebar_anchor = self.sidebar_selected.clone();
+        }
+    }
+
+    /// Scrolls the tree so the selected row stays inside the viewport.
+    fn sidebar_reveal_selection(&mut self) {
+        let rows = self.sidebar_rows();
+        let Some(index) = rows
+            .iter()
+            .position(|row| Some(&row.path) == self.sidebar_selected.as_ref())
+        else {
+            return;
+        };
+        let capacity = self.sidebar_capacity.max(1);
+        if index < self.sidebar_scroll {
+            self.sidebar_scroll = index;
+        } else if index >= self.sidebar_scroll + capacity {
+            self.sidebar_scroll = index + 1 - capacity;
+        }
+        self.sidebar_scroll = self.sidebar_scroll.min(rows.len().saturating_sub(capacity));
+    }
+
+    /// Right arrow: expand a folder, or step into the first child if already open.
+    fn sidebar_expand_selection(&mut self) {
+        let rows = self.sidebar_rows();
+        let Some(entry) = self
+            .sidebar_selected
+            .as_ref()
+            .and_then(|path| rows.iter().find(|row| &row.path == path))
+            .cloned()
+        else {
+            if let Some(first) = rows.first() {
+                self.sidebar_selected = Some(first.path.clone());
+                self.sidebar_reveal_selection();
+            }
+            return;
+        };
+        if !entry.is_dir {
+            return;
+        }
+        if self.sidebar_expanded.contains(&entry.path) {
+            self.sidebar_move_selection(1, false);
+        } else {
+            self.sidebar_entries.remove(&entry.path);
+            self.sidebar_expanded.insert(entry.path);
+            self.sidebar_reveal_selection();
+        }
+    }
+
+    /// Left arrow: collapse a folder, otherwise jump to its parent folder.
+    fn sidebar_collapse_selection(&mut self) {
+        let rows = self.sidebar_rows();
+        let Some(index) = self
+            .sidebar_selected
+            .as_ref()
+            .and_then(|path| rows.iter().position(|row| &row.path == path))
+        else {
+            return;
+        };
+        let entry = rows[index].clone();
+        if entry.is_dir && self.sidebar_expanded.contains(&entry.path) {
+            self.sidebar_expanded.remove(&entry.path);
+            self.sidebar_prune_selection();
+            return;
+        }
+        if let Some(parent) = rows[..index]
+            .iter()
+            .rev()
+            .find(|row| row.is_dir && entry.path.starts_with(&row.path))
+        {
+            self.sidebar_selected = Some(parent.path.clone());
+            self.sidebar_reveal_selection();
+        }
+    }
+
+    /// Enter: open a file, or toggle a folder.
+    fn sidebar_activate_selection(&mut self) {
+        let rows = self.sidebar_rows();
+        let Some(index) = self
+            .sidebar_selected
+            .as_ref()
+            .and_then(|path| rows.iter().position(|row| &row.path == path))
+        else {
+            if let Some(first) = rows.first() {
+                self.sidebar_selected = Some(first.path.clone());
+            }
+            return;
+        };
+        let entry = rows[index].clone();
+        if entry.is_dir {
+            if !self.sidebar_expanded.remove(&entry.path) {
+                self.sidebar_entries.remove(&entry.path);
+                self.sidebar_expanded.insert(entry.path);
+            } else {
+                self.sidebar_prune_selection();
+            }
+            return;
+        }
+        let files = self.sidebar_selected_files();
+        let total = files.len();
+        let mut opened = 0;
+        for file in files {
+            // Multi-open pins the tabs: previews would otherwise replace each
+            // other and only the last selection would survive.
+            match self.open_file_tab(&file, total == 1) {
+                Ok(()) => opened += 1,
+                Err(error) => self.notification = Some(error.to_string()),
+            }
+        }
+        if total > 1 {
+            self.notification = Some(format!("opened {opened} files"));
+        }
+    }
+
+    /// Keyboard navigation for the file tree. Returns `Some(consumed)` when the
+    /// key belongs to the sidebar; `None` lets it fall through to the editor.
+    fn handle_sidebar_key(&mut self, key: KeyEvent) -> Option<bool> {
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        match key.code {
+            KeyCode::Char('e') if control && shift => {
+                self.sidebar_focus = false;
+                Some(false)
+            }
+            KeyCode::Esc => {
+                if self.sidebar_multi.is_empty() {
+                    self.sidebar_focus = false;
+                } else {
+                    self.sidebar_multi.clear();
+                }
+                Some(false)
+            }
+            KeyCode::Char(' ') if control => {
+                if let Some(path) = self.sidebar_selected.clone() {
+                    self.sidebar_select(path, SidebarSelect::Toggle);
+                }
+                Some(false)
+            }
+            KeyCode::Up => {
+                self.sidebar_move_selection(-1, shift);
+                Some(false)
+            }
+            KeyCode::Down => {
+                self.sidebar_move_selection(1, shift);
+                Some(false)
+            }
+            KeyCode::Char('p') if control => {
+                self.sidebar_move_selection(-1, shift);
+                Some(false)
+            }
+            KeyCode::Char('n') if control => {
+                self.sidebar_move_selection(1, shift);
+                Some(false)
+            }
+            KeyCode::Right => {
+                self.sidebar_expand_selection();
+                Some(false)
+            }
+            KeyCode::Left => {
+                self.sidebar_collapse_selection();
+                Some(false)
+            }
+            KeyCode::Enter => {
+                self.sidebar_activate_selection();
+                Some(false)
+            }
+            KeyCode::Home => {
+                self.sidebar_move_selection(isize::MIN / 2, shift);
+                Some(false)
+            }
+            KeyCode::End => {
+                self.sidebar_move_selection(isize::MAX / 2, shift);
+                Some(false)
+            }
+            KeyCode::Char('r') if control => {
+                self.sidebar_entries.clear();
+                Some(false)
+            }
+            _ => None,
+        }
+    }
+
+    /// Fold regions for the current buffer, computed at most once per version.
+    /// The full text is only materialised when the cache is stale, so steady
+    /// state never pays the O(file size) scan.
+    fn cached_fold_regions(
+        &mut self,
+        language: mtide_syntax::Language,
+    ) -> std::sync::Arc<Vec<mtide_syntax::FoldRegion>> {
+        let version = self.document.version();
+        let fresh = self.fold_cache.as_ref().is_some_and(|cache| {
+            cache.version == version && cache.path == self.path && cache.language == language
+        });
+        if !fresh {
+            let text = self.document.text();
+            let regions = std::sync::Arc::new(mtide_syntax::fold_regions(text.as_str(), language));
+            let index = std::sync::Arc::new(
+                regions
+                    .iter()
+                    .map(|region| (region.start_line, region.end_line))
+                    .collect::<std::collections::BTreeMap<_, _>>(),
+            );
+            self.fold_cache = Some(FoldCache {
+                path: self.path.clone(),
+                version,
+                language,
+                regions,
+                index,
+            });
+        }
+        self.fold_cache
+            .as_ref()
+            .map(|cache| std::sync::Arc::clone(&cache.regions))
+            .unwrap_or_default()
+    }
+
+    fn fold_index(&self) -> Option<std::sync::Arc<std::collections::BTreeMap<usize, usize>>> {
+        self.fold_cache
+            .as_ref()
+            .map(|cache| std::sync::Arc::clone(&cache.index))
+    }
+
+    /// Splits a rope line into its content and a trailing line terminator,
+    /// recognising CRLF, CR and LF. The returned slices borrow the input.
+    fn split_line_terminator(line: &str) -> (&str, &str) {
+        if let Some(rest) = line.strip_suffix("\r\n") {
+            (rest, "\r\n")
+        } else if let Some(rest) = line.strip_suffix('\n') {
+            (rest, "\n")
+        } else if let Some(rest) = line.strip_suffix('\r') {
+            (rest, "\r")
+        } else {
+            (line, "")
+        }
+    }
+
+    /// Builds the bytes to persist for a UTF-8 document by streaming the rope
+    /// line by line, applying trim / final-newline / line-ending normalisation
+    /// in a single pass. This avoids the several full-buffer copies the naive
+    /// `to_string` + `replace` + `encode` path makes, which is what made
+    /// saving large files (where large_file_mode kicks in) allocate hundreds of
+    /// megabytes. Non-UTF-8 encodings still need a contiguous `str` for the
+    /// encoder, so `save` keeps the old path for those.
+    fn save_bytes_streaming(
+        document: &Document,
+        trim: bool,
+        insert_final_newline: bool,
+        ending: LineEnding,
+        encoding: TextEncoding,
+    ) -> Vec<u8> {
+        let line_count = document.line_count();
+        let bom = matches!(encoding, TextEncoding::Utf8Bom);
+        let target: &[u8] = match ending {
+            LineEnding::Crlf => b"\r\n",
+            LineEnding::Cr => b"\r",
+            _ => b"\n",
+        };
+        let mut out = Vec::with_capacity(document.len_bytes() + if bom { 3 } else { 0 } + 1);
+        if bom {
+            out.extend_from_slice(&[0xef, 0xbb, 0xbf]);
+        }
+        // ropey counts a trailing empty line for a file that ends with a line
+        // terminator, but str::lines() (used by the canonical transform)
+        // discards it. `logical_lines` is the number of real content lines.
+        let trailing_empty = line_count > 1
+            && document
+                .line(line_count - 1)
+                .is_some_and(|last| last.is_empty());
+        let logical_lines = if trailing_empty {
+            line_count - 1
+        } else {
+            line_count
+        };
+        let last_real_ends_with_lf = trailing_empty
+            && document
+                .line(line_count - 2)
+                .is_some_and(|last| last.ends_with('\n'));
+
+        if trim {
+            // Canonical uses `str::lines()`, which splits on `\n` only (and
+            // strips a single trailing `\r`), unlike ropey's line view. Match
+            // it exactly: trimming is a user-initiated option, not the
+            // large-file autosave hot path, so one `text()` allocation here is
+            // acceptable and far cheaper than the old text->join->normalise
+            // ->encode chain.
+            let text = document.text();
+            let mut t = text
+                .lines()
+                .map(str::trim_end)
+                .collect::<Vec<_>>()
+                .join("\n");
+            if insert_final_newline && !t.is_empty() && !t.ends_with('\n') {
+                t.push('\n');
+            }
+            let t = normalize_line_endings(&t, ending);
+            // `save()` only routes the UTF-8 family here, so the normalised
+            // string is already UTF-8; the BOM (if any) was written at the top
+            // of this function, so we must not let `encode_text` add a second.
+            out.extend_from_slice(t.as_bytes());
+            return out;
+        }
+
+        // Non-trim path: keep the source verbatim and let normalisation decide
+        // the separators, mirroring save()'s `text.ends_with('\n')` decision.
+        //
+        // re-terminate endings (Lf/Crlf/Cr): every break becomes `target`. A
+        // source trailing break is already emitted as `target`, and the
+        // canonical final-newline push *merges* with it (normalise collapses
+        // "\r\n"/"\r" first), so we only add `target` when the source lacked
+        // a trailing break.
+        // Mixed/None: the source terminator is preserved verbatim; the
+        // canonical push is a separate `b"\n"` that only applies when the last
+        // real line did not already end in LF.
+        for index in 0..logical_lines {
+            let raw = document.line(index).unwrap_or_default();
+            let (content, terminator) = Self::split_line_terminator(&raw);
+            out.extend_from_slice(content.as_bytes());
+            if index + 1 < logical_lines {
+                let sep: &[u8] = match ending {
+                    LineEnding::Mixed | LineEnding::None => terminator.as_bytes(),
+                    _ => target,
+                };
+                out.extend_from_slice(sep);
+            }
+        }
+        if trailing_empty {
+            let raw = document.line(logical_lines - 1).unwrap_or_default();
+            let (_, terminator) = Self::split_line_terminator(&raw);
+            let sep: &[u8] = match ending {
+                LineEnding::Mixed | LineEnding::None => terminator.as_bytes(),
+                _ => target,
+            };
+            out.extend_from_slice(sep);
+        }
+        let push_final = match ending {
+            LineEnding::Mixed | LineEnding::None => insert_final_newline && !last_real_ends_with_lf,
+            _ => insert_final_newline && !trailing_empty,
+        };
+        // Guard on the *document* being empty, not on the output buffer: a
+        // UTF-8 BOM already put three bytes in `out`, which would make an
+        // empty file look non-empty and get a spurious trailing newline.
+        if push_final && document.len_bytes() > 0 {
+            match ending {
+                LineEnding::Mixed | LineEnding::None => out.extend_from_slice(b"\n"),
+                _ => out.extend_from_slice(target),
+            }
+        }
+        out
     }
 
     fn save(&mut self) -> Result<(), AppError> {
@@ -7689,31 +9849,51 @@ impl App {
             self.open_save_as();
             return Ok(());
         }
+        if self.external_change || self.stale_restore {
+            return Err(AppError::ExternalChange(
+                self.path.clone().unwrap_or_default(),
+            ));
+        }
         if let Some(path) = &self.path {
             if let Some(baseline) = &self.baseline {
                 if changed_since(path, baseline)? {
                     return Err(AppError::ExternalChange(path.clone()));
                 }
             }
-            let mut text = self.document.text();
-            let had_conflict_markers = Self::conflict_marker_count(&text) > 0;
-            if self.trim_trailing_whitespace {
-                text = text
-                    .lines()
-                    .map(str::trim_end)
-                    .collect::<Vec<_>>()
-                    .join("\n");
-            }
-            if self.insert_final_newline && !text.is_empty() && !text.ends_with('\n') {
-                text.push('\n');
-            }
-            let text = normalize_line_endings(&text, self.line_ending);
-            let bytes =
-                encode_text(&text, self.encoding).ok_or_else(|| AppError::Binary(path.clone()))?;
+            let had_conflict_markers = self.document.conflict_marker_count() > 0;
+            let bytes = if matches!(self.encoding, TextEncoding::Utf8 | TextEncoding::Utf8Bom) {
+                // Stream straight from the rope: one allocation for the output
+                // instead of text -> trim -> normalise -> encode copies.
+                Self::save_bytes_streaming(
+                    &self.document,
+                    self.trim_trailing_whitespace,
+                    self.insert_final_newline,
+                    self.line_ending,
+                    self.encoding,
+                )
+            } else {
+                // Encoders for UTF-16 / GBK / Latin-1 need a contiguous string.
+                let mut text = self.document.text();
+                if self.trim_trailing_whitespace {
+                    text = text
+                        .lines()
+                        .map(str::trim_end)
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                }
+                if self.insert_final_newline && !text.is_empty() && !text.ends_with('\n') {
+                    text.push('\n');
+                }
+                let text = normalize_line_endings(&text, self.line_ending);
+                encode_text(&text, self.encoding).ok_or_else(|| AppError::Binary(path.clone()))?
+            };
             atomic_write(path, &bytes)?;
+            if let Some(session) = self.lsp.as_mut() {
+                let _ = session.client.did_save(path);
+            }
             self.document.mark_saved();
             self.baseline = fingerprint(path).ok();
-            if had_conflict_markers && Self::conflict_marker_count(&text) == 0 {
+            if had_conflict_markers && self.document.conflict_marker_count() == 0 {
                 if let Some(repository) = self.git_repository.clone() {
                     repository.stage(path)?;
                     self.notification = Some("saved and marked conflict resolved".into());
@@ -7738,6 +9918,7 @@ impl App {
         self.line_ending = mtide_workspace::detect_line_ending(&text);
         self.baseline = fingerprint(&path).ok();
         self.external_change = false;
+        self.stale_restore = false;
         self.notification = Some("reloaded external file".into());
         Ok(())
     }
@@ -7746,8 +9927,13 @@ impl App {
         if let Some(path) = &self.path {
             self.baseline = fingerprint(path).ok();
         }
-        self.save()?;
+        // Clearing the flags first is what makes the save an explicit decision.
         self.external_change = false;
+        self.stale_restore = false;
+        if let Err(error) = self.save() {
+            self.external_change = true;
+            return Err(error);
+        }
         self.notification = Some("overwrote external file".into());
         Ok(())
     }
@@ -8347,6 +10533,10 @@ impl App {
         if self.save_all_on_quit && self.document.is_dirty() && self.path.is_some() {
             self.save()?;
         }
+        if let Some(session) = self.lsp.as_mut() {
+            session.client.shutdown();
+        }
+        self.lsp = None;
         self.persist_session()
     }
 
@@ -8398,6 +10588,7 @@ impl App {
             pinned: tab.pinned,
             preview: tab.preview,
             dirty: tab.dirty,
+            scroll: tab.scroll,
         }
     }
 }
@@ -8471,13 +10662,12 @@ fn diff_context_visible(diff: Option<&LineDiff>, index: usize, context: usize) -
 }
 
 fn sticky_context_lines(
-    text: &str,
-    language: mtide_syntax::Language,
+    regions: &[mtide_syntax::FoldRegion],
     current_line: usize,
     limit: usize,
 ) -> Vec<usize> {
-    let mut lines = mtide_syntax::fold_regions(text, language)
-        .into_iter()
+    let mut lines = regions
+        .iter()
         .filter(|region| region.start_line < current_line && current_line <= region.end_line)
         .map(|region| region.start_line)
         .collect::<Vec<_>>();
@@ -8545,6 +10735,7 @@ fn write_git_diff_line(
                 symbol,
                 style,
                 background,
+                reverse: false,
             },
         );
         offset =
@@ -8750,6 +10941,9 @@ fn default_commands() -> CommandRegistry {
         ("task.cancel", "Cancel task", "Ctrl-Shift-F9"),
         ("git.cancel", "Cancel running Git operation", "Ctrl-Shift-G"),
         ("task.results", "Task results and problems", "F6"),
+        ("editor.completion", "Trigger completion", "Ctrl+Space"),
+        ("editor.hover", "Show hover information", "Ctrl+I"),
+        ("view.explorer", "Focus the file explorer", "Ctrl+Shift+E"),
         ("task.output", "Task output", "Ctrl-Shift-O"),
         ("navigation.toggleBookmark", "Toggle bookmark", "F11"),
         ("navigation.clearBookmarks", "Clear bookmarks", "Ctrl-F11"),
@@ -9200,6 +11394,23 @@ fn main() -> Result<(), AppError> {
         doctor();
         return Ok(());
     }
+    if env::args().any(|argument| matches!(argument.as_str(), "--help" | "-h")) {
+        print_usage();
+        return Ok(());
+    }
+    if env::args().any(|argument| matches!(argument.as_str(), "--version" | "-V")) {
+        println!("mtide {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+    // The interface is a full-screen TUI: writing frames into a pipe produces
+    // nothing but escape-sequence noise, so refuse early with an explanation.
+    if !io::stdout().is_terminal() {
+        eprintln!(
+            "mtide: stdout is not a terminal. Run mtide from an interactive terminal \
+             (use 'mtide --doctor' for diagnostics, 'mtide --help' for usage)."
+        );
+        return Err(AppError::Io(io::Error::other("stdout is not a terminal")));
+    }
     let options = parse_args(env::args().skip(1));
     let workspace = options
         .workspace_file
@@ -9215,6 +11426,17 @@ fn main() -> Result<(), AppError> {
     } else {
         None
     };
+    if stdin_text.is_some() {
+        // The buffer came from the pipe, so keyboard input has to come from the
+        // controlling terminal instead (PRD ED-20: `git diff | mtide`).
+        adopt_controlling_terminal()?;
+    } else if !io::stdin().is_terminal() {
+        eprintln!(
+            "mtide: standard input is not a terminal and no '-' buffer was requested. \
+             Pipe a buffer with 'mtide -', or run mtide from an interactive terminal."
+        );
+        return Err(AppError::Io(io::Error::other("stdin is not a terminal")));
+    }
     let session_path = env::current_dir()?.join(".mtide").join("session.json");
     let interrupted = Arc::new(AtomicBool::new(false));
     flag::register(SIGINT, Arc::clone(&interrupted)).map_err(io::Error::other)?;
@@ -9227,6 +11449,7 @@ fn main() -> Result<(), AppError> {
         options.theme_override,
         &interrupted,
     )?;
+    app.no_lsp = options.no_lsp;
     app.workspace_file = options.workspace_file.clone();
     if let (Some(workspace), Some(workspace_path)) = (&workspace, options.workspace_file.as_deref())
     {
@@ -9322,6 +11545,61 @@ struct CliOptions {
     workspace_file: Option<PathBuf>,
 }
 
+/// Reads one directory into a stable, sorted list: folders first, then files.
+/// Draws one list row. Selected rows use reverse video (matching the menus and
+/// the sidebar) padded to the full width so the highlight reads as a bar.
+fn write_list_row(
+    frame: &mut CellBuffer,
+    x: u16,
+    y: u16,
+    text: &str,
+    width: u16,
+    selected: bool,
+    style: ColorSlot,
+) {
+    if selected {
+        frame.write_str_reverse(
+            x,
+            y,
+            &format!("{text:<width$}", width = width as usize),
+            style,
+        );
+    } else {
+        frame.write_str(x, y, text, style);
+    }
+}
+
+fn read_directory(dir: &Path) -> Vec<SidebarEntry> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut rows = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name == ".git" || name == ".mtide" {
+                return None;
+            }
+            let is_dir = entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false);
+            Some(SidebarEntry {
+                name,
+                path,
+                is_dir,
+                depth: 0,
+            })
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        right
+            .is_dir
+            .cmp(&left.is_dir)
+            .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+    });
+    rows.truncate(512);
+    rows
+}
+
 fn file_icon(path: Option<&Path>) -> &'static str {
     let Some(path) = path else {
         return "?";
@@ -9376,6 +11654,52 @@ where
         }
     }
     options
+}
+
+/// Re-points standard input at the controlling terminal after a pipe buffer was
+/// consumed, so the event loop still receives key presses.
+#[cfg(unix)]
+fn adopt_controlling_terminal() -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let tty = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")?;
+    // SAFETY: dup2 replaces fd 0 with a freshly opened terminal descriptor; the
+    // result is checked and ownership of the File is untouched.
+    if unsafe { nix::libc::dup2(tty.as_raw_fd(), nix::libc::STDIN_FILENO) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn adopt_controlling_terminal() -> io::Result<()> {
+    Ok(())
+}
+
+fn print_usage() {
+    println!(
+        "mtide {} — multi-language terminal IDE
+
+USAGE:
+    mtide [OPTIONS] [PATH[:LINE[:COLUMN]]]...
+
+OPTIONS:
+    --readonly              Open buffers read-only
+    --wait                  Return after the file is closed (git editor mode)
+    --theme <NAME>          Override the configured theme
+    --workspace <FILE>      Load a .mtide workspace file
+    --safe-mode             Start without plugins
+    --no-lsp                Start without language servers
+    --no-plugins            Start without plugins
+    --log-level <LEVEL>     Set the log level (error|warn|info|debug|trace)
+    --doctor                Print terminal, git and key-diagnostic information
+    -h, --help              Print this help
+    -V, --version           Print the version
+    -                       Read the initial buffer from standard input",
+        env!("CARGO_PKG_VERSION")
+    );
 }
 
 fn find_project_config(path: &Path) -> Option<PathBuf> {
@@ -9477,23 +11801,27 @@ fn terminal_key_diagnostics() -> Vec<String> {
 mod tests {
     use super::{
         configured_task, configured_task_plan, default_task, default_test_task,
-        diff_context_visible, editor_diff_line_marks, file_icon, find_project_config,
-        horizontal_view, key_stroke, notification_presentation, parse_args, parse_force_key,
-        parse_location, render_git_diff, render_git_split, sticky_context_lines, terminal_bytes,
-        terminal_color_slot, terminal_key_diagnostics, write_git_diff_line, App, Branch, Edit,
-        GitChangeKind, GitHistoryFilterKind, Selection, StatusEntry, TerminalSession,
+        diff_context_visible, editor_diff_line_marks, encode_text, file_icon, find_project_config,
+        horizontal_view, key_stroke, lsp_language, normalize_line_endings,
+        notification_presentation, parse_args, parse_force_key, parse_location, render_git_diff,
+        render_git_split, sticky_context_lines, terminal_bytes, terminal_color_slot,
+        terminal_key_diagnostics, write_git_diff_line, App, AppError, Branch, DocId, Document,
+        Edit, GitChangeKind, GitHistoryFilterKind, LineEnding, LspSession, Selection, StatusEntry,
+        TerminalSession, TextEncoding,
     };
     use crossterm::event::{
         KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     };
     use mtide_api::ColorSlot;
     use mtide_diff::{apply_hunks, diff_lines, DiffOp};
+    use mtide_lsp::{ClientConfig, CompletionItem, LspClient};
     use mtide_task::{TaskRun, TaskSpec, TaskState};
     use mtide_tui::CellBuffer;
     use mtide_vt::Color as VtColor;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::Command;
+    use std::sync::atomic::AtomicBool;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -9571,11 +11899,9 @@ mod tests {
     #[test]
     fn fr_ed25_sticky_context_returns_nested_enclosing_regions_in_order() {
         let text = "fn outer() {\n    fn inner() {\n        work();\n    }\n}\n";
-        assert_eq!(
-            sticky_context_lines(text, mtide_syntax::Language::Rust, 2, 2),
-            vec![0, 1]
-        );
-        assert!(sticky_context_lines(text, mtide_syntax::Language::Rust, 0, 2).is_empty());
+        let regions = mtide_syntax::fold_regions(text, mtide_syntax::Language::Rust);
+        assert_eq!(sticky_context_lines(&regions, 2, 2), vec![0, 1]);
+        assert!(sticky_context_lines(&regions, 0, 2).is_empty());
     }
 
     #[test]
@@ -9593,7 +11919,7 @@ mod tests {
         let mut frame = CellBuffer::new(80, 24);
         app.draw(&mut frame, 80, 24);
         let row = (0..80)
-            .filter_map(|x| frame.get(x, 1).map(|cell| cell.symbol))
+            .filter_map(|x| frame.get(x, 2).map(|cell| cell.symbol))
             .collect::<String>();
         assert!(row.contains("outer()"));
     }
@@ -10391,7 +12717,9 @@ mod tests {
         app.last_git_poll = Instant::now() - Duration::from_secs(1);
         app.poll_git().expect("schedule git refresh");
         assert!(app.git_status_job.is_some());
-        for _ in 0..100 {
+        // The refresh runs on a worker thread; on a loaded machine a git
+        // subprocess can take longer than a couple of hundred milliseconds.
+        for _ in 0..500 {
             app.poll_git().expect("poll git refresh");
             if app.git_status_job.is_none() {
                 break;
@@ -10652,6 +12980,1557 @@ mod tests {
         assert_eq!(app.cursor, 0);
     }
 
+    fn buffer_contains(frame: &CellBuffer, needle: &str) -> bool {
+        for row in 0..frame.height {
+            let mut line = String::new();
+            for column in 0..frame.width {
+                if let Some(cell) = frame.get(column, row) {
+                    line.push(cell.symbol);
+                }
+            }
+            if line.contains(needle) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn sample_diagnostic(message: &str) -> mtide_lsp::Diagnostic {
+        mtide_lsp::Diagnostic {
+            range: mtide_lsp::Range {
+                start: mtide_lsp::Position {
+                    line: 2,
+                    character: 4,
+                },
+                end: mtide_lsp::Position {
+                    line: 2,
+                    character: 9,
+                },
+            },
+            severity: mtide_lsp::DiagnosticSeverity::Error,
+            source: "rust-analyzer".into(),
+            message: message.into(),
+            code: Some("E0308".into()),
+        }
+    }
+
+    fn long_document_app(prefix: &str) -> App {
+        let text = (0..200)
+            .map(|index| format!("{prefix}{index:03}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut app = App::open(
+            None,
+            false,
+            Some(text),
+            PathBuf::from(format!("/tmp/mtide-scroll-{prefix}.json")),
+            None,
+            None,
+        )
+        .expect("open long document");
+        app.cursor = 0;
+        app
+    }
+
+    #[test]
+    fn fr_ed12_editor_scrolls_to_keep_the_cursor_visible() {
+        let mut app = long_document_app("L");
+        app.cursor = app.document.line_to_byte(150).expect("cursor to line 150");
+        let mut frame = CellBuffer::new(100, 24);
+        app.draw(&mut frame, 100, 24);
+        assert!(
+            buffer_contains(&frame, "L150"),
+            "the cursor line must be rendered after scrolling"
+        );
+        assert!(
+            !buffer_contains(&frame, "L000"),
+            "the first line must have scrolled out of the viewport"
+        );
+        assert!(app.editor_scroll > 0);
+    }
+
+    #[test]
+    fn fr_ed12_manual_scroll_moves_the_viewport_without_moving_the_cursor() {
+        let mut app = long_document_app("M");
+        app.scroll_editor(50);
+        let mut frame = CellBuffer::new(100, 24);
+        app.draw(&mut frame, 100, 24);
+        assert_eq!(app.cursor, 0, "scrolling must not move the cursor");
+        assert!(buffer_contains(&frame, "M050"));
+        assert!(!buffer_contains(&frame, "M000"));
+
+        // A second frame must not snap back while the cursor stays put.
+        let mut second = CellBuffer::new(100, 24);
+        app.draw(&mut second, 100, 24);
+        assert!(buffer_contains(&second, "M050"));
+        assert_eq!(app.editor_scroll, 50);
+    }
+
+    #[test]
+    fn fr_ed12_moving_the_cursor_reanchors_the_viewport() {
+        let mut app = long_document_app("N");
+        app.scroll_editor(80);
+        app.cursor = app.document.line_to_byte(2).expect("cursor to line 2");
+        let mut frame = CellBuffer::new(100, 24);
+        app.draw(&mut frame, 100, 24);
+        assert!(
+            buffer_contains(&frame, "N002"),
+            "a cursor above the viewport pulls the view back to it"
+        );
+        assert_eq!(app.editor_scroll, 2);
+    }
+
+    fn click(app: &mut App, column: u16, row: u16, width: u16, height: u16) {
+        app.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            },
+            width,
+            height,
+        );
+    }
+
+    fn sidebar_app(root: &Path, session: &str) -> App {
+        let mut app = App::open(
+            None,
+            false,
+            Some("body".into()),
+            PathBuf::from(format!("/tmp/{session}.json")),
+            None,
+            None,
+        )
+        .expect("open document");
+        app.workspace_roots = vec![root.to_path_buf()];
+        app
+    }
+
+    fn focus_key(app: &mut App) {
+        app.handle(KeyEvent::new(
+            KeyCode::Char('e'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ))
+        .expect("focus explorer");
+    }
+
+    fn sidebar_key(app: &mut App, code: KeyCode) {
+        app.handle(KeyEvent::new(code, KeyModifiers::NONE))
+            .expect("sidebar key");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fr_gt08_status_refresh_keeps_the_loaded_history() {
+        let root = std::env::temp_dir().join(format!("mtide-git-history-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create repo");
+        let file = root.join("main.rs");
+        fs::write(&file, "fn main() {}\n").expect("write file");
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "t@example.com"],
+            vec!["config", "user.name", "Test"],
+            vec!["add", "."],
+            vec!["commit", "-q", "-m", "first"],
+        ] {
+            assert!(Command::new("git")
+                .current_dir(&root)
+                .args(args)
+                .status()
+                .expect("run git")
+                .success());
+        }
+        let mut app = App::open(
+            Some(file),
+            false,
+            None,
+            root.join("session.json"),
+            None,
+            None,
+        )
+        .expect("open repository");
+
+        let refresh = |app: &mut App| {
+            app.last_git_poll = Instant::now() - Duration::from_secs(1);
+            app.poll_git().expect("start refresh");
+            for _ in 0..500 {
+                app.poll_git().expect("poll refresh");
+                if app.git_status_job.is_none() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            assert!(app.git_status_job.is_none());
+        };
+
+        refresh(&mut app);
+        assert_eq!(app.git_history.len(), 1, "initial refresh loads history");
+        // A later status refresh has no reason to fetch history again; it must
+        // not clear the list it never asked for.
+        refresh(&mut app);
+        assert_eq!(
+            app.git_history.len(),
+            1,
+            "a background status refresh must not wipe the commit list"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+    #[test]
+    fn fr_ui19_ctrl_shift_e_focuses_the_tree_and_esc_returns_to_the_editor() {
+        let root = std::env::temp_dir().join(format!("mtide-nav-focus-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create root");
+        let mut app = sidebar_app(&root, "mtide-nav-focus");
+        app.sidebar_width = None;
+        focus_key(&mut app);
+        assert!(app.sidebar_focus);
+        assert_eq!(app.sidebar_width, Some(28), "focusing reveals the sidebar");
+        assert_eq!(app.sidebar_selected, Some(root.clone()));
+
+        let mut frame = CellBuffer::new(120, 20);
+        app.draw(&mut frame, 120, 20);
+        assert!(
+            frame.get(1, 1).is_some_and(|cell| cell.reverse),
+            "the focused explorer header is inverted"
+        );
+
+        sidebar_key(&mut app, KeyCode::Esc);
+        assert!(!app.sidebar_focus, "Esc hands focus back to the editor");
+        let mut frame = CellBuffer::new(120, 20);
+        app.draw(&mut frame, 120, 20);
+        assert_eq!(frame.get(1, 1).and_then(|cell| cell.background), None);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn fr_ui19_arrows_expand_folders_move_between_rows_and_open_files() {
+        let root = std::env::temp_dir().join(format!("mtide-nav-tree-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).expect("create src");
+        fs::write(root.join("src").join("main.rs"), "fn main() {}").expect("write main");
+        fs::write(root.join("notes.md"), "# notes").expect("write notes");
+        let mut app = sidebar_app(&root, "mtide-nav-tree");
+        let mut frame = CellBuffer::new(120, 20);
+        app.draw(&mut frame, 120, 20);
+        focus_key(&mut app);
+
+        // Right on a collapsed folder expands it without moving the cursor.
+        sidebar_key(&mut app, KeyCode::Right);
+        assert!(app.sidebar_expanded.contains(&root));
+        assert_eq!(app.sidebar_selected, Some(root.clone()));
+
+        sidebar_key(&mut app, KeyCode::Down);
+        assert_eq!(app.sidebar_selected, Some(root.join("src")));
+
+        // Right on an expanded folder steps into its first child.
+        sidebar_key(&mut app, KeyCode::Right);
+        assert!(app.sidebar_expanded.contains(&root.join("src")));
+        sidebar_key(&mut app, KeyCode::Down);
+        assert_eq!(app.sidebar_selected, Some(root.join("src").join("main.rs")));
+
+        sidebar_key(&mut app, KeyCode::Enter);
+        assert_eq!(app.path, Some(root.join("src").join("main.rs")));
+        assert!(app.document.text().starts_with("fn main"));
+
+        // Left collapses the folder, then jumps to the parent.
+        sidebar_key(&mut app, KeyCode::Left);
+        assert_eq!(app.sidebar_selected, Some(root.join("src")));
+        sidebar_key(&mut app, KeyCode::Left);
+        assert!(!app.sidebar_expanded.contains(&root.join("src")));
+        sidebar_key(&mut app, KeyCode::Left);
+        assert_eq!(app.sidebar_selected, Some(root.clone()));
+
+        sidebar_key(&mut app, KeyCode::End);
+        let last = app.sidebar_rows().last().map(|row| row.path.clone());
+        assert_eq!(app.sidebar_selected, last);
+        sidebar_key(&mut app, KeyCode::Home);
+        assert_eq!(app.sidebar_selected, Some(root.clone()));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn fr_ui19_sidebar_selection_keeps_the_viewport_scrolled() {
+        let root = std::env::temp_dir().join(format!("mtide-nav-scroll-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create root");
+        for index in 0..40 {
+            fs::write(root.join(format!("file{index:02}.rs")), "x").expect("write file");
+        }
+        let mut app = sidebar_app(&root, "mtide-nav-scroll");
+        app.sidebar_expanded.insert(root.clone());
+        let mut frame = CellBuffer::new(120, 14);
+        app.draw(&mut frame, 120, 14);
+        focus_key(&mut app);
+        sidebar_key(&mut app, KeyCode::End);
+        assert!(
+            app.sidebar_scroll > 0,
+            "moving past the viewport scrolls the tree"
+        );
+        let rows = app.sidebar_rows();
+        let selected = rows
+            .iter()
+            .position(|row| Some(&row.path) == app.sidebar_selected.as_ref())
+            .expect("selection is a visible row");
+        let capacity = app.sidebar_capacity;
+        assert!(
+            selected >= app.sidebar_scroll && selected < app.sidebar_scroll + capacity,
+            "selection {selected} must stay inside {}..{}",
+            app.sidebar_scroll,
+            app.sidebar_scroll + capacity
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn fr_ui19_ctrl_click_toggles_rows_and_plain_click_collapses_the_selection() {
+        let root = std::env::temp_dir().join(format!("mtide-multi-ctrl-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create root");
+        for name in ["a.rs", "b.rs", "c.rs"] {
+            fs::write(root.join(name), "x").expect("write file");
+        }
+        let mut app = sidebar_app(&root, "mtide-multi-ctrl");
+        app.sidebar_expanded.insert(root.clone());
+        app.sidebar_selected = Some(root.clone());
+        let mut frame = CellBuffer::new(120, 20);
+        app.draw(&mut frame, 120, 20);
+
+        // Rows: root at 2, a.rs at 3, b.rs at 4, c.rs at 5.
+        app.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 3,
+                row: 3,
+                modifiers: KeyModifiers::CONTROL,
+            },
+            120,
+            20,
+        );
+        assert_eq!(app.sidebar_selection_size(), 2, "cursor plus one extra row");
+        assert!(app.sidebar_multi.contains(&root.join("a.rs")));
+
+        app.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 3,
+                row: 5,
+                modifiers: KeyModifiers::CONTROL,
+            },
+            120,
+            20,
+        );
+        assert_eq!(app.sidebar_selection_size(), 3);
+        assert_eq!(app.sidebar_selected, Some(root.join("c.rs")));
+
+        // Ctrl+click on the cursor row itself is a no-op: the cursor row is
+        // always selected and must stay in the set.
+        app.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 3,
+                row: 5,
+                modifiers: KeyModifiers::CONTROL,
+            },
+            120,
+            20,
+        );
+        assert_eq!(app.sidebar_selection_size(), 3);
+        assert_eq!(app.sidebar_selected, Some(root.join("c.rs")));
+
+        // Ctrl+click a previously added row to drop it from the set.
+        app.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 3,
+                row: 3,
+                modifiers: KeyModifiers::CONTROL,
+            },
+            120,
+            20,
+        );
+        assert_eq!(app.sidebar_selection_size(), 2);
+
+        // A plain click returns to a single selection.
+        app.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 3,
+                row: 4,
+                modifiers: KeyModifiers::NONE,
+            },
+            120,
+            20,
+        );
+        assert_eq!(app.sidebar_selection_size(), 1);
+        assert_eq!(app.sidebar_selected, Some(root.join("b.rs")));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn fr_ui19_shift_click_and_shift_arrow_select_a_range() {
+        let root = std::env::temp_dir().join(format!("mtide-multi-range-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create root");
+        for name in ["a.rs", "b.rs", "c.rs", "d.rs"] {
+            fs::write(root.join(name), "x").expect("write file");
+        }
+        let mut app = sidebar_app(&root, "mtide-multi-range");
+        app.sidebar_expanded.insert(root.clone());
+        app.sidebar_selected = Some(root.join("a.rs"));
+        app.sidebar_anchor = Some(root.join("a.rs"));
+        let mut frame = CellBuffer::new(120, 20);
+        app.draw(&mut frame, 120, 20);
+        focus_key(&mut app);
+
+        // Shift+Down twice extends a..c while keeping a.rs as the anchor.
+        app.handle(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT))
+            .expect("shift down");
+        app.handle(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT))
+            .expect("shift down");
+        assert_eq!(app.sidebar_selected, Some(root.join("c.rs")));
+        assert_eq!(
+            app.sidebar_selected_files().len(),
+            3,
+            "a.rs, b.rs and c.rs are selected"
+        );
+        assert!(app.sidebar_multi.contains(&root.join("a.rs")));
+        assert!(app.sidebar_multi.contains(&root.join("b.rs")));
+
+        // Shift+Up shrinks the same range instead of restarting it.
+        app.handle(KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT))
+            .expect("shift up");
+        assert_eq!(app.sidebar_selected_files().len(), 2);
+
+        // A plain arrow drops back to a single row.
+        app.handle(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .expect("plain down");
+        assert_eq!(app.sidebar_selection_size(), 1);
+
+        // Shift+click extends from the anchor to the clicked row.
+        app.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 3,
+                row: 3,
+                modifiers: KeyModifiers::NONE,
+            },
+            120,
+            20,
+        );
+        app.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 3,
+                row: 5,
+                modifiers: KeyModifiers::SHIFT,
+            },
+            120,
+            20,
+        );
+        assert_eq!(app.sidebar_selected, Some(root.join("c.rs")));
+        assert_eq!(app.sidebar_selected_files().len(), 3);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn fr_ui19_enter_opens_every_selected_file_and_esc_clears_first() {
+        let root = std::env::temp_dir().join(format!("mtide-multi-open-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create root");
+        for name in ["a.rs", "b.rs", "c.rs"] {
+            fs::write(root.join(name), "// file").expect("write file");
+        }
+        let mut app = sidebar_app(&root, "mtide-multi-open");
+        app.sidebar_expanded.insert(root.clone());
+        app.sidebar_selected = Some(root.join("a.rs"));
+        app.sidebar_anchor = Some(root.join("a.rs"));
+        let mut frame = CellBuffer::new(120, 20);
+        app.draw(&mut frame, 120, 20);
+        focus_key(&mut app);
+
+        app.handle(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT))
+            .expect("shift down");
+        app.handle(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT))
+            .expect("shift down");
+        app.handle(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("open selection");
+        let opened_tabs = app
+            .tabs
+            .iter()
+            .filter(|tab| {
+                tab.path
+                    .as_deref()
+                    .is_some_and(|path| path.starts_with(&root))
+            })
+            .count();
+        assert_eq!(opened_tabs, 3, "each selected file gets its own tab");
+        assert_eq!(app.path, Some(root.join("c.rs")));
+        assert!(app
+            .notification
+            .as_deref()
+            .is_some_and(|message| message.contains("opened 3 files")));
+
+        // Esc clears the multi selection before it leaves the sidebar.
+        assert!(!app.sidebar_multi.is_empty());
+        app.handle(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("esc clears");
+        assert!(app.sidebar_multi.is_empty());
+        assert!(app.sidebar_focus, "the tree keeps focus after clearing");
+        app.handle(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("esc leaves");
+        assert!(!app.sidebar_focus);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn fr_ui19_multi_selection_is_rendered_distinctly_from_the_cursor_row() {
+        let root = std::env::temp_dir().join(format!("mtide-multi-render-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create root");
+        for name in ["a.rs", "b.rs"] {
+            fs::write(root.join(name), "x").expect("write file");
+        }
+        let mut app = sidebar_app(&root, "mtide-multi-render");
+        app.sidebar_expanded.insert(root.clone());
+        app.sidebar_selected = Some(root.join("a.rs"));
+        app.sidebar_multi.insert(root.join("b.rs"));
+        let mut frame = CellBuffer::new(120, 20);
+        app.draw(&mut frame, 120, 20);
+        // Cursor row (a.rs at row 3) is fully reversed, the extra row is
+        // reversed with dim text, and unrelated rows keep normal colours.
+        let cursor = frame.get(2, 3).expect("cursor row");
+        assert!(cursor.reverse);
+        assert_eq!(cursor.style, ColorSlot::Default);
+        let extra = frame.get(2, 4).expect("extra selected row");
+        assert!(extra.reverse);
+        assert_eq!(extra.style, ColorSlot::Muted);
+        let plain = frame.get(2, 2).expect("unselected row");
+        assert!(!plain.reverse);
+        assert!(!plain.reverse);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn fr_ui19_collapsing_a_folder_prunes_hidden_selections() {
+        let root = std::env::temp_dir().join(format!("mtide-multi-prune-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).expect("create src");
+        fs::write(root.join("src").join("a.rs"), "x").expect("write a");
+        fs::write(root.join("src").join("b.rs"), "x").expect("write b");
+        let mut app = sidebar_app(&root, "mtide-multi-prune");
+        app.sidebar_expanded.insert(root.clone());
+        app.sidebar_expanded.insert(root.join("src"));
+        app.sidebar_selected = Some(root.join("src").join("a.rs"));
+        app.sidebar_multi.insert(root.join("src").join("b.rs"));
+        let mut frame = CellBuffer::new(120, 20);
+        app.draw(&mut frame, 120, 20);
+        focus_key(&mut app);
+        assert_eq!(app.sidebar_selection_size(), 2);
+
+        // First Left jumps from the file to its folder, the second collapses it.
+        sidebar_key(&mut app, KeyCode::Left);
+        assert_eq!(app.sidebar_selected, Some(root.join("src")));
+        sidebar_key(&mut app, KeyCode::Left);
+        assert!(!app.sidebar_expanded.contains(&root.join("src")));
+        assert!(
+            app.sidebar_multi.is_empty(),
+            "hidden rows leave the selection"
+        );
+        assert_eq!(app.sidebar_selected, Some(root.join("src")));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn fr_ui19_pruning_moves_a_hidden_cursor_to_its_visible_ancestor() {
+        let root =
+            std::env::temp_dir().join(format!("mtide-prune-ancestor-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src").join("deep")).expect("create tree");
+        fs::write(root.join("src").join("deep").join("a.rs"), "x").expect("write file");
+        let mut app = sidebar_app(&root, "mtide-prune-ancestor");
+        app.sidebar_expanded.insert(root.clone());
+        app.sidebar_expanded.insert(root.join("src"));
+        app.sidebar_expanded.insert(root.join("src").join("deep"));
+        app.sidebar_selected = Some(root.join("src").join("deep").join("a.rs"));
+        let mut frame = CellBuffer::new(120, 20);
+        app.draw(&mut frame, 120, 20);
+        assert!(app.sidebar_selection_size() >= 1);
+
+        // Collapsing the intermediate folder hides the cursor file; the cursor
+        // must land on that folder, not on the first row of the tree.
+        app.sidebar_expanded.remove(&root.join("src"));
+        app.sidebar_prune_selection();
+        assert_eq!(app.sidebar_selected, Some(root.join("src")));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn fr_ui19_pruning_repairs_the_shift_anchor_so_ranges_keep_working() {
+        let root = std::env::temp_dir().join(format!("mtide-prune-anchor-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).expect("create src");
+        fs::write(root.join("src").join("a.rs"), "x").expect("write file");
+        fs::write(root.join("b.rs"), "x").expect("write file");
+        fs::write(root.join("c.rs"), "x").expect("write file");
+        let mut app = sidebar_app(&root, "mtide-prune-anchor");
+        app.sidebar_expanded.insert(root.clone());
+        app.sidebar_expanded.insert(root.join("src"));
+        // Selection spans the root and a file inside src.
+        app.sidebar_selected = Some(root.join("src").join("a.rs"));
+        app.sidebar_anchor = Some(root.join("src").join("a.rs"));
+        app.sidebar_multi.insert(root.clone());
+        let mut frame = CellBuffer::new(120, 20);
+        app.draw(&mut frame, 120, 20);
+
+        app.sidebar_expanded.remove(&root.join("src"));
+        app.sidebar_prune_selection();
+        assert_eq!(app.sidebar_selected, Some(root.join("src")));
+        assert_eq!(
+            app.sidebar_anchor,
+            Some(root.join("src")),
+            "the anchor follows the cursor after pruning"
+        );
+        assert!(
+            app.sidebar_multi.contains(&root),
+            "visible rows stay selected"
+        );
+
+        // Shift+click must still extend from the repaired anchor: rows are now
+        // root, src, b.rs, c.rs, so row 4 is b.rs and the range src..b.rs yields
+        // exactly one extra row. A stale anchor would collapse this to a single
+        // selection instead.
+        app.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 3,
+                row: 4,
+                modifiers: KeyModifiers::SHIFT,
+            },
+            120,
+            20,
+        );
+        assert_eq!(app.sidebar_selected, Some(root.join("b.rs")));
+        assert_eq!(app.sidebar_selection_size(), 2);
+        assert!(app.sidebar_multi.contains(&root.join("src")));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn fr_ui19_enter_after_collapse_never_opens_hidden_files() {
+        let root = std::env::temp_dir().join(format!("mtide-prune-open-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).expect("create src");
+        fs::write(root.join("src").join("a.rs"), "// a").expect("write a");
+        fs::write(root.join("src").join("b.rs"), "// b").expect("write b");
+        let mut app = sidebar_app(&root, "mtide-prune-open");
+        app.sidebar_expanded.insert(root.clone());
+        app.sidebar_expanded.insert(root.join("src"));
+        app.sidebar_selected = Some(root.join("src").join("a.rs"));
+        app.sidebar_multi.insert(root.join("src").join("b.rs"));
+        let mut frame = CellBuffer::new(120, 20);
+        app.draw(&mut frame, 120, 20);
+        focus_key(&mut app);
+        assert_eq!(app.sidebar_selected_files().len(), 2);
+
+        // Collapse src, then Enter: nothing hidden may be opened.
+        sidebar_key(&mut app, KeyCode::Left);
+        sidebar_key(&mut app, KeyCode::Left);
+        assert!(!app.sidebar_expanded.contains(&root.join("src")));
+        let tabs_before = app.tabs.len();
+        sidebar_key(&mut app, KeyCode::Enter);
+        assert_eq!(app.tabs.len(), tabs_before, "hidden files stay unopened");
+        assert!(app.sidebar_selected_files().is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn fr_ui03_lists_share_the_reverse_selection_style() {
+        let mut app = App::open(
+            None,
+            false,
+            Some("body".into()),
+            PathBuf::from("/tmp/mtide-list-style-session.json"),
+            None,
+            None,
+        )
+        .expect("open document");
+        app.command_palette = true;
+        app.command_query = "save".into();
+        app.command_selected = 0;
+        let mut frame = CellBuffer::new(100, 30);
+        app.draw(&mut frame, 100, 30);
+
+        let reversed_rows = (0..30)
+            .filter(|row| {
+                (0..100).any(|column| frame.get(column, *row).is_some_and(|cell| cell.reverse))
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !reversed_rows.is_empty(),
+            "the selected palette entry must be reversed"
+        );
+        let selected_row = reversed_rows[0];
+        let text = (0..100)
+            .filter_map(|column| frame.get(column, selected_row).map(|cell| cell.symbol))
+            .collect::<String>();
+        assert!(
+            text.contains('>'),
+            "the reversed row is the selected entry: {text}"
+        );
+    }
+
+    #[test]
+    fn fr_ed26_streaming_save_matches_the_canonical_transform() {
+        fn canonical(text: &str, trim: bool, final_nl: bool, ending: LineEnding, encoding: TextEncoding) -> Vec<u8> {
+            // Mirror save(): only collapse through lines()+join() when trimming,
+            // otherwise the trailing newline of the source is preserved.
+            let mut t = text.to_string();
+            if trim {
+                t = t.lines().map(str::trim_end).collect::<Vec<_>>().join("\n");
+            }
+            if final_nl && !t.is_empty() && !t.ends_with('\n') {
+                t.push('\n');
+            }
+            let t = normalize_line_endings(&t, ending);
+            encode_text(&t, encoding).unwrap()
+        }
+        let cases = [
+            "fn main() {}\nlet x = 1;\n",
+            "fn main() {}\nlet x = 1;",
+            "line1\r\nline2\r\n",
+            "line1\r\nline2",
+            "a\rb\r",
+            "mixed\nline\r\nend\n",
+            "",
+            "\n",
+            "\r\n",
+            "\r",
+            "a\rb",
+            "x\r\n\r\ny",
+            "trailing   \n",
+            "trailing   ",
+            "  ",
+            "no newline at all",
+            "a\n\n\n",
+        ];
+        let endings = [
+            LineEnding::Lf,
+            LineEnding::Crlf,
+            LineEnding::Cr,
+            LineEnding::Mixed,
+            LineEnding::None,
+        ];
+        let encodings = [TextEncoding::Utf8, TextEncoding::Utf8Bom];
+        for text in cases {
+            for ending in endings {
+                for encoding in encodings {
+                    for trim in [false, true] {
+                        for final_nl in [false, true] {
+                            let doc = Document::new(DocId(1), text);
+                            let actual = App::save_bytes_streaming(
+                                &doc,
+                                trim,
+                                final_nl,
+                                ending,
+                                encoding,
+                            );
+                            let expected = canonical(text, trim, final_nl, ending, encoding);
+                            assert_eq!(
+                                actual, expected,
+                                "mismatch text={text:?} ending={ending:?} trim={trim} \
+                                 final_nl={final_nl} encoding={encoding:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fr_ed26_streaming_save_preserves_trailing_newline_for_mixed_endings() {
+        // A trailing newline on the final line must survive for Mixed/None.
+        let doc = Document::new(DocId(1), "a\n");
+        let with_nl =
+            App::save_bytes_streaming(&doc, false, false, LineEnding::Mixed, TextEncoding::Utf8);
+        assert_eq!(with_nl, b"a\n");
+        let without_nl =
+            App::save_bytes_streaming(&doc, false, false, LineEnding::None, TextEncoding::Utf8);
+        assert_eq!(without_nl, b"a\n");
+    }
+
+    #[test]
+    fn dbg_perf_save_large_file() {
+        let mut source = String::new();
+        for index in 0..18_000 {
+            source.push_str(&format!("fn function_{index}(value: u32) -> u32 {{\n    let doubled = value * 2; // comment {index}\n    doubled + {index}\n}}\n"));
+        }
+        let dir = std::env::temp_dir().join(format!("mtide-perf-save-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("big.rs");
+        fs::write(&path, &source).expect("write");
+        let size = source.len();
+        let mut app = App::open(
+            Some(path.clone()),
+            false,
+            None,
+            dir.join("session.json"),
+            None,
+            None,
+        )
+        .expect("open");
+
+        let doc = Document::new(DocId(1), &source);
+        let t = Instant::now();
+        let n = doc.conflict_marker_count();
+        println!("  conflict_marker_count: {:?} ({n})", t.elapsed());
+
+        let t = Instant::now();
+        let bytes = App::save_bytes_streaming(&doc, false, true, LineEnding::Lf, TextEncoding::Utf8);
+        println!("  save_bytes_streaming: {:?} ({} bytes)", t.elapsed(), bytes.len());
+
+        let t = Instant::now();
+        let fp = mtide_workspace::fingerprint(&path).expect("fingerprint");
+        println!("  fingerprint: {:?}", t.elapsed());
+        let _ = fp;
+
+        let t = Instant::now();
+        mtide_workspace::changed_since(&path, &app.baseline.clone().unwrap()).expect("changed_since");
+        println!("  changed_since: {:?}", t.elapsed());
+
+        let t = Instant::now();
+        mtide_workspace::atomic_write(&path, &bytes).expect("write");
+        println!("  atomic_write: {:?}", t.elapsed());
+
+        let start = Instant::now();
+        app.save().expect("save");
+        println!("save 1 ({} bytes): {:?}", size, start.elapsed());
+
+        // Make it dirty again and save a second time.
+        app.document
+            .apply(&[Edit {
+                range: app.document.len_bytes()..app.document.len_bytes(),
+                insert: "\n// edited\n".into(),
+            }])
+            .expect("edit");
+        let start = Instant::now();
+        app.save().expect("save 2");
+        println!("save 2: {:?}", start.elapsed());
+
+        let written = fs::read(&path).expect("read back");
+        let mut expected = source.clone();
+        expected.push_str("\n// edited\n");
+        println!("written {} bytes, roundtrip ok: {}", written.len(), written == expected.as_bytes());
+        assert_eq!(written, expected.as_bytes());
+    }
+
+    #[test]
+    fn dbg_perf_595kb() {
+        let mut source = String::new();
+        for index in 0..18_000 {
+            source.push_str(&format!("fn function_{index}(value: u32) -> u32 {{\n    let doubled = value * 2; // comment {index}\n    doubled + {index}\n}}\n"));
+        }
+        let dir = std::env::temp_dir().join(format!("mtide-perf-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("big.rs");
+        fs::write(&path, &source).expect("write");
+        let size = source.len();
+        let mut app = App::open(
+            Some(path),
+            false,
+            None,
+            dir.join("session.json"),
+            None,
+            None,
+        )
+        .expect("open");
+
+        let start = Instant::now();
+        let mut frame = CellBuffer::new(120, 40);
+        app.draw(&mut frame, 120, 40);
+        println!("first draw: {:?} ({} bytes)", start.elapsed(), size);
+
+        let start = Instant::now();
+        for _ in 0..5 {
+            let mut frame = CellBuffer::new(120, 40);
+            app.draw(&mut frame, 120, 40);
+        }
+        println!("5 draws: {:?}", start.elapsed());
+
+        let text = app.document.text();
+        let start = Instant::now();
+        let regions = mtide_syntax::fold_regions(&text, mtide_syntax::Language::Rust);
+        println!(
+            "fold_regions: {:?} ({} regions)",
+            start.elapsed(),
+            regions.len()
+        );
+        let start = Instant::now();
+        let regions = mtide_syntax::fold_regions(text.as_str(), mtide_syntax::Language::Rust);
+        let _ = sticky_context_lines(&regions, 10, 2);
+        println!("sticky: {:?}", start.elapsed());
+        assert!(size > 0);
+    }
+    #[test]
+    fn fr_ui20_open_menu_highlights_the_title_and_the_selected_entry() {
+        let mut app = App::open(
+            None,
+            false,
+            Some("body".into()),
+            PathBuf::from("/tmp/mtide-menu-session.json"),
+            None,
+            None,
+        )
+        .expect("open document");
+        app.menu_open = Some(0);
+        app.menu_selected = 1;
+        let mut frame = CellBuffer::new(100, 30);
+        app.draw(&mut frame, 100, 30);
+        assert!(
+            frame.get(1, 0).is_some_and(|cell| cell.reverse),
+            "the open menu title must be inverted"
+        );
+        assert!(
+            frame.get(3, 4).is_some_and(|cell| cell.reverse),
+            "the selected row must be inverted (row 4 is the second entry)"
+        );
+        assert_eq!(
+            frame.get(3, 3).and_then(|cell| cell.background),
+            Some(ColorSlot::Terminal),
+            "unselected rows paint the terminal background so they hide what is underneath"
+        );
+        assert!(
+            frame.get(3, 3).is_some_and(|cell| !cell.reverse),
+            "unselected rows keep normal colours"
+        );
+        assert!(buffer_contains(&frame, "Save"));
+        assert!(buffer_contains(&frame, "New File"));
+    }
+
+    #[test]
+    fn fr_ui20_submenu_has_its_own_frame_and_hides_the_text_underneath() {
+        let mut app = App::open(
+            None,
+            false,
+            Some("body".into()),
+            PathBuf::from("/tmp/mtide-submenu-session.json"),
+            None,
+            None,
+        )
+        .expect("open document");
+        app.menu_open = Some(4);
+        app.menu_selected = 0;
+        app.menu_submenu = true;
+        let mut frame = CellBuffer::new(100, 30);
+        app.draw(&mut frame, 100, 30);
+        assert!(buffer_contains(&frame, "Diff Views"));
+        assert!(
+            buffer_contains(&frame, "Split / Unified"),
+            "the submenu must list its entries"
+        );
+        // The submenu surface must be opaque: filled background over the editor,
+        // while its selected row is inverted.
+        assert!(
+            frame.get(70, 3).is_some_and(|cell| cell.reverse),
+            "the first submenu entry is selected"
+        );
+        let submenu_cell = frame.get(70, 4).expect("submenu cell");
+        assert_eq!(
+            submenu_cell.background,
+            Some(ColorSlot::Terminal),
+            "the submenu must paint its own background instead of blending in"
+        );
+        assert!(!submenu_cell.reverse);
+        assert!(
+            buffer_contains(&frame, "┌") && buffer_contains(&frame, "└"),
+            "both dropdowns need visible borders"
+        );
+    }
+
+    #[test]
+    fn fr_ui20_clicking_a_menu_entry_runs_it() {
+        let mut app = App::open(
+            None,
+            false,
+            Some("body".into()),
+            PathBuf::from("/tmp/mtide-menu-click-session.json"),
+            None,
+            None,
+        )
+        .expect("open document");
+        assert!(app.word_wrap);
+        click(&mut app, 10, 0, 100, 30); // Edit
+        assert_eq!(app.menu_open, Some(1));
+        click(&mut app, 12, 6, 100, 30); // fourth entry: Toggle Word Wrap
+        assert_eq!(app.menu_open, None);
+        assert!(!app.word_wrap, "the clicked entry must actually run");
+    }
+
+    #[test]
+    fn fr_ui20_sidebar_expands_folders_and_opens_files_on_click() {
+        let root = std::env::temp_dir().join(format!("mtide-sidebar-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).expect("create src");
+        fs::write(root.join("src").join("main.rs"), "fn main() {}").expect("write file");
+        fs::write(root.join("README.md"), "# title").expect("write readme");
+
+        let mut app = App::open(
+            None,
+            false,
+            Some("body".into()),
+            root.join("session.json"),
+            None,
+            None,
+        )
+        .expect("open document");
+        app.workspace_roots = vec![root.clone()];
+        let mut frame = CellBuffer::new(120, 30);
+        app.draw(&mut frame, 120, 30);
+        assert!(buffer_contains(&frame, "mtide-sidebar"));
+        assert!(
+            !buffer_contains(&frame, "src"),
+            "collapsed roots must not list children"
+        );
+
+        click(&mut app, 3, 2, 120, 30); // click the root row
+        assert!(app.sidebar_expanded.contains(&root));
+        let mut expanded = CellBuffer::new(120, 30);
+        app.draw(&mut expanded, 120, 30);
+        assert!(buffer_contains(&expanded, "src"));
+        assert!(buffer_contains(&expanded, "README.md"));
+
+        click(&mut app, 3, 4, 120, 30); // second child: README.md (dirs sort first)
+        assert_eq!(app.path, Some(root.join("README.md")));
+        assert!(app.document.text().starts_with("# title"));
+
+        click(&mut app, 3, 2, 120, 30); // collapse again
+        assert!(!app.sidebar_expanded.contains(&root));
+        let _ = fs::remove_dir_all(root);
+    }
+    #[test]
+    fn fr_ws03_each_tab_remembers_its_scroll_position() {
+        let mut app = long_document_app("T");
+        app.ensure_tab_state();
+        app.scroll_editor(37);
+        app.sync_current_tab();
+        assert_eq!(app.tabs[0].scroll, 37);
+        assert_eq!(
+            app.tabs[0].scroll_cursor, 0,
+            "the anchor cursor travels with the scroll offset"
+        );
+
+        // A second tab starts at the top.
+        let mut second = app.current_editor_tab();
+        second.path = Some(PathBuf::from("/tmp/mtide-scroll-second.rs"));
+        second.text = "other\nfile".into();
+        second.cursor = 0;
+        second.scroll = 0;
+        second.scroll_cursor = 0;
+        app.tabs.push(second);
+        app.active_tab = 1;
+        app.restore_editor_tab(app.tabs[1].clone());
+        let mut frame = CellBuffer::new(100, 24);
+        app.draw(&mut frame, 100, 24);
+        assert_eq!(
+            app.editor_scroll, 0,
+            "a fresh tab must not inherit the offset"
+        );
+
+        // Switching back restores the first tab's viewport.
+        app.sync_current_tab();
+        app.active_tab = 0;
+        app.restore_editor_tab(app.tabs[0].clone());
+        assert_eq!(app.editor_scroll, 37);
+        let mut restored = CellBuffer::new(100, 24);
+        app.draw(&mut restored, 100, 24);
+        assert!(buffer_contains(&restored, "T037"));
+        assert!(!buffer_contains(&restored, "T000"));
+    }
+
+    #[test]
+    fn fr_ws03_scroll_position_survives_a_session_round_trip() {
+        let mut app = long_document_app("U");
+        app.ensure_tab_state();
+        app.scroll_editor(24);
+        let tab = app.current_editor_tab();
+        let session = App::session_tab_from_editor(&tab);
+        assert_eq!(session.scroll, 24);
+        let restored = App::editor_tab_from_session(session);
+        assert_eq!(restored.scroll, 24);
+        assert_eq!(restored.scroll_cursor, tab.cursor);
+    }
+
+    #[test]
+    fn fr_ed11_stale_session_restore_is_treated_as_an_external_conflict() {
+        let root = std::env::temp_dir().join(format!("mtide-stale-session-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create fixture");
+        let file = root.join("main.rs");
+        fs::write(&file, "newer disk content\n").expect("write file");
+        let session_path = root.join("session.json");
+        mtide_workspace::save_session(
+            &session_path,
+            &mtide_workspace::SessionSnapshot {
+                path: Some(file.clone()),
+                text: "older session buffer\n".into(),
+                cursor_line: 0,
+                cursor_column: 0,
+                workspace_roots: Vec::new(),
+                folded_lines: Vec::new(),
+                tabs: Vec::new(),
+                active_tab: 0,
+                bookmarks: Vec::new(),
+                recent_files: Vec::new(),
+            },
+        )
+        .expect("write session");
+
+        let mut app = App::open_with_cancel(
+            None,
+            false,
+            None,
+            session_path,
+            None,
+            None,
+            &AtomicBool::new(false),
+        )
+        .expect("restore session");
+
+        assert_eq!(app.document.text(), "older session buffer\n");
+        assert!(
+            app.external_change,
+            "a snapshot older than the file must not be autosaved over it"
+        );
+        assert!(matches!(app.save(), Err(AppError::ExternalChange(_))));
+        assert_eq!(
+            fs::read_to_string(&file).expect("read file"),
+            "newer disk content\n",
+            "the newer file must survive"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+    #[test]
+    fn fr_ed12_scroll_is_clamped_and_reset_per_file() {
+        let mut app = long_document_app("P");
+        app.scroll_editor(10_000);
+        assert_eq!(app.editor_scroll, app.document.line_count() - 1);
+        app.scroll_editor(-10_000);
+        assert_eq!(app.editor_scroll, 0);
+
+        app.scroll_editor(30);
+        app.path = Some(PathBuf::from("/tmp/mtide-scroll-other.rs"));
+        let mut frame = CellBuffer::new(100, 24);
+        app.draw(&mut frame, 100, 24);
+        assert_eq!(app.editor_scroll, 0, "a new file starts at the top");
+    }
+
+    #[test]
+    fn fr_ed12_mouse_clicks_map_through_the_scroll_offset() {
+        let mut app = long_document_app("Q");
+        app.scroll_editor(40);
+        let cursor = app
+            .editor_mouse_position(60, 5, 100, 24)
+            .expect("hit inside the editor");
+        let line = app.document.byte_to_line(cursor).expect("line for cursor");
+        assert!(
+            (41..=46).contains(&line),
+            "click on viewport row 5 must land near line 45, got {line}"
+        );
+    }
+    #[test]
+    fn fr_ln06_poll_lsp_mirrors_the_document_and_folds_diagnostics() {
+        use std::io::BufReader;
+        use std::os::unix::net::UnixStream;
+
+        let (client_stream, server_stream) = UnixStream::pair().expect("socket pair");
+        let reader = client_stream.try_clone().expect("clone client reader");
+        let handle = std::thread::spawn(move || {
+            let _ = server_stream.set_read_timeout(Some(Duration::from_millis(150)));
+            let mut server_reader =
+                BufReader::new(server_stream.try_clone().expect("clone server reader"));
+            let mut server_writer = server_stream;
+            loop {
+                let Ok(Some(message)) = mtide_proc::read_message(&mut server_reader) else {
+                    return;
+                };
+                match message.get("method").and_then(|value| value.as_str()) {
+                    Some("initialize") => {
+                        mtide_proc::write_message(
+                            &mut server_writer,
+                            &serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "id": message["id"],
+                                "result": { "capabilities": { "textDocumentSync": 1 } },
+                            }),
+                        )
+                        .expect("answer initialize");
+                    }
+                    Some("textDocument/didOpen") => {
+                        let uri = message["params"]["textDocument"]["uri"].clone();
+                        mtide_proc::write_message(
+                            &mut server_writer,
+                            &serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "method": "textDocument/publishDiagnostics",
+                                "params": {
+                                    "uri": uri,
+                                    "version": 0,
+                                    "diagnostics": [{
+                                        "range": {
+                                            "start": { "line": 0, "character": 0 },
+                                            "end": { "line": 0, "character": 3 },
+                                        },
+                                        "severity": 1,
+                                        "source": "test-lsp",
+                                        "message": "boom",
+                                    }],
+                                },
+                            }),
+                        )
+                        .expect("publish diagnostics");
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let mut app = App::open(
+            None,
+            false,
+            Some("fn main() {}".into()),
+            PathBuf::from("/tmp/mtide-lsp-wiring-session.json"),
+            None,
+            None,
+        )
+        .expect("open document");
+        app.path = Some(PathBuf::from("/tmp/workspace/src/main.rs"));
+        let mut client = LspClient::attach(
+            ClientConfig {
+                server_id: "test-lsp".into(),
+                ..ClientConfig::default()
+            },
+            reader,
+            client_stream,
+        );
+        client
+            .initialize(Path::new("/tmp/workspace"))
+            .expect("start handshake");
+        app.lsp = Some(LspSession {
+            client,
+            server: "test-lsp",
+            language: "rust",
+            synced: None,
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            app.poll_lsp();
+            if app
+                .lsp_diagnostics
+                .file(Path::new("/tmp/workspace/src/main.rs"))
+                .is_some()
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let stored = app
+            .lsp_diagnostics
+            .file(Path::new("/tmp/workspace/src/main.rs"))
+            .expect("diagnostics folded into the app store");
+        assert_eq!(stored.diagnostics[0].message, "boom");
+        assert!(
+            app.lsp_status.contains("1E"),
+            "status must surface the error count: {}",
+            app.lsp_status
+        );
+        assert_eq!(
+            app.lsp
+                .as_ref()
+                .and_then(|session| session.synced.clone())
+                .map(|(path, _)| path),
+            Some(PathBuf::from("/tmp/workspace/src/main.rs")),
+            "the server must have been told which document is open"
+        );
+
+        // Closing the buffer must tell the server and reset the sync marker.
+        app.path = None;
+        app.poll_lsp();
+        assert_eq!(
+            app.lsp.as_ref().and_then(|session| session.synced.clone()),
+            None
+        );
+        handle.join().expect("server thread");
+    }
+
+    fn completion_item(label: &str) -> CompletionItem {
+        CompletionItem {
+            label: label.into(),
+            insert_text: label.into(),
+            ..CompletionItem::default()
+        }
+    }
+
+    fn app_with_text(text: &str, session: &str) -> App {
+        let mut app = App::open(
+            None,
+            false,
+            Some(text.into()),
+            PathBuf::from(format!("/tmp/{session}.json")),
+            None,
+            None,
+        )
+        .expect("open document");
+        app.cursor = app.document.text().len();
+        app
+    }
+
+    #[test]
+    fn fr_ln07_accepting_completion_applies_the_text_edit_and_auto_import_together() {
+        let mut app = app_with_text("Str", "mtide-completion-import");
+        let mut item = completion_item("String");
+        item.detail = "struct".into();
+        item.text_edit = Some(mtide_lsp::TextEdit {
+            start: mtide_lsp::Position {
+                line: 0,
+                character: 0,
+            },
+            end: mtide_lsp::Position {
+                line: 0,
+                character: 3,
+            },
+            new_text: "String".into(),
+        });
+        item.additional_edits = vec![mtide_lsp::TextEdit {
+            start: mtide_lsp::Position {
+                line: 0,
+                character: 0,
+            },
+            end: mtide_lsp::Position {
+                line: 0,
+                character: 0,
+            },
+            new_text: "use std::string::String;\n".into(),
+        }];
+        app.completion_open = true;
+        app.completion_items = vec![item];
+        app.completion_anchor = 0;
+        app.completion_prefix = "Str".into();
+        app.accept_completion().expect("accept completion");
+
+        assert_eq!(
+            app.document.text(),
+            "use std::string::String;\nString",
+            "auto-import must land in the same transaction as the completion"
+        );
+        assert_eq!(app.cursor, app.document.text().len());
+        assert!(!app.completion_open);
+        assert!(app.document.is_dirty());
+    }
+
+    #[test]
+    fn fr_ln07_snippet_completion_expands_placeholders_and_sets_tab_stops() {
+        let mut app = app_with_text("pri", "mtide-completion-snippet");
+        let mut item = completion_item("println!");
+        item.insert_text = "println!(\"$1\")".into();
+        item.snippet = true;
+        app.completion_open = true;
+        app.completion_items = vec![item];
+        app.completion_anchor = 0;
+        app.completion_prefix = "pri".into();
+        app.accept_completion().expect("accept snippet");
+
+        assert_eq!(app.document.text(), "println!(\"\")");
+        assert_eq!(app.snippet_stops, vec![(10, 10)]);
+        assert_eq!(app.cursor, 10);
+    }
+
+    #[test]
+    fn fr_ln07_completion_list_filters_by_prefix_then_substring() {
+        let mut app = app_with_text("", "mtide-completion-filter");
+        app.completion_items = vec![
+            completion_item("println"),
+            completion_item("print"),
+            completion_item("eprintln"),
+        ];
+        app.completion_prefix = "pri".into();
+        let filtered = app
+            .filtered_completions()
+            .into_iter()
+            .map(|item| item.label)
+            .collect::<Vec<_>>();
+        assert_eq!(filtered, vec!["println".to_string(), "print".to_string()]);
+
+        app.completion_prefix = "printl".into();
+        let filtered = app
+            .filtered_completions()
+            .into_iter()
+            .map(|item| item.label)
+            .collect::<Vec<_>>();
+        assert_eq!(filtered, vec!["println".to_string()]);
+    }
+
+    #[test]
+    fn fr_ln07_popup_follows_typing_and_closes_when_the_word_ends() {
+        let mut app = app_with_text("pr", "mtide-completion-sync");
+        app.completion_open = true;
+        app.completion_items = vec![completion_item("println")];
+        app.completion_anchor = 0;
+        app.completion_prefix = "pr".into();
+
+        app.document
+            .apply(&[Edit {
+                range: 2..2,
+                insert: "i".into(),
+            }])
+            .expect("type");
+        app.cursor = 3;
+        app.sync_completion_after_edit();
+        assert!(app.completion_open);
+        assert_eq!(app.completion_prefix, "pri");
+
+        app.document
+            .apply(&[Edit {
+                range: 3..3,
+                insert: ")".into(),
+            }])
+            .expect("type punctuation");
+        app.cursor = 4;
+        app.sync_completion_after_edit();
+        assert!(!app.completion_open, "punctuation must dismiss the popup");
+    }
+
+    #[test]
+    fn fr_ln08_hover_popup_renders_the_server_text() {
+        let mut app = app_with_text("fn main() {}", "mtide-hover");
+        app.hover_open = true;
+        app.hover_lines = vec!["fn main()".into(), "returns ()".into()];
+        let mut frame = CellBuffer::new(100, 30);
+        app.draw(&mut frame, 100, 30);
+        assert!(buffer_contains(&frame, "fn main()"));
+        assert!(buffer_contains(&frame, "Hover"));
+    }
+
+    #[test]
+    fn fr_ln06_completion_without_a_server_explains_why() {
+        let mut app = app_with_text("fn main() {}", "mtide-completion-offline");
+        app.path = Some(PathBuf::from("/tmp/workspace/src/main.rs"));
+        app.request_completion();
+        assert!(!app.completion_open);
+        assert!(app
+            .notification
+            .as_deref()
+            .is_some_and(|message| message.contains("language server")));
+    }
+    #[test]
+    fn fr_ln06_language_mapping_only_offers_servers_with_recipes() {
+        assert_eq!(lsp_language(Path::new("main.rs")), Some("rust"));
+        assert_eq!(lsp_language(Path::new("app.go")), Some("go"));
+        assert_eq!(lsp_language(Path::new("tool.py")), Some("python"));
+        assert_eq!(lsp_language(Path::new("app.ts")), Some("typescript"));
+        assert_eq!(lsp_language(Path::new("notes.txt")), None);
+        assert_eq!(lsp_language(Path::new("data.json")), None);
+    }
+
+    #[test]
+    fn fr_ln09_problems_panel_lists_lsp_diagnostics() {
+        let mut app = App::open(
+            None,
+            false,
+            Some("fn main() {}".into()),
+            PathBuf::from("/tmp/mtide-lsp-panel-session.json"),
+            None,
+            None,
+        )
+        .expect("open document");
+        let path = PathBuf::from("/tmp/workspace/src/main.rs");
+        app.lsp_diagnostics.publish(
+            &path,
+            Some(1),
+            "rust-analyzer",
+            vec![sample_diagnostic("mismatched types")],
+        );
+        app.task_results_open = true;
+        let mut frame = CellBuffer::new(110, 30);
+        app.draw(&mut frame, 110, 30);
+        assert!(
+            buffer_contains(&frame, "mismatched types"),
+            "the problems panel must list language server diagnostics"
+        );
+        assert!(buffer_contains(&frame, "main.rs:3:5"));
+    }
+
+    #[test]
+    fn fr_ln09_lsp_diagnostics_become_jump_targets_and_status_counts() {
+        let mut app = App::open(
+            None,
+            false,
+            Some("fn main() {}".into()),
+            PathBuf::from("/tmp/mtide-lsp-jump-session.json"),
+            None,
+            None,
+        )
+        .expect("open document");
+        let path = PathBuf::from("/tmp/workspace/src/main.rs");
+        app.lsp_diagnostics.publish(
+            &path,
+            Some(1),
+            "rust-analyzer",
+            vec![sample_diagnostic("mismatched types")],
+        );
+        let targets = app.problem_targets();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].0, path);
+        assert_eq!(targets[0].1, 3);
+        assert_eq!(targets[0].2, Some(5));
+        let status = app.status_line(200, app.document.text().len());
+        assert!(
+            status.contains("1E"),
+            "status must surface the error count: {status}"
+        );
+    }
+
+    #[test]
+    fn fr_ln06_no_lsp_flag_never_starts_a_server() {
+        let mut app = App::open(
+            None,
+            false,
+            Some("fn main() {}".into()),
+            PathBuf::from("/tmp/mtide-lsp-off-session.json"),
+            None,
+            None,
+        )
+        .expect("open document");
+        app.no_lsp = true;
+        app.poll_lsp();
+        assert!(app.lsp.is_none());
+        assert_eq!(app.lsp_status, "LSP:off");
+        assert!(!app
+            .status_line(200, app.document.text().len())
+            .contains("LSP:"));
+    }
+
+    #[test]
+    fn fr_ln06_unsupported_language_does_not_spawn_a_probe() {
+        let mut app = App::open(
+            None,
+            false,
+            Some("plain text".into()),
+            PathBuf::from("/tmp/mtide-lsp-none-session.json"),
+            None,
+            None,
+        )
+        .expect("open document");
+        app.path = Some(PathBuf::from("/tmp/notes.txt"));
+        app.poll_lsp();
+        assert!(app.lsp.is_none());
+        assert!(app.lsp_probe_job.is_none());
+        assert_eq!(app.lsp_status, "LSP:no-recipe");
+    }
     #[test]
     fn fr_ui05_status_line_contains_core_state_and_fits_narrow_terminal() {
         let mut app = App::open(
@@ -10869,7 +14748,7 @@ mod tests {
             MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
                 column: 5,
-                row: 2,
+                row: 3,
                 modifiers: KeyModifiers::NONE,
             },
             80,
@@ -10879,7 +14758,7 @@ mod tests {
             MouseEvent {
                 kind: MouseEventKind::Drag(MouseButton::Left),
                 column: 10,
-                row: 2,
+                row: 3,
                 modifiers: KeyModifiers::NONE,
             },
             80,
@@ -10890,7 +14769,7 @@ mod tests {
             MouseEvent {
                 kind: MouseEventKind::Up(MouseButton::Left),
                 column: 10,
-                row: 2,
+                row: 3,
                 modifiers: KeyModifiers::NONE,
             },
             80,
@@ -10920,11 +14799,16 @@ mod tests {
         assert_eq!(app.active_tab, 1);
         app.switch_tab(-1);
         assert_eq!(app.active_tab, 0);
+        let mut frame = CellBuffer::new(80, 24);
+        app.draw(&mut frame, 80, 24);
+        let target = (app.tab_origin..app.tab_origin + 80)
+            .find(|column| app.tab_at_column(*column) == Some(1))
+            .expect("second tab has a column");
         app.handle_mouse(
             MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
-                column: 12,
-                row: 0,
+                column: target,
+                row: 1,
                 modifiers: KeyModifiers::NONE,
             },
             80,
@@ -10996,7 +14880,7 @@ mod tests {
         assert!(app.bookmarks.contains(&1));
         let mut frame = CellBuffer::new(80, 24);
         app.draw(&mut frame, 80, 24);
-        assert_eq!(frame.get(4, 2).map(|cell| cell.symbol), Some('◆'));
+        assert_eq!(frame.get(4, 3).map(|cell| cell.symbol), Some('◆'));
         app.persist_session().expect("persist bookmarks");
         let snapshot = mtide_workspace::load_session(&session).expect("load bookmarks");
         assert_eq!(snapshot.bookmarks, vec![1]);
@@ -11367,7 +15251,7 @@ mod tests {
         app.toggle_fold_at_cursor();
         let mut frame = CellBuffer::new(80, 24);
         app.draw(&mut frame, 80, 24);
-        assert!(frame.get(5, 1).is_some_and(|cell| cell.symbol == '…'));
+        assert!(frame.get(5, 2).is_some_and(|cell| cell.symbol == '…'));
         app.set_all_folds(false);
         assert!(app.folded_lines.is_empty());
         app.set_all_folds(true);
@@ -12261,10 +16145,13 @@ mod tests {
         let restored = App::open(None, false, None, session, None, None).expect("restore session");
         assert!(restored.document.is_dirty());
         assert!(restored.document.text().starts_with("unsaved\n"));
-        assert_eq!(
-            restored.notification.as_deref(),
-            Some("restored unsaved session changes")
-        );
+        // The snapshot is older than the file, so it must be flagged as a
+        // conflict instead of being autosaved over it.
+        assert!(restored.external_change);
+        assert!(restored
+            .notification
+            .as_deref()
+            .is_some_and(|message| message.contains("restored unsaved session changes")));
         let _ = fs::remove_dir_all(root);
     }
 

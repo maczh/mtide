@@ -41,6 +41,29 @@ impl ManagedProcess {
     pub fn id(&self) -> u32 {
         self.child.id()
     }
+
+    /// Hands the child's stdin to the caller (JSON-RPC writer half).
+    pub fn take_stdin(&mut self) -> Result<std::process::ChildStdin, ProcError> {
+        self.child
+            .stdin
+            .take()
+            .ok_or_else(|| ProcError::Io(io::Error::other("child stdin unavailable")))
+    }
+
+    /// Hands the child's stdout to the caller (JSON-RPC reader half).
+    pub fn take_stdout(&mut self) -> Result<std::process::ChildStdout, ProcError> {
+        self.child
+            .stdout
+            .take()
+            .ok_or_else(|| ProcError::Io(io::Error::other("child stdout unavailable")))
+    }
+
+    pub fn take_stderr(&mut self) -> Result<std::process::ChildStderr, ProcError> {
+        self.child
+            .stderr
+            .take()
+            .ok_or_else(|| ProcError::Io(io::Error::other("child stderr unavailable")))
+    }
     pub fn try_wait(&mut self) -> Result<Option<ExitStatus>, ProcError> {
         Ok(self.child.try_wait()?)
     }

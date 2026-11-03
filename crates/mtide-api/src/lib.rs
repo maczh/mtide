@@ -7,6 +7,10 @@ pub const PROTOCOL_VERSION: u16 = 1;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ColorSlot {
     Default,
+    /// The terminal's own foreground/background (ANSI reset). Used by surfaces
+    /// such as menus that must hide whatever is underneath them without
+    /// imposing a palette colour.
+    Terminal,
     Muted,
     Focus,
     Error,

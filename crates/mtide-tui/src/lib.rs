@@ -4,7 +4,7 @@ use crossterm::{
     cursor,
     event::{DisableMouseCapture, EnableMouseCapture, KeyCode, KeyEvent, KeyModifiers},
     execute,
-    style::{Color, Print, SetBackgroundColor, SetForegroundColor},
+    style::{Attribute, Color, Print, SetAttribute, SetBackgroundColor, SetForegroundColor},
     terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use mtide_api::ColorSlot;
@@ -20,6 +20,10 @@ pub struct Cell {
     pub symbol: char,
     pub style: ColorSlot,
     pub background: Option<ColorSlot>,
+    /// Reverse video: the terminal swaps foreground and background. Menus use
+    /// this for the selected row so the highlight follows the user's palette
+    /// (light surface with dark text on a dark terminal).
+    pub reverse: bool,
 }
 
 impl Default for Cell {
@@ -28,6 +32,7 @@ impl Default for Cell {
             symbol: ' ',
             style: ColorSlot::Default,
             background: None,
+            reverse: false,
         }
     }
 }
@@ -890,6 +895,134 @@ pub struct Layout {
     pub status: (u16, u16),
 }
 
+/// The stable five-region workbench geometry required by the product UI.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WorkbenchLayout {
+    pub menu_height: u16,
+    pub sidebar: Option<(u16, u16, u16, u16)>,
+    pub editor: (u16, u16, u16, u16),
+    pub output: (u16, u16, u16, u16),
+    pub agent: Option<(u16, u16, u16, u16)>,
+    pub status: (u16, u16, u16, u16),
+}
+
+pub const OUTPUT_TABS: [&str; 5] = [
+    "Terminal",
+    "Diagnostics",
+    "References",
+    "Output",
+    "Debug Console",
+];
+
+pub fn workbench_layout(
+    width: u16,
+    height: u16,
+    sidebar_width: Option<u16>,
+    output_height: Option<u16>,
+    agent_width: Option<u16>,
+) -> WorkbenchLayout {
+    let menu_height = height.min(1);
+
+    let status_height = height.saturating_sub(menu_height).min(1);
+    let usable_height = height.saturating_sub(menu_height + status_height).max(1);
+    let sidebar = (width >= 100).then(|| {
+        let w = sidebar_width
+            .unwrap_or(width / 5)
+            .clamp(20, width.saturating_sub(60));
+        (w, usable_height)
+    });
+    let left = sidebar.map(|(w, _)| w).unwrap_or(0);
+    let agent = (width >= 140).then(|| {
+        let w = agent_width
+            .unwrap_or(32)
+            .clamp(24, width.saturating_sub(left + 50));
+        (width.saturating_sub(w), menu_height, w, usable_height)
+    });
+    let right = agent.map(|(_, _, w, _)| w).unwrap_or(0);
+    let center_x = left;
+    let center_width = width.saturating_sub(left + right);
+    let out = output_height
+        .unwrap_or(8)
+        .clamp(4, usable_height.saturating_sub(4).max(4));
+    let editor_height = usable_height.saturating_sub(out).max(1);
+    WorkbenchLayout {
+        menu_height,
+        sidebar: sidebar.map(|(w, h)| (0, menu_height, w, h)),
+        editor: (center_x, menu_height, center_width, editor_height),
+        output: (center_x, menu_height + editor_height, center_width, out),
+        agent,
+        status: (
+            0,
+            height.saturating_sub(status_height),
+            width,
+            status_height,
+        ),
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MenuItem {
+    pub title: &'static str,
+    pub shortcut: Option<&'static str>,
+    pub separator: bool,
+    pub submenu: bool,
+}
+
+pub fn main_menu_contract() -> [&'static str; 6] {
+    ["File", "Edit", "Selection", "View", "Options", "Help"]
+}
+
+pub fn menu_items(menu: &str) -> Vec<MenuItem> {
+    let item = |title, shortcut| MenuItem {
+        title,
+        shortcut,
+        separator: false,
+        submenu: false,
+    };
+    match menu {
+        "File" => vec![
+            item("New File", Some("Ctrl+N")),
+            item("Save", Some("Ctrl+S")),
+            item("Open Folder", Some("Ctrl+O")),
+            item("Quit", Some("Ctrl+Q")),
+        ],
+        "Edit" => vec![
+            item("Undo", Some("Ctrl+Z")),
+            item("Redo", Some("Ctrl+Y")),
+            item("Find", Some("Ctrl+F")),
+            item("Replace", Some("Ctrl+R")),
+        ],
+        "Selection" => vec![
+            item("Select All", Some("Ctrl+A")),
+            item("Add Next Occurrence", Some("Ctrl+D")),
+        ],
+        "View" => vec![
+            item("Command Palette", Some("Ctrl+P")),
+            item("Toggle Sidebar", Some("Ctrl+B")),
+            item("Toggle Terminal", Some("Ctrl+T")),
+        ],
+        "Options" => vec![
+            item("Line Numbers", None),
+            item("Word Wrap", None),
+            item("Menu Bar", Some("Alt+Shift+M")),
+            MenuItem {
+                title: "Diff Views",
+                shortcut: None,
+                separator: false,
+                submenu: true,
+            },
+            MenuItem {
+                title: "Git Files",
+                shortcut: None,
+                separator: false,
+                submenu: true,
+            },
+        ],
+        "Help" => vec![item("About", None)],
+        _ => Vec::new(),
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ColorCapability {
     NoColor,
@@ -1100,7 +1233,42 @@ impl CellBuffer {
         (x < self.width && y < self.height)
             .then(|| &self.cells[y as usize * self.width as usize + x as usize])
     }
+
+    pub fn get_mut(&mut self, x: u16, y: u16) -> Option<&mut Cell> {
+        if x >= self.width || y >= self.height {
+            return None;
+        }
+        let index = y as usize * self.width as usize + x as usize;
+        self.cells.get_mut(index)
+    }
     pub fn write_str(&mut self, x: u16, y: u16, text: &str, style: ColorSlot) {
+        self.write_str_styled(x, y, text, style, None);
+    }
+
+    /// Writes text in reverse video, used for selection highlights.
+    pub fn write_str_reverse(&mut self, x: u16, y: u16, text: &str, style: ColorSlot) {
+        self.write_str_styled(x, y, text, style, Some(ColorSlot::Terminal));
+        let width = UnicodeWidthStr::width(text) as u16;
+        for column in 0..width {
+            if let Some(cell) = x
+                .checked_add(column)
+                .and_then(|position| self.get_mut(position, y))
+            {
+                cell.reverse = true;
+            }
+        }
+    }
+
+    /// Writes text with an explicit background slot, which is how selection and
+    /// menu highlights are rendered (inverse video without ANSI escapes).
+    pub fn write_str_styled(
+        &mut self,
+        x: u16,
+        y: u16,
+        text: &str,
+        style: ColorSlot,
+        background: Option<ColorSlot>,
+    ) {
         let mut offset = 0u16;
         for grapheme in text.graphemes(true) {
             let Some(position) = x.checked_add(offset) else {
@@ -1115,10 +1283,35 @@ impl CellBuffer {
                 Cell {
                     symbol,
                     style,
-                    background: None,
+                    background,
+                    reverse: false,
                 },
             );
             offset = offset.saturating_add(UnicodeWidthStr::width(grapheme).max(1) as u16);
+        }
+    }
+
+    /// Fills a rectangle with a background slot, used to draw menu surfaces.
+    pub fn fill_background(
+        &mut self,
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
+        background: Option<ColorSlot>,
+    ) {
+        for row in 0..height {
+            for column in 0..width {
+                let Some(position) = x.checked_add(column) else {
+                    continue;
+                };
+                let Some(line) = y.checked_add(row) else {
+                    continue;
+                };
+                if let Some(cell) = self.get_mut(position, line) {
+                    cell.background = background;
+                }
+            }
         }
     }
 
@@ -1254,6 +1447,11 @@ pub fn render_with_options<W: Write>(
         execute!(
             out,
             cursor::MoveTo(x, y),
+            if cell.reverse {
+                SetAttribute(Attribute::Reverse)
+            } else {
+                SetAttribute(Attribute::NoReverse)
+            },
             SetForegroundColor(color(cell.style, options.inherit_terminal_colors)),
             SetBackgroundColor(
                 cell.background
@@ -1397,6 +1595,7 @@ fn color(slot: ColorSlot, inherit_terminal_colors: bool) -> Color {
     match slot {
         ColorSlot::Default if inherit_terminal_colors => Color::Reset,
         ColorSlot::Default => Color::White,
+        ColorSlot::Terminal => Color::Reset,
         ColorSlot::Muted => Color::DarkGrey,
         ColorSlot::Focus => Color::Cyan,
         ColorSlot::Error => Color::Red,
@@ -1414,6 +1613,24 @@ fn color(slot: ColorSlot, inherit_terminal_colors: bool) -> Color {
 mod tests {
     use super::*;
 
+    #[test]
+    fn fr_ui02_reverse_cells_emit_reverse_video_and_terminal_backgrounds() {
+        let previous = CellBuffer::new(20, 2);
+        let mut current = previous.clone();
+        current.write_str_reverse(1, 0, "File", ColorSlot::Default);
+        current.write_str_styled(1, 1, "Edit", ColorSlot::Default, Some(ColorSlot::Terminal));
+        let mut out = Vec::new();
+        render(&mut out, &current, &previous).expect("render frame");
+        let text = String::from_utf8_lossy(&out);
+        assert!(
+            text.contains("\u{1b}[7m"),
+            "selected cells must ask the terminal for reverse video"
+        );
+        assert!(
+            text.contains("\u{1b}[49m"),
+            "ColorSlot::Terminal must reset the background instead of painting white"
+        );
+    }
     #[test]
     fn fr_ui01_diff_only_contains_changed_cells() {
         let old = CellBuffer::new(80, 24);
@@ -1491,6 +1708,30 @@ mod tests {
             layout_with_sidebar(120, 40, true, Some(32)).sidebar,
             Some((32, 39))
         );
+    }
+
+    #[test]
+    fn fr_ui20_main_menu_contract_is_stable() {
+        assert_eq!(
+            main_menu_contract(),
+            ["File", "Edit", "Selection", "View", "Options", "Help"]
+        );
+        assert!(menu_items("Options")
+            .iter()
+            .any(|item| item.submenu && item.title == "Diff Views"));
+        assert_eq!(menu_items("File")[0].shortcut, Some("Ctrl+N"));
+    }
+
+    #[test]
+    fn fr_ui21_workbench_has_five_regions_and_safe_minimums() {
+        let layout = workbench_layout(200, 60, Some(28), Some(12), Some(36));
+        assert_eq!(layout.sidebar, Some((0, 1, 28, 58)));
+        assert_eq!(layout.agent, Some((164, 1, 36, 58)));
+        assert!(layout.editor.2 >= 50);
+        assert!(layout.output.3 >= 4);
+        let narrow = workbench_layout(80, 24, None, None, None);
+        assert_eq!(narrow.sidebar, None);
+        assert_eq!(narrow.agent, None);
     }
 
     #[test]
@@ -1637,6 +1878,7 @@ mod tests {
                 symbol: 'A',
                 style: ColorSlot::Indexed(201),
                 background: Some(ColorSlot::Rgb(1, 2, 3)),
+                reverse: false,
             },
         );
         let cell = buffer.get(0, 0).expect("colored cell");

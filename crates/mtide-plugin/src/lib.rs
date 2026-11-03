@@ -152,7 +152,13 @@ pub enum WidgetNode {
 impl WidgetNode {
     pub fn sanitize(self) -> Result<Self, PluginError> {
         fn clean(text: String) -> Result<String, PluginError> {
-            if text.chars().any(|ch| ch == '\x1b' || ch == '\u{9b}') {
+            // Escape sequences are the documented hazard, but bare control
+            // characters (carriage return, bell, CSI in 8-bit form) can corrupt
+            // the grid just as easily, so only newline and tab survive.
+            if text.chars().any(|character| {
+                (character.is_control() && character != '\n' && character != '\t')
+                    || character == '\u{9b}'
+            }) {
                 Err(PluginError::AnsiOutput)
             } else {
                 Ok(text)
@@ -249,7 +255,11 @@ impl PermissionBroker {
     }
     pub fn check_path(&mut self, permission: Permission, path: &Path) -> Result<(), PluginError> {
         self.check(permission)?;
-        if path == self.workspace || path.starts_with(&self.workspace) {
+        // Resolve `.` and `..` lexically before the boundary check: without this
+        // a plugin could reach outside the workspace with `<workspace>/../x`.
+        let candidate = normalize_path(path);
+        let workspace = normalize_path(&self.workspace);
+        if candidate == workspace || candidate.starts_with(&workspace) {
             Ok(())
         } else {
             Err(PluginError::OutsideWorkspace)
@@ -261,6 +271,24 @@ impl PermissionBroker {
     pub fn should_disable(&self) -> bool {
         self.violations >= 3
     }
+}
+
+/// Lexical path normalisation: drops `.`, folds `..` and collapses repeated
+/// separators without touching the file system.
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !normalized.pop() {
+                    normalized.push("..");
+                }
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -375,6 +403,51 @@ mod tests {
         assert!(state.restart());
     }
 
+    #[test]
+    fn fr_pl03_broker_rejects_parent_directory_escapes() {
+        let mut broker = PermissionBroker::new("/workspace", [Permission::WorkspaceRead].into());
+        assert_eq!(
+            broker.check_path(
+                Permission::WorkspaceRead,
+                Path::new("/workspace/../etc/passwd")
+            ),
+            Err(PluginError::OutsideWorkspace)
+        );
+        assert_eq!(
+            broker.check_path(
+                Permission::WorkspaceRead,
+                Path::new("/workspace-evil/secret")
+            ),
+            Err(PluginError::OutsideWorkspace)
+        );
+        assert!(broker
+            .check_path(
+                Permission::WorkspaceRead,
+                Path::new("/workspace/src/./main.rs")
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn fr_pl04_widget_sanitize_blocks_all_control_characters() {
+        for text in ["carriage\rreturn", "bell\u{7}", "eight-bit\u{9b}31m"] {
+            assert!(
+                WidgetNode::Text {
+                    text: text.into(),
+                    style: StyleToken::Default
+                }
+                .sanitize()
+                .is_err(),
+                "{text:?} must be rejected"
+            );
+        }
+        assert!(WidgetNode::Text {
+            text: "multi\nline\ttab".into(),
+            style: StyleToken::Default
+        }
+        .sanitize()
+        .is_ok());
+    }
     #[test]
     fn fr_pl05_manifest_discovery_skips_invalid_plugins() {
         let root = std::env::temp_dir().join(format!("mtide-plugin-{}", std::process::id()));
