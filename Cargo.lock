@@ -266,8 +266,10 @@ dependencies = [
  "mtide-core",
  "mtide-diff",
  "mtide-git",
+ "mtide-lsp",
  "mtide-nav",
  "mtide-plugin",
+ "mtide-proc",
  "mtide-search",
  "mtide-syntax",
  "mtide-task",
@@ -275,6 +277,8 @@ dependencies = [
  "mtide-tui",
  "mtide-vt",
  "mtide-workspace",
+ "nix",
+ "serde_json",
  "signal-hook",
  "thiserror",
  "toml",
@@ -317,6 +321,16 @@ name = "mtide-git"
 version = "0.1.0"
 dependencies = [
  "mtide-diff",
+ "thiserror",
+]
+
+[[package]]
+name = "mtide-lsp"
+version = "0.1.0"
+dependencies = [
+ "mtide-proc",
+ "serde",
+ "serde_json",
  "thiserror",
 ]
 
