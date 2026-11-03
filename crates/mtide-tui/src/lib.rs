@@ -1271,6 +1271,125 @@ pub fn render_with_options<W: Write>(
     Ok(())
 }
 
+/// Text-only Markdown projection used by the read-only preview.  Keeping the
+/// projection independent from rendering makes wrapping and keyboard tests
+/// deterministic and lets narrow terminals fall back without a parser panic.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MarkdownLine {
+    Heading { level: u8, text: String },
+    List { ordered: bool, text: String },
+    Code { text: String },
+    Table { cells: Vec<String> },
+    Paragraph(String),
+    Blank,
+}
+
+pub fn markdown_preview(source: &str, width: usize) -> Vec<MarkdownLine> {
+    let width = width.max(1);
+    let mut in_code = false;
+    let mut output = Vec::new();
+    for raw in source.lines() {
+        let line = raw.trim_end();
+        if line.trim_start().starts_with("```") {
+            in_code = !in_code;
+            continue;
+        }
+        if in_code {
+            output.push(MarkdownLine::Code {
+                text: line.chars().take(width).collect(),
+            });
+            continue;
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            output.push(MarkdownLine::Blank);
+        } else if trimmed.starts_with('|') && trimmed.ends_with('|') {
+            output.push(MarkdownLine::Table {
+                cells: trimmed[1..trimmed.len() - 1]
+                    .split('|')
+                    .map(|cell| cell.trim().to_owned())
+                    .collect(),
+            });
+        } else if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
+            output.push(MarkdownLine::List {
+                ordered: false,
+                text: trimmed[2..].chars().take(width).collect(),
+            });
+        } else if let Some((level, text)) = trimmed.split_once(' ') {
+            let level = level.chars().count();
+            if (1..=6).contains(&level)
+                && level <= trimmed.len()
+                && trimmed[..level].chars().all(|c| c == '#')
+            {
+                output.push(MarkdownLine::Heading {
+                    level: level as u8,
+                    text: text.chars().take(width).collect(),
+                });
+            } else {
+                output.push(MarkdownLine::Paragraph(
+                    trimmed.chars().take(width).collect(),
+                ));
+            }
+        } else if let Some((prefix, text)) = trimmed.split_once(". ") {
+            if prefix.chars().all(|c| c.is_ascii_digit()) {
+                output.push(MarkdownLine::List {
+                    ordered: true,
+                    text: text.chars().take(width).collect(),
+                });
+            } else {
+                output.push(MarkdownLine::Paragraph(
+                    trimmed.chars().take(width).collect(),
+                ));
+            }
+        } else {
+            output.push(MarkdownLine::Paragraph(
+                trimmed.chars().take(width).collect(),
+            ));
+        }
+    }
+    output
+}
+
+/// A compact, clickable model for UI-18. Each source line maps to one cell;
+/// callers can translate a minimap row back to a document line safely.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Minimap {
+    pub rows: Vec<u8>,
+    pub visible: bool,
+}
+
+impl Minimap {
+    pub fn from_text(text: &str, terminal_width: u16) -> Self {
+        Self {
+            rows: text
+                .lines()
+                .map(|line| match line.trim_start().chars().next() {
+                    Some('#') | Some('/') | Some('!') => 3,
+                    Some(' ') | Some('\t') => 2,
+                    Some(_) => 1,
+                    None => 0,
+                })
+                .collect(),
+            visible: terminal_width >= 120,
+        }
+    }
+    pub fn line_at(&self, row: usize) -> Option<usize> {
+        self.visible
+            .then_some(row.min(self.rows.len().saturating_sub(1)))
+    }
+}
+
+pub fn accessibility_label(kind: &str, message: &str) -> String {
+    let marker = match kind.to_ascii_lowercase().as_str() {
+        "error" => "✖",
+        "warning" => "▲",
+        "success" => "✔",
+        "progress" => "…",
+        _ => "•",
+    };
+    format!("{marker} {kind}: {message}")
+}
+
 fn color(slot: ColorSlot, inherit_terminal_colors: bool) -> Color {
     if std::env::var_os("NO_COLOR").is_some() {
         return Color::Reset;
@@ -1304,6 +1423,29 @@ mod tests {
         assert_eq!(changed.len(), "编辑🙂".chars().count());
         assert_eq!((changed[0].0, changed[0].1), (2, 3));
         assert_eq!(changed[1].0, 4);
+    }
+
+    #[test]
+    fn fr_ui09_accessibility_labels_do_not_depend_on_colour() {
+        assert_eq!(
+            accessibility_label("error", "build failed"),
+            "✖ error: build failed"
+        );
+        assert!(accessibility_label("warning", "deprecated").starts_with('▲'));
+    }
+
+    #[test]
+    fn fr_ui17_markdown_preview_and_ui18_minimap_are_width_safe() {
+        let lines = markdown_preview("# Title\n- item\n```rust\nfn main() {}\n```\n| a | b |", 8);
+        assert!(matches!(lines[0], MarkdownLine::Heading { level: 1, .. }));
+        assert!(matches!(
+            lines[1],
+            MarkdownLine::List { ordered: false, .. }
+        ));
+        assert!(matches!(lines[2], MarkdownLine::Code { .. }));
+        assert!(matches!(lines[3], MarkdownLine::Table { .. }));
+        assert!(!Minimap::from_text("a\nb", 80).visible);
+        assert_eq!(Minimap::from_text("a\nb", 120).line_at(99), Some(1));
     }
 
     #[test]

@@ -130,6 +130,9 @@ fn check_dependencies() -> Result<(), String> {
         "mtide-task",
         "mtide-git",
         "mtide-diff",
+        "mtide-nav",
+        "mtide-ai",
+        "mtide-plugin",
         "mtide",
     ] {
         if !names.contains(required) {

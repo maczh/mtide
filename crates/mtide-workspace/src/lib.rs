@@ -405,6 +405,40 @@ pub struct Config {
     pub save_all_on_quit: bool,
 }
 
+/// Staged settings used by WS-06. The caller applies the preview to its live
+/// app state, but the user-level TOML is written only after `apply`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SettingsTransaction {
+    original: Config,
+    draft: Config,
+}
+
+impl SettingsTransaction {
+    pub fn new(config: Config) -> Self {
+        Self {
+            original: config.clone(),
+            draft: config,
+        }
+    }
+    pub fn draft(&self) -> &Config {
+        &self.draft
+    }
+    pub fn draft_mut(&mut self) -> &mut Config {
+        &mut self.draft
+    }
+    pub fn is_dirty(&self) -> bool {
+        self.original != self.draft
+    }
+    pub fn cancel(self) -> Config {
+        self.original
+    }
+    pub fn apply(self, path: &Path) -> Result<Config, WorkspaceError> {
+        let text = toml::to_string_pretty(&self.draft)?;
+        atomic_write(path, text.as_bytes())?;
+        Ok(self.draft)
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct EditorConfig {
     pub tab_width: Option<u8>,
@@ -888,6 +922,26 @@ mod tests {
         assert_eq!(configured.terminal_force_keys, vec!["ctrl-q", "alt-x"]);
         assert_eq!(configured.autosave_interval_secs, 12);
         assert!(configured.save_all_on_quit);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn fr_ws06_settings_transaction_keeps_cancel_non_persistent_and_apply_atomic() {
+        let root = std::env::temp_dir().join(format!("mtide-settings-{}", std::process::id()));
+        fs::create_dir_all(&root).expect("create settings fixture");
+        let target = root.join("config.toml");
+        let original = Config::default();
+        let mut transaction = SettingsTransaction::new(original.clone());
+        transaction.draft_mut().theme = "modern".into();
+        assert!(transaction.is_dirty());
+        assert_eq!(transaction.cancel(), original);
+        let mut transaction = SettingsTransaction::new(Config::default());
+        transaction.draft_mut().theme = "modern".into();
+        let applied = transaction.apply(&target).expect("apply settings");
+        assert_eq!(applied.theme, "modern");
+        assert!(fs::read_to_string(&target)
+            .expect("read settings")
+            .contains("theme = \"modern\""));
         let _ = fs::remove_dir_all(root);
     }
 

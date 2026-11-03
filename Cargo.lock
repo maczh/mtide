@@ -261,10 +261,13 @@ name = "mtide"
 version = "0.1.0"
 dependencies = [
  "crossterm",
+ "mtide-ai",
  "mtide-api",
  "mtide-core",
  "mtide-diff",
  "mtide-git",
+ "mtide-nav",
+ "mtide-plugin",
  "mtide-search",
  "mtide-syntax",
  "mtide-task",
@@ -277,6 +280,15 @@ dependencies = [
  "toml",
  "unicode-segmentation",
  "unicode-width",
+]
+
+[[package]]
+name = "mtide-ai"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]
@@ -305,6 +317,24 @@ name = "mtide-git"
 version = "0.1.0"
 dependencies = [
  "mtide-diff",
+ "thiserror",
+]
+
+[[package]]
+name = "mtide-nav"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "mtide-plugin"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
  "thiserror",
 ]
 

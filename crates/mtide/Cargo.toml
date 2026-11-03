@@ -18,6 +18,9 @@ mtide-task = { path = "../mtide-task" }
 mtide-git = { path = "../mtide-git" }
 mtide-diff = { path = "../mtide-diff" }
 mtide-search = { path = "../mtide-search" }
+mtide-ai = { path = "../mtide-ai" }
+mtide-nav = { path = "../mtide-nav" }
+mtide-plugin = { path = "../mtide-plugin" }
 signal-hook.workspace = true
 thiserror.workspace = true
 toml.workspace = true

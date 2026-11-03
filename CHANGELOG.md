@@ -17,6 +17,9 @@
 
 ## Unreleased
 
+- PRD2 UI/PL/AI/WS/NV foundation: added independent `mtide-ai`, `mtide-plugin`, and `mtide-nav` contracts with adapter probing/event parsing, sensitive-context filtering, Diff Gate base checks, audit/session metadata, plugin manifest discovery/permission/RPC/widget sanitization, recent-position/bookmark/local-history/outline state, and settings Apply/Cancel staging.
+- Added keyboard-accessible UI primitives for semantic accessibility labels, width-safe Markdown preview projection, and terminal-width-gated minimap data.
+
 - 扩展 GT-12 Git 取消链路：blame、fetch/pull/push/sync、merge/rebase、提交详情与 stash 详情均使用可中断进程；新增 `git.cancel` / Ctrl-Shift-G，并在详情面板 Esc 时回收后台 Git 进程。
 - TR-01 VT 状态机现在跟踪鼠标报告（1000/1002/1003/1006）与 bracketed paste（2004）；终端聚焦时 TUI 鼠标和粘贴事件按 SGR/括号粘贴协议透传给 PTY。
 - GT-14 新增编辑器 Diff 模式（`Ctrl-Alt-Shift-D`）：工作区文件保持可编辑，后台基于当前未保存文本实时重算 HEAD 差异，并在行号槽显示新增行装饰；原有 `Ctrl-Alt-D` 外部变更比较快捷键保持不变。

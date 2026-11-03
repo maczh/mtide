@@ -12,6 +12,9 @@ members = [
     "crates/mtide-task",
     "crates/mtide-git",
     "crates/mtide-diff",
+    "crates/mtide-nav",
+    "crates/mtide-ai",
+    "crates/mtide-plugin",
     "crates/mtide",
     "xtask",
 ]
