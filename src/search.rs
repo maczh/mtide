@@ -12,6 +12,15 @@ pub struct SearchResult {
     pub text: String,
 }
 
+// Keep interactive searches responsive even when a file is opened directly
+// from a system directory containing many unrelated entries.
+const MAX_SEARCH_ENTRIES: usize = 5_000;
+
+struct SearchBudget {
+    remaining: usize,
+    remaining_bytes: u64,
+}
+
 #[allow(dead_code)]
 pub fn search_workspace_roots(roots: &[PathBuf], query: &str) -> Vec<SearchResult> {
     search_workspace_roots_with_globs(roots, query, &[], &[])
@@ -40,8 +49,24 @@ pub fn search_workspace_roots_with_options(
         return Vec::new();
     }
     let mut results = Vec::new();
+    let mut budget = SearchBudget {
+        remaining: MAX_SEARCH_ENTRIES,
+        remaining_bytes: 64 * 1024 * 1024,
+    };
     for root in roots {
-        visit(root, root, query, include, exclude, use_regex, &mut results);
+        visit(
+            root,
+            root,
+            query,
+            include,
+            exclude,
+            use_regex,
+            &mut results,
+            &mut budget,
+        );
+        if budget.remaining == 0 {
+            break;
+        }
     }
     results
 }
@@ -109,6 +134,7 @@ fn replace_line_case_insensitive(line: &str, query: &str, replacement: &str) -> 
     (output, count)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn visit(
     path: &Path,
     root: &Path,
@@ -117,7 +143,11 @@ fn visit(
     exclude: &[String],
     use_regex: bool,
     results: &mut Vec<SearchResult>,
+    budget: &mut SearchBudget,
 ) {
+    if budget.remaining == 0 {
+        return;
+    }
     let Ok(metadata) = fs::metadata(path) else {
         return;
     };
@@ -126,6 +156,18 @@ fn visit(
             return;
         };
         for entry in entries.flatten() {
+            budget.remaining = budget.remaining.saturating_sub(1);
+            if budget.remaining == 0 {
+                return;
+            }
+            // Do not follow symlinked directories. Apart from making workspace
+            // search unexpectedly escape its roots, this can create cycles.
+            if entry
+                .file_type()
+                .is_ok_and(|file_type| file_type.is_symlink())
+            {
+                continue;
+            }
             let child = entry.path();
             let relative = child.strip_prefix(root).unwrap_or(&child);
             if child
@@ -140,13 +182,17 @@ fn visit(
             if matches_glob(relative, exclude, true) {
                 continue;
             }
-            visit(&child, root, query, include, exclude, use_regex, results);
+            visit(
+                &child, root, query, include, exclude, use_regex, results, budget,
+            );
         }
     } else if metadata.len() <= 4 * 1024 * 1024
+        && metadata.len() <= budget.remaining_bytes
         && (include.is_empty()
             || matches_glob(path.strip_prefix(root).unwrap_or(path), include, false))
         && !matches_glob(path.strip_prefix(root).unwrap_or(path), exclude, false)
     {
+        budget.remaining_bytes -= metadata.len();
         let Ok(text) = fs::read_to_string(path) else {
             return;
         };

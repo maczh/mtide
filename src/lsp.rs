@@ -541,6 +541,7 @@ mod tests {
     #[test]
     fn records_failed_state_for_invalid_server_configuration() {
         let settings = LspSettings {
+            extra: BTreeMap::new(),
             enabled: true,
             servers: BTreeMap::from([(
                 "rust".to_owned(),

@@ -14,7 +14,7 @@ Lua 模块通过 `require("ttt")` 注入，不假设全局变量。插件加载�
 
 声明 `editor.write` 后，插件可调用 `insert(line, col, text)`、`set_line(line, text)`、`replace(start_line, start_col, end_line, end_col, text)`、`set_cursor(line, col)`、`set_selection(...)`、`clear_selection()`、`add_cursor(line, col)` 和 `clear_cursors()`；`begin_undo_group()` / `end_undo_group()` 可将连续写入合并成一次撤销操作，并支持嵌套。写入调用进入 Host 编辑请求队列，在插件回调结束后应用，并复用 Buffer 的 undo checkpoint；非法或越界坐标会被安全限制到当前缓冲区范围。
 
-`require("ttt.events")` 提供与 `ttt.on(event, callback)` 等价的 `events.on(event, callback)` 注册入口。同一事件允许多个插件回调同时订阅，Host 按注册顺序依次触发，单个回调失败会终止当前事件派发并报告插件错误。文件/编辑器事件会附带活动路径及必要的 1-based 行列参数：打开/重载/保存事件传入 `path`，`editor.change`/`cursor.change` 传入 `path, line, col, language, selection_active, selection_text`；旧版忽略额外参数的无参回调保持兼容。
+`require("ttt.events")` 提供与 `ttt.on(event, callback)` 等价的 `events.on(event, callback)` 注册入口。同一事件允许多个插件回调同时订阅，Host 按注册顺序依次触发，单个回调失败会终止当前事件派发并报告插件错误。文件/编辑器事件会附带活动路径及必要的 1-based 行列参数：打开/重载/保存事件传入 `path`，`editor.change`/`cursor.change` 传入 `path, line, col, language, selection_active, selection_text, current_line_text, line_count, dirty`；旧版忽略额外参数的无参回调保持兼容。
 
 `require("ttt.diagnostics")` 提供 `publish(path, items)` 和 `clear([path])`，需要 `editor.diagnostics` 权限。每个 item 使用 1-based `line/col`，可选 `end_line/end_col`、`severity`（`error`/`warning`/`info`/`hint`）、`message` 和 `source`；重复发布会替换该插件在该文件上的诊断。Host 将插件诊断与 LSP 诊断合并显示，插件禁用或重载时其运行时状态自然清空。
 
@@ -40,7 +40,7 @@ Lua 模块通过 `require("ttt")` 注入，不假设全局变量。插件加载�
 
 可注册 Sidebar/Bottom/Drawer/Editor panel、command、keybinding、file handler、status item、tab 和 Widget。Widget 包括 tree/table/list/input/dialog/dropdown/tabs/scrollview/markdown，并支持命名 style 和必要的 raw cell API。
 
-兼容的近期插件 API 还包括 pager、border/title/password input、table row actions/selected/loading/empty/inset、tree/list right badge、hstack align、表格水平滚动、双击选择复制、插件 selectionStyle、插件 tab id/on_close/focus、读取/导航 diff tabs、bundled theme manifest、`ttt.text` terminal-column width、`ttt.terminal` 的 spawn/send/read/screen/focus/close/list 进程终端 API、`sys.spawn` 交互 stdio、`sys.exec` 的 env/timeout/cancel 和 `sys.exec_async` 限长流式输出。
+兼容的近期插件 API 还包括 pager、border/title/password input、checkbox（`checked` 与 `label/text`）、table row actions/selected/loading/empty/inset、tree/list right badge、hstack align、表格水平滚动（`scroll_x`/`horizontal_scroll` 与可选 `width`，按 Unicode 字符裁剪）、双击选择复制、插件 selectionStyle、插件 tab id/on_close/focus、读取/导航 diff tabs、bundled theme manifest、`ttt.text` terminal-column width、`ttt.terminal` 的 spawn/send/read/screen/focus/close/list 进程终端 API、`sys.spawn` 交互 stdio、`sys.exec` 的 env/timeout/cancel 和 `sys.exec_async` 限长流式输出。
 
 权限按文件、网络、process、terminal、storage、screen 等拆分。权限拒绝必须返回可处理错误；插件整体禁用时核心编辑器仍可运行。
 
@@ -77,7 +77,7 @@ manifest 至少包含名称、版本、入口、兼容版本和权限。安装�
 
 Agent 是右侧持久终端会话，不与普通 bottom terminal 共用状态。Provider 配置包含 executable、args、cwd、可选 install command、显示名和启用状态。Host 同时兼容 mtide 的 `agent.providers` 和 TTT 的 `agents` 顶层 schema（`cli`、字符串/数组 `args`、`install`），统一归一化后再启动。Host 会先检查 executable 是否存在于 PATH；缺失时在右侧显示完整安装命令，只有用户按 Enter 明确确认后才会把命令发送到普通 Terminal 执行，禁止启动阶段静默安装。安装命令执行期间保持 pending 状态；一旦 executable 进入 PATH，Host 自动重建该 provider 的独立 Agent PTY 会话，切换 provider 会取消旧 pending 状态。
 
-Agent 输出是 PTY 文本，不直接改变编辑器状态；Agent 进入 alternate screen 后，字符、退格、回车和 Tab 直接写入其 PTY，bracketed paste 和启用的鼠标协议也使用标准终端事件。Host 会在退出时保存 active provider、未提交输入和 VT 屏幕文本快照，下一次启动且 provider 一致时恢复这些可视状态，PTY 进程本身不会被伪持久化。未来若增加结构化 tool integration，必须经过权限和事件协议。
+Agent 默认输出是 PTY 文本，不直接改变编辑器状态；Agent 进入 alternate screen 后，字符、退格、回车和 Tab 直接写入其 PTY，bracketed paste 和启用的鼠标协议也使用标准终端事件。Agent 也可逐行发送 `{"type":"tool_call","id":...,"tool":"read_file|list_files|write_file|search","args":{...}}`，Host 在主循环异步执行并回写 `tool_result` JSONL，权限和 workspace 根目录校验与本地工具入口一致。Host 会在退出时保存 active provider、未提交输入和 VT 屏幕文本快照，下一次启动且 provider 一致时恢复这些可视状态，PTY 进程本身不会被伪持久化。
 
 ## 5. 安全边界
 
@@ -88,7 +88,7 @@ Agent 输出是 PTY 文本，不直接改变编辑器状态；Agent 进入 alter
 
 插件可调用 `ttt.show_info(title, entries)` 打开只读信息弹层，其中 `entries` 为 `{key = "...", value = "..."}` 数组。按 Enter 或 Esc 关闭。
 
-插件可调用 `ttt.open_dialog({title, width, height, render, on_close})` 打开通用插件弹层，内容复用 panel proxy 渲染；`ttt.close_dialog()` 可主动关闭。弹层中的 `panel:input({text, placeholder, on_change})` 已支持字符输入、退格和实时回调，`panel:button({label, on_click})` 已支持 Tab 切换焦点、Enter 和底部按钮区域鼠标点击；Esc 和主动关闭都会先恢复原焦点，再执行 `on_close`。更复杂的多控件导航仍由后续 Widget 状态层补齐。
+插件可调用 `ttt.open_dialog({title, width, height, render, on_close})` 打开通用插件弹层，内容复用 panel proxy 渲染；`ttt.close_dialog()` 可主动关闭。弹层中的 `panel:input({text, placeholder, on_change})` 和 `panel:password({text, value, on_change})` 已支持字符输入、退格和实时回调，密码内容按掩码渲染；`panel:checkbox({checked, label/text, on_change})` 支持状态保持、Tab/Shift-Tab 焦点循环和 Enter/Space 切换，多个 `panel:button({label, on_click})` 支持 Tab/Shift-Tab 双向焦点循环、Enter 和按内容行命中的鼠标点击；dropdown 也支持按行命中后用方向键/Enter 操作。Esc 和主动关闭都会先恢复原焦点，再执行 `on_close`。
 
 插件可通过 `require("ttt.command_line")` 使用单行命令输入：`show({prefix, text, on_change, on_submit, on_cancel, on_key})`、`hide()`、`set_text(text)` 和 `active()`。该模块要求 `keybindings` 权限；输入期间所有按键由命令行优先处理，提交前先关闭 overlay，再执行 `on_submit`，取消执行 `on_cancel`，焦点随后恢复。
 
@@ -98,7 +98,7 @@ Agent 输出是 PTY 文本，不直接改变编辑器状态；Agent 进入 alter
 
 `ttt.executable_path()` 返回当前 mtide 可执行文件的绝对路径，供插件调用自身宿主或展示诊断信息使用。
 
-`ttt.open_changes({id, title, description, diff})` 可将包含 `diff --git` 文件头的 unified diff 打开为插件只读差异标签；Host 保留描述和原始 diff 行并复用自定义 tab 生命周期，插件标签获得焦点后支持 Up/Down/PageUp/PageDown/Home/End 滚动、`[`/`]` 在 `@@` hunk 间跳转、Esc 或 Ctrl-W 关闭。
+`ttt.open_changes({id, title, description, diff, file_path})` 可将包含 `diff --git` 文件头的 unified diff 打开为插件只读差异标签；Host 保留描述和原始 diff 行并复用自定义 tab 生命周期，插件标签获得焦点后支持 Up/Down/PageUp/PageDown/Home/End 滚动、`[`/`]` 在 `@@` hunk 间跳转、`v` 切换 unified/split 视图、Esc 或 Ctrl-W 关闭。提供 `file_path` 时，Enter 会打开对应工作区文件并进入可编辑基线 diff 模式。
 
 插件可通过 `require("ttt.net")` 使用受 `network.http` 权限保护的 `get`、`post`、`get_async` 和 `post_async`。同步/异步请求都限制为 HTTP(S)、30 秒超时和 10 MiB 响应体，并返回 `{status, body, headers, error?}`；异步网络线程只投递完成事件，Lua 回调在主循环执行。`network.http=true` 允许所有目标；声明字符串数组时按主机名/IP 和可选端口精确匹配，未列出的目标在请求离开进程前即被拒绝，自动重定向也会逐跳执行同样的目标校验。
 

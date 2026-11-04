@@ -16,15 +16,19 @@ use crate::{
         branches as git_branches, checkout as git_checkout, checkout_conflict_side,
         commit as git_commit, conflict_blocks, create_branch as git_create_branch,
         current_branch as git_branch, delete_branch as git_delete_branch, diff as git_diff,
-        fetch as git_fetch, history as git_history, hunk_count as git_hunk_count, hunk_start_line,
-        pull as git_pull, push as git_push, remote_with_credentials as git_remote_credentials,
+        diff_refs as git_diff_refs, fetch as git_fetch,
+        fetch_pull_request as git_fetch_pull_request, history as git_history,
+        hunk_count as git_hunk_count, hunk_start_line,
+        list_pull_request_comments as git_list_pr_comments, pull as git_pull, push as git_push,
+        remote_with_credentials as git_remote_credentials, resolve_ref as git_resolve_ref,
         stage as git_stage, status as git_status, unstage as git_unstage, BlameLine, DiffLine,
-        GitChange, GitCommit,
+        GitChange, GitCommit, PullRequestComment,
     },
     lsp::{LspManager, LspServerState},
     plugin::{
+        download_plugin_registry_entry, fetch_plugin_registry, install_plugin_archive,
         PluginEditorRequest, PluginEditorSnapshot, PluginEventArg, PluginPackage,
-        PluginPanelLocation, PluginPanelRequest, PluginRuntime,
+        PluginPanelLocation, PluginPanelRequest, PluginRegistryEntry, PluginRuntime,
     },
     search::{
         replace_with_options, search_text_with_options, search_workspace_roots_with_options,
@@ -176,6 +180,9 @@ pub enum LspPopup {
         edit: serde_json::Value,
         summary: Vec<String>,
     },
+    ConflictPreview {
+        lines: Vec<String>,
+    },
     Info(String),
 }
 impl BottomTab {
@@ -205,6 +212,7 @@ pub struct App {
     search_index: usize,
     search_root: PathBuf,
     workspace_roots: Vec<PathBuf>,
+    explorer_roots: Vec<PathBuf>,
     explorer_paths: Vec<PathBuf>,
     explorer_index: usize,
     explorer_mode: Option<ExplorerMode>,
@@ -220,6 +228,11 @@ pub struct App {
     change_index: usize,
     change_hunk_index: usize,
     change_diff: Vec<DiffLine>,
+    diff_split: bool,
+    pull_request_target: Option<(String, u64)>,
+    pull_request_head: Option<String>,
+    pull_request_comments: Vec<PullRequestComment>,
+    pull_request_comment_mode: bool,
     blame_lines: Vec<BlameLine>,
     history: Vec<GitCommit>,
     output_scroll: usize,
@@ -234,15 +247,21 @@ pub struct App {
     agent: TerminalState,
     agent_provider: String,
     agent_session_path: Option<PathBuf>,
+    agent_protocol_buffer: Vec<u8>,
     agent_install_confirm: bool,
     agent_install_pending: bool,
     status_message: String,
     plugin_runtimes: Vec<PluginRuntime>,
+    plugin_registry_entries: Vec<PluginRegistryEntry>,
     plugin_drawer: Option<PluginDrawerState>,
     plugin_custom_tab: Option<(usize, String)>,
     plugin_tab_scroll: usize,
     plugin_tab_hunk: usize,
+    plugin_tab_split: bool,
+    plugin_tab_collapsed_hunks: BTreeSet<usize>,
     plugin_file_view: Option<(String, String)>,
+    git_diff_tab_text: Option<String>,
+    plugin_diff_file_path: Option<PathBuf>,
     plugin_file_close: Option<(usize, u64)>,
     plugin_dialog: Option<PluginDialog>,
     plugin_command_line: Option<PluginCommandLine>,
@@ -292,33 +311,70 @@ impl App {
     }
 
     pub fn new_with_stdin(args: &[String], stdin_text: Option<&str>) -> AppResult<Self> {
-        let explicit_target = args.iter().enumerate().find_map(|(index, arg)| {
-            if (arg.starts_with('-') && arg != "-")
-                || (index > 0
-                    && args.get(index - 1).is_some_and(|previous| {
-                        matches!(previous.as_str(), "--plugin" | "--config")
-                    }))
-            {
-                None
-            } else {
-                Some(arg)
-            }
-        });
+        let explicit_target = args
+            .windows(2)
+            .find(|pair| pair[0] == "--workspace")
+            .map(|pair| pair[1].clone())
+            .or_else(|| {
+                args.iter()
+                    .enumerate()
+                    .find_map(|(index, arg)| {
+                        if (arg.starts_with('-') && arg != "-")
+                            || (index > 0
+                                && args.get(index - 1).is_some_and(|previous| {
+                                    matches!(
+                                        previous.as_str(),
+                                        "--plugin"
+                                            | "--config"
+                                            | "--workspace"
+                                            | "--exec"
+                                            | "--exec-split-on"
+                                            | "--size"
+                                    )
+                                }))
+                        {
+                            None
+                        } else {
+                            Some(arg)
+                        }
+                    })
+                    .cloned()
+            });
+        let settings_path = args
+            .windows(2)
+            .find(|pair| pair[0] == "--config")
+            .map(|pair| PathBuf::from(&pair[1]));
         let mut settings = args
             .windows(2)
             .find(|pair| pair[0] == "--config")
             .map(|pair| Settings::load_from_path(&pair[1]))
             .unwrap_or_else(Settings::load);
+        if args.iter().any(|arg| arg == "--clear-default-folders") {
+            settings.default_folders.clear();
+            if let Some(path) = settings_path {
+                let _ = settings.save_to_path(path);
+            } else {
+                let _ = settings.save();
+            }
+        }
         let welcome = args.iter().any(|arg| arg == "--welcome");
-        let target = explicit_target
-            .map(String::as_str)
-            .map(parse_location_target)
-            .or_else(|| {
-                (!welcome)
-                    .then(|| settings.default_folders.first().map(String::as_str))
-                    .flatten()
-                    .map(parse_location_target)
-            });
+        let using_default_folders = explicit_target.is_none() && !welcome && stdin_text.is_none();
+        let pull_request = explicit_target
+            .as_deref()
+            .and_then(parse_github_pull_request_url);
+        let target = if pull_request.is_some() {
+            None
+        } else {
+            explicit_target
+                .as_deref()
+                .map(parse_location_target)
+                .or_else(|| {
+                    (!welcome)
+                        .then(|| settings.default_folders.first().map(String::as_str))
+                        .flatten()
+                        .map(parse_location_target)
+                })
+        };
         let target = if !welcome && target.is_none() && stdin_text.is_some() {
             Some(parse_location_target("-"))
         } else {
@@ -376,7 +432,11 @@ impl App {
         }
         let mut terminal = TerminalState::with_command(terminal_command(&settings), None);
         terminal.set_scrollback(settings.terminal.scrollback);
-        let workspace_roots = match workspace_roots(target.as_ref()) {
+        let workspace_roots = match if using_default_folders {
+            default_workspace_roots(&settings)
+        } else {
+            workspace_roots(target.as_ref())
+        } {
             Ok(roots) => roots,
             Err(error) => {
                 if startup_error.is_none() {
@@ -389,6 +449,36 @@ impl App {
             .first()
             .cloned()
             .unwrap_or_else(|| PathBuf::from("."));
+        let explorer_roots = target
+            .as_ref()
+            .filter(|target| {
+                target
+                    .path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    == Some("ttt")
+            })
+            .and_then(|target| {
+                fs::read_to_string(&target.path)
+                    .ok()
+                    .and_then(|contents| serde_json::from_str::<WorkspaceFile>(&contents).ok())
+                    .map(|workspace| {
+                        let base = target.path.parent().unwrap_or_else(|| Path::new("."));
+                        workspace
+                            .folders
+                            .into_iter()
+                            .map(|folder| {
+                                if folder.path.is_absolute() {
+                                    folder.path
+                                } else {
+                                    base.join(folder.path)
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                    })
+            })
+            .filter(|roots| !roots.is_empty())
+            .unwrap_or_else(|| workspace_roots.clone());
         let language_overrides_path = language_overrides_path(&search_root);
         let language_overrides = language_overrides_path
             .as_deref()
@@ -443,7 +533,7 @@ impl App {
         let change_diff = changes
             .first()
             .map_or_else(Vec::new, |change| git_diff(&search_root, change));
-        let explorer_paths = workspace_roots
+        let explorer_paths = explorer_roots
             .iter()
             .flat_map(|root| list_directory(root))
             .collect();
@@ -489,6 +579,7 @@ impl App {
             search_index: 0,
             search_root,
             workspace_roots,
+            explorer_roots,
             explorer_paths,
             explorer_index: 0,
             explorer_mode: None,
@@ -504,6 +595,11 @@ impl App {
             change_index: 0,
             change_hunk_index: 0,
             change_diff,
+            diff_split: false,
+            pull_request_target: None,
+            pull_request_head: None,
+            pull_request_comments: Vec::new(),
+            pull_request_comment_mode: false,
             blame_lines: Vec::new(),
             history: Vec::new(),
             output_scroll: 0,
@@ -518,15 +614,21 @@ impl App {
             agent,
             agent_provider,
             agent_session_path,
+            agent_protocol_buffer: Vec::new(),
             agent_install_confirm: false,
             agent_install_pending: false,
             status_message,
             plugin_runtimes,
+            plugin_registry_entries: Vec::new(),
             plugin_drawer: None,
             plugin_custom_tab: None,
             plugin_tab_scroll: 0,
             plugin_tab_hunk: 0,
+            plugin_tab_split: false,
+            plugin_tab_collapsed_hunks: BTreeSet::new(),
             plugin_file_view: None,
+            git_diff_tab_text: None,
+            plugin_diff_file_path: None,
             plugin_file_close: None,
             plugin_dialog: None,
             plugin_command_line: None,
@@ -562,12 +664,63 @@ impl App {
             diff_base_lines: None,
             plugin_mouse_events: Vec::new(),
         };
+        if let Some(pull_request) = pull_request {
+            if let Err(error) =
+                app.load_pull_request_review(&pull_request.repository, pull_request.number)
+            {
+                app.status_message = format!("PR review failed: {error}");
+            }
+        }
         app.sync_lsp_for_buffer();
         app.emit_plugin_event("app.start");
         Ok(app)
     }
     pub const fn focus(&self) -> Focus {
         self.focus
+    }
+    pub fn automation_panel(&mut self, panel: &str) -> AppResult<()> {
+        self.focus = match panel.to_ascii_lowercase().as_str() {
+            "explorer" => Focus::Explorer,
+            "find" | "search" => Focus::Search,
+            "changes" => Focus::Changes,
+            "branches" => Focus::Branches,
+            "editor" => Focus::Editor,
+            "terminal" => Focus::Terminal,
+            "output" => Focus::Output,
+            "agent" => Focus::Agent,
+            other => {
+                return Err(crate::error::AppError::Workspace(format!(
+                    "unknown --exec panel: {other}"
+                )))
+            }
+        };
+        Ok(())
+    }
+    pub fn automation_open(
+        &mut self,
+        path: &str,
+        line: Option<usize>,
+        column: Option<usize>,
+        readonly: bool,
+    ) -> AppResult<()> {
+        let path = Path::new(path);
+        let path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.search_root.join(path)
+        };
+        let mut buffer = Buffer::open(&path)?;
+        buffer.set_readonly(readonly);
+        self.open_buffer(buffer);
+        if let Some(line) = line {
+            let line = line
+                .saturating_sub(1)
+                .min(self.file_lines().len().saturating_sub(1));
+            let column = column.unwrap_or(1).saturating_sub(1);
+            self.buffer_mut().set_cursor(line, column);
+        }
+        self.focus = Focus::Editor;
+        Ok(())
     }
     pub const fn sidebar_tab(&self) -> SidebarTab {
         self.sidebar_tab
@@ -736,6 +889,18 @@ impl App {
     pub fn status_message(&self) -> &str {
         &self.status_message
     }
+    pub fn automation_debug(&self) -> JsonValue {
+        json!({
+            "focus": format!("{:?}", self.focus),
+            "language": self.language(),
+            "cursor": {"line": self.cursor().line + 1, "column": self.cursor().column + 1},
+            "line_count": self.file_lines().len(),
+            "status": self.status_message,
+        })
+    }
+    pub fn automation_screenshot(&self) -> String {
+        self.file_lines().join("\n")
+    }
     pub fn search_query(&self) -> &str {
         &self.search_query
     }
@@ -778,6 +943,94 @@ impl App {
     pub fn change_hunk_count(&self) -> usize {
         git_hunk_count(&self.change_diff)
     }
+    #[allow(dead_code)]
+    pub fn load_pull_request_review(&mut self, repository: &str, number: u64) -> AppResult<()> {
+        let reference = git_fetch_pull_request(&self.search_root, repository, number)?;
+        let diff = git_diff_refs(&self.search_root, "HEAD", &reference);
+        if diff.is_empty() {
+            return Err(crate::error::AppError::Git(
+                "pull request has no reviewable diff".to_owned(),
+            ));
+        }
+        self.change_diff = diff;
+        self.change_hunk_index = 0;
+        self.diff_split = false;
+        self.pull_request_target = Some((repository.to_owned(), number));
+        self.pull_request_head = Some(reference);
+        self.pull_request_comments.clear();
+        self.pull_request_comment_mode = false;
+        self.bottom_tab = BottomTab::Output;
+        self.status_message = format!("Loaded pull request #{number} review diff");
+        Ok(())
+    }
+    pub fn load_pull_request_comments(&mut self) -> AppResult<()> {
+        let Some((repository, number)) = self.pull_request_target.clone() else {
+            return Err(crate::error::AppError::Git(
+                "no pull request review is active".to_owned(),
+            ));
+        };
+        self.pull_request_comments = git_list_pr_comments(&repository, number)?;
+        self.output_scroll = 0;
+        self.status_message = format!(
+            "Loaded {} pull request review comments",
+            self.pull_request_comments.len()
+        );
+        Ok(())
+    }
+    fn submit_pull_request_comment(&mut self) -> AppResult<()> {
+        let (Some((repository, number)), Some(reference)) = (
+            self.pull_request_target.clone(),
+            self.pull_request_head.clone(),
+        ) else {
+            return Err(crate::error::AppError::Git(
+                "no pull request review is active".into(),
+            ));
+        };
+        let path = self
+            .change_diff
+            .iter()
+            .find_map(|line| line.text.strip_prefix("+++ b/").map(str::to_owned))
+            .ok_or_else(|| crate::error::AppError::Git("review diff has no file path".into()))?;
+        let line = self
+            .change_diff
+            .iter()
+            .filter(|line| line.kind == '@')
+            .nth(self.change_hunk_index)
+            .and_then(|line| parse_new_hunk_line(&line.text))
+            .ok_or_else(|| crate::error::AppError::Git("review hunk has no target line".into()))?;
+        let commit_id = git_resolve_ref(&self.search_root, &reference)?;
+        let comment = crate::git::create_pull_request_comment(
+            &repository,
+            number,
+            &commit_id,
+            &path,
+            line,
+            &self.commit_message,
+        )?;
+        self.pull_request_comments.push(comment);
+        self.commit_message.clear();
+        self.pull_request_comment_mode = false;
+        self.status_message = "Pull request comment submitted".to_owned();
+        Ok(())
+    }
+    fn jump_to_pull_request_comment(&mut self) -> AppResult<()> {
+        let Some(comment) = self
+            .pull_request_comments
+            .get(self.output_scroll())
+            .cloned()
+        else {
+            return Ok(());
+        };
+        let path = self.search_root.join(&comment.path);
+        let mut buffer = Buffer::open(&path)?;
+        if let Some(line) = comment.line {
+            buffer.set_cursor(line.saturating_sub(1) as usize, 0);
+        }
+        self.open_buffer(buffer);
+        self.focus = Focus::Editor;
+        self.status_message = format!("Jumped to PR comment {}", comment.path);
+        Ok(())
+    }
     pub const fn commit_mode(&self) -> bool {
         self.commit_mode
     }
@@ -793,16 +1046,33 @@ impl App {
     pub fn change_diff(&self) -> &[DiffLine] {
         &self.change_diff
     }
+    pub const fn diff_split(&self) -> bool {
+        self.diff_split
+    }
+    pub fn pull_request_comments(&self) -> &[PullRequestComment] {
+        &self.pull_request_comments
+    }
+    pub const fn pull_request_comment_mode(&self) -> bool {
+        self.pull_request_comment_mode
+    }
     pub const fn output_scroll(&self) -> usize {
         self.output_scroll
+    }
+    fn output_max_scroll(&self) -> usize {
+        self.change_diff
+            .len()
+            .saturating_sub(1)
+            .max(self.history.len().saturating_sub(1))
+            .max(self.blame_lines.len().saturating_sub(1))
+            .max(self.plugin_registry_entries.len().saturating_sub(1))
     }
     pub fn explorer_paths(&self) -> &[PathBuf] {
         &self.explorer_paths
     }
     pub fn explorer_label(&self, path: &Path) -> String {
-        if self.workspace_roots.len() > 1 {
+        if self.explorer_roots.len() > 1 {
             if let Some(root) = self
-                .workspace_roots
+                .explorer_roots
                 .iter()
                 .find(|root| path.starts_with(root))
             {
@@ -833,6 +1103,9 @@ impl App {
     }
     pub fn terminal_input(&self) -> &str {
         self.terminals[self.active_terminal].input()
+    }
+    pub fn terminal_title(&self) -> &str {
+        self.terminals[self.active_terminal].title()
     }
     pub fn terminal_screen_styled_lines(&self) -> Vec<Vec<(char, TerminalStyle)>> {
         self.terminals[self.active_terminal].screen_styled_lines()
@@ -949,6 +1222,139 @@ impl App {
                 .map_or(!self.settings.agent.command.is_empty(), |provider| {
                     !provider.command.is_empty()
                 })
+    }
+    #[allow(dead_code)]
+    pub fn agent_tool_allowed(&self, tool: &str) -> bool {
+        let Some(provider) = self.settings.agent.providers.get(&self.agent_provider) else {
+            return self
+                .settings
+                .agent
+                .tools
+                .iter()
+                .any(|allowed| allowed == tool);
+        };
+        let permissions = if provider.tools.is_empty() {
+            &self.settings.agent.tools
+        } else {
+            &provider.tools
+        };
+        permissions.iter().any(|allowed| allowed == tool)
+    }
+
+    #[allow(dead_code)]
+    pub fn agent_tool_call(&self, tool: &str, args: &JsonValue) -> AppResult<JsonValue> {
+        if !self.agent_tool_allowed(tool) {
+            return Err(crate::error::AppError::Workspace(format!(
+                "agent tool denied: {tool}"
+            )));
+        }
+        let path = args
+            .get("path")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| {
+                crate::error::AppError::Workspace("agent tool path is required".into())
+            })?;
+        let path = if tool == "write_file" {
+            self.agent_workspace_write_path(path)?
+        } else {
+            self.agent_workspace_path(path)?
+        };
+        match tool {
+            "read_file" => {
+                let contents = fs::read_to_string(&path)?;
+                Ok(json!({"path": path.display().to_string(), "content": contents}))
+            }
+            "list_files" => {
+                let entries = fs::read_dir(&path)?
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>();
+                Ok(json!({"path": path.display().to_string(), "entries": entries}))
+            }
+            "write_file" => {
+                let content = args
+                    .get("content")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| {
+                        crate::error::AppError::Workspace(
+                            "agent write_file content is required".into(),
+                        )
+                    })?;
+                let temporary = path.with_extension(format!("mtide-agent-{}", std::process::id()));
+                fs::write(&temporary, content)?;
+                if let Err(error) = fs::rename(&temporary, &path) {
+                    let _ = fs::remove_file(&temporary);
+                    return Err(error.into());
+                }
+                Ok(json!({"path": path.display().to_string(), "bytes": content.len()}))
+            }
+            "search" => {
+                let query = args
+                    .get("query")
+                    .and_then(JsonValue::as_str)
+                    .filter(|query| !query.is_empty())
+                    .ok_or_else(|| {
+                        crate::error::AppError::Workspace("agent search query is required".into())
+                    })?;
+                let limit = args
+                    .get("limit")
+                    .and_then(JsonValue::as_u64)
+                    .unwrap_or(50)
+                    .clamp(1, 500) as usize;
+                let mut results = Vec::new();
+                collect_agent_search_results(&path, query, limit, &mut results);
+                Ok(json!({"query": query, "results": results}))
+            }
+            _ => Err(crate::error::AppError::Workspace(format!(
+                "unknown agent tool: {tool}"
+            ))),
+        }
+    }
+
+    fn agent_workspace_path(&self, path: &str) -> AppResult<PathBuf> {
+        let candidate = if Path::new(path).is_absolute() {
+            PathBuf::from(path)
+        } else {
+            self.search_root.join(path)
+        };
+        let canonical = candidate.canonicalize()?;
+        if self
+            .workspace_roots
+            .iter()
+            .filter_map(|root| root.canonicalize().ok())
+            .any(|root| canonical.starts_with(root))
+        {
+            Ok(canonical)
+        } else {
+            Err(crate::error::AppError::Workspace(
+                "agent tool path is outside workspace".into(),
+            ))
+        }
+    }
+
+    fn agent_workspace_write_path(&self, path: &str) -> AppResult<PathBuf> {
+        let candidate = if Path::new(path).is_absolute() {
+            PathBuf::from(path)
+        } else {
+            self.search_root.join(path)
+        };
+        if candidate.exists() {
+            let canonical = candidate.canonicalize()?;
+            if !canonical.is_file() {
+                return Err(crate::error::AppError::Workspace(
+                    "agent write_file target is not a file".into(),
+                ));
+            }
+            return self.agent_workspace_path(path);
+        }
+        let parent = candidate.parent().ok_or_else(|| {
+            crate::error::AppError::Workspace("agent write_file parent is unavailable".into())
+        })?;
+        let parent = self.agent_workspace_path(&parent.to_string_lossy())?;
+        let name = candidate.file_name().ok_or_else(|| {
+            crate::error::AppError::Workspace("agent write_file name is unavailable".into())
+        })?;
+        Ok(parent.join(name))
     }
     pub fn agent_install_confirm(&self) -> bool {
         self.agent_install_confirm
@@ -1116,8 +1522,13 @@ impl App {
         }
         for terminal in &mut self.terminals {
             terminal.poll();
+            if let Some(text) = terminal.take_osc52_clipboard() {
+                self.clipboard = text;
+                self.status_message = "Terminal updated clipboard".to_owned();
+            }
         }
         self.agent.poll();
+        self.poll_agent_protocol();
         if self.agent_install_pending && self.agent_executable_available() {
             self.agent_install_pending = false;
             self.restart_agent_session();
@@ -1135,6 +1546,45 @@ impl App {
         self.sync_plugin_clipboard();
         self.refresh_plugin_custom_tab();
         self.emit_plugin_event("app.tick");
+    }
+
+    fn poll_agent_protocol(&mut self) {
+        self.agent_protocol_buffer
+            .extend_from_slice(&self.agent.take_recent_output());
+        if self.agent_protocol_buffer.len() > 1024 * 1024 {
+            let drain = self.agent_protocol_buffer.len() - 1024 * 1024;
+            self.agent_protocol_buffer.drain(..drain);
+        }
+        while let Some(newline) = self
+            .agent_protocol_buffer
+            .iter()
+            .position(|byte| *byte == b'\n')
+        {
+            let line: Vec<u8> = self.agent_protocol_buffer.drain(..=newline).collect();
+            let Ok(message) = serde_json::from_slice::<JsonValue>(&line) else {
+                continue;
+            };
+            if message.get("type").and_then(JsonValue::as_str) != Some("tool_call") {
+                continue;
+            }
+            let Some(tool) = message.get("tool").and_then(JsonValue::as_str) else {
+                continue;
+            };
+            let args = message.get("args").cloned().unwrap_or_else(|| json!({}));
+            let id = message.get("id").cloned().unwrap_or(JsonValue::Null);
+            let response = match self.agent_tool_call(tool, &args) {
+                Ok(result) => json!({"type":"tool_result", "id":id, "ok":true, "result":result}),
+                Err(error) => {
+                    json!({"type":"tool_result", "id":id, "ok":false, "error":error.to_string()})
+                }
+            };
+            if let Ok(mut encoded) = serde_json::to_vec(&response) {
+                encoded.push(b'\n');
+                if let Err(error) = self.agent.write_bytes(&encoded) {
+                    self.status_message = format!("Agent tool response failed: {error}");
+                }
+            }
+        }
     }
     fn apply_plugin_panel_requests(&mut self) {
         let requests = self
@@ -1189,15 +1639,43 @@ impl App {
                 PluginPanelRequest::OpenTab { id, title, focus } => {
                     if let Some(runtime) = self.plugin_runtimes.get(runtime_index) {
                         if let Ok(Some(text)) = runtime.render_panel(&format!("__tab:{id}")) {
+                            self.git_diff_tab_text = None;
+                            self.plugin_diff_file_path = None;
                             self.plugin_file_view = Some((title, text));
                             self.plugin_custom_tab = Some((runtime_index, id));
                             self.plugin_tab_scroll = 0;
                             self.plugin_tab_hunk = 0;
+                            self.plugin_tab_split = false;
+                            self.plugin_tab_collapsed_hunks.clear();
                             if focus {
                                 self.focus = Focus::Editor;
                             }
                         } else {
                             self.status_message = "Plugin tab render failed".to_owned();
+                        }
+                    }
+                }
+                PluginPanelRequest::OpenChangesTab {
+                    id,
+                    title,
+                    file_path,
+                    focus,
+                } => {
+                    if let Some(runtime) = self.plugin_runtimes.get(runtime_index) {
+                        if let Ok(Some(text)) = runtime.render_panel(&format!("__tab:{id}")) {
+                            self.git_diff_tab_text = None;
+                            self.plugin_diff_file_path = file_path.map(PathBuf::from);
+                            self.plugin_file_view = Some((title, text));
+                            self.plugin_custom_tab = Some((runtime_index, id));
+                            self.plugin_tab_scroll = 0;
+                            self.plugin_tab_hunk = 0;
+                            self.plugin_tab_split = false;
+                            self.plugin_tab_collapsed_hunks.clear();
+                            if focus {
+                                self.focus = Focus::Editor;
+                            }
+                        } else {
+                            self.status_message = "Plugin changes tab render failed".to_owned();
                         }
                     }
                 }
@@ -1216,6 +1694,8 @@ impl App {
                         self.plugin_file_view = None;
                         self.plugin_tab_scroll = 0;
                         self.plugin_tab_hunk = 0;
+                        self.plugin_tab_split = false;
+                        self.plugin_tab_collapsed_hunks.clear();
                         self.focus = Focus::Editor;
                     }
                 }
@@ -1239,6 +1719,10 @@ impl App {
                     } else {
                         self.search_root.join(path)
                     };
+                    if !path.starts_with(&self.search_root) {
+                        self.status_message = "Plugin diff path is outside workspace".to_owned();
+                        return;
+                    }
                     match Buffer::open(&path) {
                         Ok(mut buffer) => {
                             buffer.set_readonly(readonly);
@@ -1452,8 +1936,50 @@ impl App {
                 .plugin_tab_scroll
                 .min(text.lines().count().saturating_sub(1));
             if let Some((_, current_text)) = self.plugin_file_view.as_mut() {
-                *current_text = text;
+                let text = collapse_plugin_diff_hunks(&text, &self.plugin_tab_collapsed_hunks);
+                *current_text = if self.plugin_tab_split {
+                    split_unified_diff_text(&text)
+                } else {
+                    text
+                };
             }
+        }
+    }
+
+    fn open_git_diff_tab(&mut self) {
+        let text = self
+            .change_diff
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        self.plugin_custom_tab = None;
+        self.git_diff_tab_text = Some(text);
+        self.plugin_file_view = Some(("Git diff".to_owned(), String::new()));
+        self.plugin_tab_scroll = 0;
+        self.plugin_tab_hunk = 0;
+        self.plugin_tab_split = true;
+        self.plugin_tab_collapsed_hunks.clear();
+        self.refresh_git_diff_tab();
+        self.focus = Focus::Editor;
+        self.status_message =
+            "Git diff tab · v unified/split · Enter edit file · Esc close".to_owned();
+    }
+
+    fn refresh_git_diff_tab(&mut self) {
+        if self.plugin_custom_tab.is_some() {
+            return;
+        }
+        let Some(source) = self.git_diff_tab_text.as_deref() else {
+            return;
+        };
+        let rendered = if self.plugin_tab_split {
+            split_unified_diff_text(source)
+        } else {
+            source.to_owned()
+        };
+        if let Some((_, text)) = self.plugin_file_view.as_mut() {
+            *text = rendered;
         }
     }
     pub fn resize_terminal(&mut self, columns: u16, rows: u16) -> AppResult<()> {
@@ -1481,6 +2007,9 @@ impl App {
                 },
             );
         Some((self.plugin_runtimes.len(), commands, keybindings, panels))
+    }
+    pub fn plugin_registry_entries(&self) -> &[PluginRegistryEntry] {
+        &self.plugin_registry_entries
     }
     pub fn plugin_status_items_by_side(&self) -> (Vec<String>, Vec<String>) {
         let mut items = self
@@ -1590,7 +2119,7 @@ impl App {
                     .flatten()
             })
     }
-    pub fn plugin_dialog_button_click(&mut self) -> AppResult<()> {
+    pub fn plugin_dialog_mouse_click(&mut self, line: usize) -> AppResult<()> {
         let Some(PluginDialog::Custom {
             runtime_index, id, ..
         }) = self.plugin_dialog.clone()
@@ -1598,8 +2127,11 @@ impl App {
             return Ok(());
         };
         if let Some(runtime) = self.plugin_runtimes.get(runtime_index) {
-            runtime.dialog_focus_button(id);
-            runtime.dialog_activate(id)?;
+            let focused = runtime.dialog_focus_at_line(id, line)
+                || (line >= 2 && runtime.dialog_focus_button(id));
+            if focused {
+                runtime.dialog_activate(id)?;
+            }
         }
         Ok(())
     }
@@ -1869,6 +2401,12 @@ impl App {
     pub const fn word_wrap(&self) -> bool {
         self.settings.editor.word_wrap
     }
+    pub fn selection_style_inverted(&self) -> bool {
+        self.settings
+            .editor
+            .selection_style
+            .eq_ignore_ascii_case("invert")
+    }
     pub fn word_wrap_column(&self) -> usize {
         self.settings.editor.word_wrap_column.max(1)
     }
@@ -1905,6 +2443,22 @@ impl App {
         self.emit_plugin_event("tab.activate");
     }
 
+    pub fn open_external_target(&mut self, target: &str) -> AppResult<()> {
+        let target = parse_location_target(target);
+        if target.path.is_dir() {
+            self.status_message = format!("Workspace target: {}", target.path.display());
+            return Ok(());
+        }
+        let mut buffer = Buffer::open(&target.path)?;
+        buffer.set_cursor(target.line, target.column);
+        self.open_buffer(buffer);
+        self.focus = Focus::Editor;
+        self.sync_lsp_for_buffer();
+        self.emit_plugin_event("document.open");
+        self.status_message = format!("Opened {}", target.path.display());
+        Ok(())
+    }
+
     fn open_plugin_file(&mut self, path: &Path) -> AppResult<bool> {
         for (runtime_index, runtime) in self.plugin_runtimes.iter().enumerate() {
             let Some(text) = runtime.open_file(path)? else {
@@ -1920,6 +2474,8 @@ impl App {
                     .to_owned()
             });
             self.plugin_file_view = Some((title, text));
+            self.git_diff_tab_text = None;
+            self.plugin_diff_file_path = None;
             self.plugin_file_close = close_id.map(|id| (runtime_index, id));
             self.focus = Focus::Editor;
             self.emit_plugin_event("tab.open");
@@ -1938,13 +2494,19 @@ impl App {
                 }
             }
             self.plugin_file_view = None;
+            self.git_diff_tab_text = None;
+            self.plugin_diff_file_path = None;
             self.plugin_tab_scroll = 0;
             self.plugin_tab_hunk = 0;
+            self.plugin_tab_split = false;
+            self.plugin_tab_collapsed_hunks.clear();
             self.emit_plugin_event("tab.close");
             return;
         }
         let Some((runtime_index, close_id)) = self.plugin_file_close.take() else {
             self.plugin_file_view = None;
+            self.git_diff_tab_text = None;
+            self.plugin_diff_file_path = None;
             return;
         };
         if let Some(runtime) = self.plugin_runtimes.get(runtime_index) {
@@ -1954,8 +2516,12 @@ impl App {
         }
         self.emit_plugin_event("tab.close");
         self.plugin_file_view = None;
+        self.git_diff_tab_text = None;
+        self.plugin_diff_file_path = None;
         self.plugin_tab_scroll = 0;
         self.plugin_tab_hunk = 0;
+        self.plugin_tab_split = false;
+        self.plugin_tab_collapsed_hunks.clear();
     }
 
     fn close_active_tab(&mut self) {
@@ -2019,11 +2585,20 @@ impl App {
                 }
                 if let Some(runtime) = self.plugin_runtimes.get(runtime_index) {
                     match key.code {
+                        KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                            runtime.dialog_focus_previous(id);
+                        }
                         KeyCode::Tab => {
                             runtime.dialog_focus_next(id);
                         }
                         KeyCode::Enter => {
                             runtime.dialog_activate(id)?;
+                        }
+                        KeyCode::Up | KeyCode::Left => {
+                            runtime.dialog_dropdown_move(id, -1)?;
+                        }
+                        KeyCode::Down | KeyCode::Right => {
+                            runtime.dialog_dropdown_move(id, 1)?;
                         }
                         KeyCode::Backspace => {
                             runtime.dialog_backspace(id)?;
@@ -2468,6 +3043,22 @@ impl App {
         Ok(false)
     }
     fn execute_builtin_command(&mut self, id: &str) -> AppResult<bool> {
+        if id == "plugin.refreshRegistry" {
+            let endpoint = std::env::var("MTIDE_PLUGIN_REGISTRY").map_err(|_| {
+                crate::error::AppError::Plugin(
+                    "MTIDE_PLUGIN_REGISTRY is required for registry refresh".into(),
+                )
+            })?;
+            self.plugin_registry_entries = fetch_plugin_registry(&endpoint)?;
+            self.bottom_visible = true;
+            self.bottom_tab = BottomTab::Output;
+            self.focus = Focus::Output;
+            self.status_message = format!(
+                "Loaded {} plugin registry entries",
+                self.plugin_registry_entries.len()
+            );
+            return Ok(true);
+        }
         let key = match id {
             "editor.save" => KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
             "editor.undo" => KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL),
@@ -2555,6 +3146,8 @@ impl App {
                 .collect(),
             selection,
             selection_text,
+            viewport_top_line: self.editor_scroll_line.unwrap_or(0),
+            viewport_left_col: self.horizontal_scroll,
         };
         let path = snapshot.path.clone();
         let payload = match event {
@@ -2575,6 +3168,9 @@ impl App {
                 PluginEventArg::Text(snapshot.language.clone()),
                 PluginEventArg::Bool(snapshot.selection.is_some()),
                 PluginEventArg::Text(snapshot.selection_text.clone()),
+                PluginEventArg::Text(buffer.lines().get(cursor.line).cloned().unwrap_or_default()),
+                PluginEventArg::Number(buffer.lines().len()),
+                PluginEventArg::Bool(buffer.dirty()),
             ],
             _ => Vec::new(),
         };
@@ -2929,7 +3525,11 @@ impl App {
                 self.output_scroll = 0;
                 self.focus = Focus::Output;
                 self.status_message =
-                    "Git diff · Up/Down/PageUp/PageDown/Home/End · Esc editor".to_owned();
+                    "Git diff · v split/unified · Up/Down/PageUp/PageDown/Home/End · Esc editor"
+                        .to_owned();
+            }
+            (KeyModifiers::NONE, KeyCode::Char('t')) if !self.change_diff.is_empty() => {
+                self.open_git_diff_tab();
             }
             (KeyModifiers::NONE, KeyCode::Char('s')) => self.change_stage(true)?,
             (KeyModifiers::NONE, KeyCode::Char('u')) => self.change_stage(false)?,
@@ -2956,27 +3556,137 @@ impl App {
     }
 
     fn handle_output_key(&mut self, key: KeyEvent) {
+        if self.pull_request_comment_mode {
+            match (key.modifiers, key.code) {
+                (KeyModifiers::NONE, KeyCode::Char(character)) => {
+                    self.commit_message.push(character)
+                }
+                (KeyModifiers::NONE, KeyCode::Backspace) => {
+                    self.commit_message.pop();
+                }
+                (KeyModifiers::NONE, KeyCode::Esc) => {
+                    self.pull_request_comment_mode = false;
+                    self.commit_message.clear();
+                    self.status_message = "Pull request comment cancelled".to_owned();
+                }
+                (KeyModifiers::NONE, KeyCode::Enter) => {
+                    if self.commit_message.trim().is_empty() {
+                        self.status_message = "Pull request comment must not be empty".to_owned();
+                    } else if let Err(error) = self.submit_pull_request_comment() {
+                        self.status_message = format!("PR comment failed: {error}");
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
         match (key.modifiers, key.code) {
+            (KeyModifiers::NONE, KeyCode::Char('i'))
+                if !self.plugin_registry_entries.is_empty() =>
+            {
+                let entry = self
+                    .plugin_registry_entries
+                    .get(self.output_scroll)
+                    .cloned()
+                    .unwrap_or_else(|| self.plugin_registry_entries[0].clone());
+                let destination = self
+                    .search_root
+                    .join(".mtide")
+                    .join("plugins")
+                    .join(format!("{}-{}", entry.name, entry.version));
+                match download_plugin_registry_entry(&entry)
+                    .and_then(|bytes| install_plugin_archive(&bytes, &destination))
+                {
+                    Ok(package) => match PluginRuntime::load(&package) {
+                        Ok(runtime) => {
+                            self.plugin_runtimes.push(runtime);
+                            self.status_message = format!(
+                                "Installed and loaded plugin {} {}",
+                                entry.name, entry.version
+                            );
+                        }
+                        Err(error) => {
+                            self.status_message = format!(
+                                "Installed plugin {}, but loading failed: {error}",
+                                entry.name
+                            );
+                        }
+                    },
+                    Err(error) => self.status_message = format!("Plugin install failed: {error}"),
+                }
+            }
+            (KeyModifiers::NONE, KeyCode::Enter)
+                if self.diff_split && !self.change_diff.is_empty() =>
+            {
+                if let Some(change) = self.changes.get(self.change_index).cloned() {
+                    let path = self.search_root.join(&change.path);
+                    if path.is_file() {
+                        match Buffer::open(&path) {
+                            Ok(buffer) => {
+                                self.open_buffer(buffer);
+                                self.diff_base_lines = (change.index != '?'
+                                    && change.worktree != '?')
+                                    .then(|| git_base_file(&self.search_root, &change.path))
+                                    .flatten();
+                                self.focus = Focus::Editor;
+                                self.status_message =
+                                    format!("Opened {} for split diff editing", path.display());
+                            }
+                            Err(error) => {
+                                self.status_message = format!("Open diff file failed: {error}")
+                            }
+                        }
+                    }
+                }
+            }
+            (KeyModifiers::NONE, KeyCode::Char('v')) if !self.change_diff.is_empty() => {
+                self.diff_split = !self.diff_split;
+                self.status_message = if self.diff_split {
+                    "Git diff: split view"
+                } else {
+                    "Git diff: unified view"
+                }
+                .to_owned();
+            }
+            (KeyModifiers::NONE, KeyCode::Char('m')) => {
+                if let Err(error) = self.load_pull_request_comments() {
+                    self.status_message = format!("PR comments failed: {error}");
+                }
+            }
+            (KeyModifiers::NONE, KeyCode::Enter) if !self.pull_request_comments.is_empty() => {
+                if let Err(error) = self.jump_to_pull_request_comment() {
+                    self.status_message = format!("PR comment navigation failed: {error}");
+                }
+            }
+            (KeyModifiers::NONE, KeyCode::Char('c'))
+                if self.pull_request_target.is_some() && !self.change_diff.is_empty() =>
+            {
+                self.pull_request_comment_mode = true;
+                self.commit_message.clear();
+                self.status_message =
+                    "PR comment · type text · Enter submit · Esc cancel".to_owned();
+            }
             (KeyModifiers::NONE, KeyCode::Up) => {
                 self.output_scroll = self.output_scroll.saturating_sub(1);
             }
             (KeyModifiers::NONE, KeyCode::Down) => {
-                self.output_scroll = self.output_scroll.saturating_add(1);
+                self.output_scroll = self
+                    .output_scroll
+                    .saturating_add(1)
+                    .min(self.output_max_scroll());
             }
             (KeyModifiers::NONE, KeyCode::PageUp) => {
                 self.output_scroll = self.output_scroll.saturating_sub(6);
             }
             (KeyModifiers::NONE, KeyCode::PageDown) => {
-                self.output_scroll = self.output_scroll.saturating_add(6);
+                self.output_scroll = self
+                    .output_scroll
+                    .saturating_add(6)
+                    .min(self.output_max_scroll());
             }
             (KeyModifiers::NONE, KeyCode::Home) => self.output_scroll = 0,
             (KeyModifiers::NONE, KeyCode::End) => {
-                self.output_scroll = self
-                    .change_diff
-                    .len()
-                    .saturating_sub(1)
-                    .max(self.history.len().saturating_sub(1))
-                    .max(self.blame_lines.len().saturating_sub(1));
+                self.output_scroll = self.output_max_scroll();
             }
             (KeyModifiers::NONE, KeyCode::Esc) => {
                 self.focus = Focus::Editor;
@@ -3054,6 +3764,29 @@ impl App {
         self.refresh_search_results();
         self.status_message = format!(
             "Resolved inline conflict with base · {} block(s) remain",
+            conflict_blocks(self.file_lines()).len()
+        );
+    }
+    fn resolve_current_conflict_both(&mut self) {
+        let blocks = conflict_blocks(self.file_lines());
+        let line = self.cursor().line;
+        let Some(block) = blocks
+            .iter()
+            .find(|block| (block.start_line..=block.end_line).contains(&line))
+            .or_else(|| blocks.first())
+            .cloned()
+        else {
+            self.status_message = "No inline conflict block found".to_owned();
+            return;
+        };
+        let mut replacement = self.file_lines()[block.ours_start..block.ours_end].to_vec();
+        replacement.extend_from_slice(&self.file_lines()[block.theirs_start..block.theirs_end]);
+        self.buffer_mut()
+            .replace_line_range(block.start_line, block.end_line + 1, &replacement);
+        self.sync_lsp_for_buffer();
+        self.refresh_search_results();
+        self.status_message = format!(
+            "Resolved inline conflict with both sides · {} block(s) remain",
             conflict_blocks(self.file_lines()).len()
         );
     }
@@ -3609,14 +4342,13 @@ impl App {
     }
 
     fn explorer_entries(&self) -> Vec<PathBuf> {
-        if self.workspace_roots.len() > 1 && self.workspace_roots.first() == Some(&self.search_root)
-        {
-            self.workspace_roots
+        if self.explorer_roots.len() > 1 {
+            self.explorer_roots
                 .iter()
                 .flat_map(|root| list_directory(root))
                 .collect()
         } else {
-            list_directory(&self.search_root)
+            list_directory(self.explorer_roots.first().unwrap_or(&self.search_root))
         }
     }
 
@@ -4114,6 +4846,14 @@ impl App {
                     self.resolve_current_conflict_base();
                     return Ok(());
                 }
+                KeyCode::Char('k') => {
+                    self.resolve_current_conflict_both();
+                    return Ok(());
+                }
+                KeyCode::Char('p') => {
+                    self.open_conflict_preview();
+                    return Ok(());
+                }
                 KeyCode::Up => {
                     self.jump_conflict(false);
                     return Ok(());
@@ -4560,6 +5300,70 @@ impl App {
             }
             (KeyModifiers::NONE, KeyCode::Home) => self.plugin_tab_scroll = 0,
             (KeyModifiers::NONE, KeyCode::End) => self.plugin_tab_scroll = line_count - 1,
+            (KeyModifiers::NONE, KeyCode::Enter)
+                if self.git_diff_tab_text.is_some() || self.plugin_diff_file_path.is_some() =>
+            {
+                let (path, base_lines) = if let Some(path) = self.plugin_diff_file_path.clone() {
+                    let path = if path.is_absolute() {
+                        path
+                    } else {
+                        self.search_root.join(path)
+                    };
+                    let base = path
+                        .strip_prefix(&self.search_root)
+                        .ok()
+                        .and_then(|relative| relative.to_str())
+                        .and_then(|relative| git_base_file(&self.search_root, relative));
+                    (path, base)
+                } else if let Some(change) = self.changes.get(self.change_index).cloned() {
+                    let path = self.search_root.join(&change.path);
+                    let base = (change.index != '?' && change.worktree != '?')
+                        .then(|| git_base_file(&self.search_root, &change.path))
+                        .flatten();
+                    (path, base)
+                } else {
+                    return;
+                };
+                if path.is_file() {
+                    let Ok(mut buffer) = Buffer::open(&path) else {
+                        self.status_message = format!("Unable to open {}", path.display());
+                        return;
+                    };
+                    if let Some(line) = hunk_start_line(&self.change_diff, self.plugin_tab_hunk) {
+                        buffer.set_cursor(line.saturating_sub(1), 0);
+                    }
+                    self.open_buffer(buffer);
+                    self.diff_base_lines = base_lines;
+                    self.close_plugin_file_view();
+                    self.focus = Focus::Editor;
+                    self.status_message = format!("Editing {} from Git diff", path.display());
+                }
+            }
+            (KeyModifiers::NONE, KeyCode::Char('v'))
+                if self.plugin_custom_tab.is_some() || self.git_diff_tab_text.is_some() =>
+            {
+                self.plugin_tab_split = !self.plugin_tab_split;
+                if self.plugin_custom_tab.is_some() {
+                    self.refresh_plugin_custom_tab();
+                } else {
+                    self.refresh_git_diff_tab();
+                }
+                self.status_message = if self.plugin_tab_split {
+                    "Diff tab: split view"
+                } else {
+                    "Diff tab: unified view"
+                }
+                .to_owned();
+            }
+            (KeyModifiers::NONE, KeyCode::Char('c')) if self.plugin_custom_tab.is_some() => {
+                if !self
+                    .plugin_tab_collapsed_hunks
+                    .remove(&self.plugin_tab_hunk)
+                {
+                    self.plugin_tab_collapsed_hunks.insert(self.plugin_tab_hunk);
+                }
+                self.refresh_plugin_custom_tab();
+            }
             (KeyModifiers::NONE, KeyCode::Char('[')) if !hunk_positions.is_empty() => {
                 self.plugin_tab_hunk = self.plugin_tab_hunk.saturating_sub(1);
                 self.plugin_tab_scroll = hunk_positions[self.plugin_tab_hunk];
@@ -4608,6 +5412,14 @@ impl App {
         Ok(())
     }
     fn insert_editor_character(&mut self, character: char) {
+        if !self.settings.editor.auto_closing_brackets {
+            if self.secondary_cursors.is_empty() {
+                self.buffer_mut().insert(&character.to_string());
+            } else {
+                self.apply_multi_cursor_insert_with_offset(&character.to_string(), 0);
+            }
+            return;
+        }
         let closing = match character {
             '(' => Some(')'),
             '[' => Some(']'),
@@ -5103,16 +5915,33 @@ impl App {
         self.status_message = "Selected entire document".to_owned();
     }
     fn open_search_from_editor(&mut self) {
+        let mut inherited_selection = false;
         if let Some(anchor) = self.selection_anchor {
             let selected = self.buffer().text_between(anchor, self.buffer().cursor());
             if !selected.is_empty() && !selected.contains('\n') {
                 self.search_query = selected;
+                inherited_selection = true;
             }
         }
         self.replace_mode = false;
         self.focus = Focus::Search;
         self.sidebar_tab = SidebarTab::Search;
-        self.refresh_search();
+        if inherited_selection {
+            // Seed Ctrl-F from the active buffer immediately. Workspace-wide
+            // traversal happens on the next query edit/navigation, so opening
+            // search remains responsive even when the file lives in a large
+            // system directory such as macOS's shared temporary directory.
+            let path = self.buffer().path().map(Path::to_path_buf);
+            let text = self.buffer().lines().join("\n");
+            self.search_results = path
+                .as_deref()
+                .map(|path| search_text_with_options(path, &text, &self.search_query, false))
+                .unwrap_or_default();
+            self.search_index = 0;
+            self.status_message = format!("{} matches", self.search_results.len());
+        } else {
+            self.refresh_search();
+        }
     }
     fn request_lsp(&mut self, method: &str) -> AppResult<()> {
         let Some(path) = self.buffer().path().map(Path::to_path_buf) else {
@@ -5362,7 +6191,23 @@ impl App {
         current_uri: &str,
         workspace_edit: &serde_json::Value,
     ) -> AppResult<usize> {
+        enum ResourceOperation {
+            Create {
+                path: PathBuf,
+                overwrite: bool,
+            },
+            Rename {
+                old: PathBuf,
+                new: PathBuf,
+                overwrite: bool,
+            },
+            Delete {
+                path: PathBuf,
+                ignore_if_missing: bool,
+            },
+        }
         let mut plans: Vec<(String, Vec<LspTextEdit>)> = Vec::new();
+        let mut resource_operations = Vec::new();
         if let Some(changes) = workspace_edit
             .get("changes")
             .and_then(serde_json::Value::as_object)
@@ -5376,6 +6221,96 @@ impl App {
             .and_then(serde_json::Value::as_array)
         {
             for document_change in document_changes {
+                if let Some(kind) = document_change
+                    .get("kind")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    let options = document_change.get("options");
+                    let overwrite = options
+                        .and_then(|options| options.get("overwrite"))
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false);
+                    match kind {
+                        "create" => {
+                            let uri = document_change
+                                .get("uri")
+                                .and_then(serde_json::Value::as_str)
+                                .ok_or_else(|| {
+                                    crate::error::AppError::Lsp(
+                                        "CreateFile is missing uri".to_owned(),
+                                    )
+                                })?;
+                            let path = uri_to_path(uri).ok_or_else(|| {
+                                crate::error::AppError::Lsp(format!(
+                                    "workspace edit uses unsupported URI: {uri}"
+                                ))
+                            })?;
+                            resource_operations.push(ResourceOperation::Create { path, overwrite });
+                        }
+                        "rename" => {
+                            let old_uri = document_change
+                                .get("oldUri")
+                                .and_then(serde_json::Value::as_str)
+                                .ok_or_else(|| {
+                                    crate::error::AppError::Lsp(
+                                        "RenameFile is missing oldUri".to_owned(),
+                                    )
+                                })?;
+                            let new_uri = document_change
+                                .get("newUri")
+                                .and_then(serde_json::Value::as_str)
+                                .ok_or_else(|| {
+                                    crate::error::AppError::Lsp(
+                                        "RenameFile is missing newUri".to_owned(),
+                                    )
+                                })?;
+                            let old = uri_to_path(old_uri).ok_or_else(|| {
+                                crate::error::AppError::Lsp(format!(
+                                    "workspace edit uses unsupported URI: {old_uri}"
+                                ))
+                            })?;
+                            let new = uri_to_path(new_uri).ok_or_else(|| {
+                                crate::error::AppError::Lsp(format!(
+                                    "workspace edit uses unsupported URI: {new_uri}"
+                                ))
+                            })?;
+                            resource_operations.push(ResourceOperation::Rename {
+                                old,
+                                new,
+                                overwrite,
+                            });
+                        }
+                        "delete" => {
+                            let uri = document_change
+                                .get("uri")
+                                .and_then(serde_json::Value::as_str)
+                                .ok_or_else(|| {
+                                    crate::error::AppError::Lsp(
+                                        "DeleteFile is missing uri".to_owned(),
+                                    )
+                                })?;
+                            let path = uri_to_path(uri).ok_or_else(|| {
+                                crate::error::AppError::Lsp(format!(
+                                    "workspace edit uses unsupported URI: {uri}"
+                                ))
+                            })?;
+                            let ignore_if_missing = options
+                                .and_then(|options| options.get("ignoreIfNotExists"))
+                                .and_then(serde_json::Value::as_bool)
+                                .unwrap_or(false);
+                            resource_operations.push(ResourceOperation::Delete {
+                                path,
+                                ignore_if_missing,
+                            });
+                        }
+                        other => {
+                            return Err(crate::error::AppError::Lsp(format!(
+                                "unsupported workspace resource operation: {other}"
+                            )))
+                        }
+                    }
+                    continue;
+                }
                 let Some(uri) = document_change
                     .get("textDocument")
                     .and_then(|document| document.get("uri"))
@@ -5387,6 +6322,91 @@ impl App {
                     continue;
                 };
                 plans.push((uri.to_owned(), parse_lsp_text_edits(edits, uri)?));
+            }
+        }
+
+        let mut virtual_exists = BTreeMap::<PathBuf, bool>::new();
+        for operation in &resource_operations {
+            match operation {
+                ResourceOperation::Create { path, overwrite } => {
+                    let exists = *virtual_exists
+                        .entry(path.clone())
+                        .or_insert_with(|| path.exists());
+                    if exists && !overwrite {
+                        return Err(crate::error::AppError::Lsp(format!(
+                            "CreateFile target already exists: {}",
+                            path.display()
+                        )));
+                    }
+                    if let Some(parent) = path.parent() {
+                        if !parent.is_dir() {
+                            return Err(crate::error::AppError::Lsp(format!(
+                                "CreateFile parent does not exist: {}",
+                                parent.display()
+                            )));
+                        }
+                    }
+                    virtual_exists.insert(path.clone(), true);
+                }
+                ResourceOperation::Rename {
+                    old,
+                    new,
+                    overwrite,
+                } => {
+                    let old_exists = *virtual_exists
+                        .entry(old.clone())
+                        .or_insert_with(|| old.is_file());
+                    let new_exists = *virtual_exists
+                        .entry(new.clone())
+                        .or_insert_with(|| new.exists());
+                    if !old_exists || uri_to_path(current_uri).as_deref() == Some(old) {
+                        return Err(crate::error::AppError::Lsp(format!(
+                            "RenameFile source is unavailable: {}",
+                            old.display()
+                        )));
+                    }
+                    if new_exists && !overwrite {
+                        return Err(crate::error::AppError::Lsp(format!(
+                            "RenameFile target already exists: {}",
+                            new.display()
+                        )));
+                    }
+                    if old.exists() && fs::metadata(old)?.permissions().readonly() {
+                        return Err(crate::error::AppError::Lsp(format!(
+                            "RenameFile source is read-only: {}",
+                            old.display()
+                        )));
+                    }
+                    virtual_exists.insert(old.clone(), false);
+                    virtual_exists.insert(new.clone(), true);
+                }
+                ResourceOperation::Delete {
+                    path,
+                    ignore_if_missing,
+                } => {
+                    let exists = *virtual_exists
+                        .entry(path.clone())
+                        .or_insert_with(|| path.exists());
+                    if exists && path.exists() && !path.is_file() {
+                        return Err(crate::error::AppError::Lsp(format!(
+                            "DeleteFile target is not a regular file: {}",
+                            path.display()
+                        )));
+                    }
+                    if exists && path.exists() && fs::metadata(path)?.permissions().readonly() {
+                        return Err(crate::error::AppError::Lsp(format!(
+                            "DeleteFile target is read-only: {}",
+                            path.display()
+                        )));
+                    }
+                    if !exists && !ignore_if_missing {
+                        return Err(crate::error::AppError::Lsp(format!(
+                            "DeleteFile target does not exist: {}",
+                            path.display()
+                        )));
+                    }
+                    virtual_exists.insert(path.clone(), false);
+                }
             }
         }
 
@@ -5431,6 +6451,35 @@ impl App {
                 }
             }
         }
+        for operation in resource_operations {
+            match operation {
+                ResourceOperation::Create { path, overwrite } => {
+                    if overwrite && path.exists() {
+                        fs::write(&path, [])?;
+                    } else {
+                        fs::File::create(&path)?;
+                    }
+                    changed += 1;
+                }
+                ResourceOperation::Rename {
+                    old,
+                    new,
+                    overwrite,
+                } => {
+                    if overwrite && new.exists() {
+                        fs::remove_file(&new)?;
+                    }
+                    fs::rename(&old, &new)?;
+                    changed += 1;
+                }
+                ResourceOperation::Delete { path, .. } => {
+                    if path.exists() {
+                        fs::remove_file(&path)?;
+                        changed += 1;
+                    }
+                }
+            }
+        }
         if changed > 0 {
             self.sync_lsp_for_buffer();
         }
@@ -5440,6 +6489,45 @@ impl App {
     fn close_lsp_popup(&mut self) {
         self.lsp_popup = None;
         self.restore_overlay_focus();
+    }
+
+    fn open_conflict_preview(&mut self) {
+        let blocks = conflict_blocks(self.file_lines());
+        let line = self.cursor().line;
+        let Some(block) = blocks
+            .iter()
+            .find(|block| (block.start_line..=block.end_line).contains(&line))
+            .or_else(|| blocks.first())
+            .cloned()
+        else {
+            self.status_message = "No inline conflict block found".to_owned();
+            return;
+        };
+        let lines = self.file_lines();
+        let mut preview = vec!["Ours".to_owned()];
+        preview.extend(
+            lines[block.ours_start..block.ours_end]
+                .iter()
+                .map(|line| format!("  {line}")),
+        );
+        if let (Some(base_start), Some(base_end)) = (block.base_start, block.base_end) {
+            preview.push("Base".to_owned());
+            preview.extend(
+                lines[base_start..base_end]
+                    .iter()
+                    .map(|line| format!("  {line}")),
+            );
+        }
+        preview.push("Theirs".to_owned());
+        preview.extend(
+            lines[block.theirs_start..block.theirs_end]
+                .iter()
+                .map(|line| format!("  {line}")),
+        );
+        preview.push("".to_owned());
+        preview.push("o Ours · t Theirs · b Base · k Keep Both · Esc close".to_owned());
+        self.begin_overlay();
+        self.lsp_popup = Some(LspPopup::ConflictPreview { lines: preview });
     }
 
     fn handle_lsp_popup_key(&mut self, key: KeyEvent) -> AppResult<bool> {
@@ -5569,6 +6657,33 @@ impl App {
                 }
                 _ => Ok(false),
             },
+            LspPopup::ConflictPreview { .. } => match key.code {
+                KeyCode::Char('o') => {
+                    self.close_lsp_popup();
+                    self.resolve_current_conflict(true);
+                    Ok(true)
+                }
+                KeyCode::Char('t') => {
+                    self.close_lsp_popup();
+                    self.resolve_current_conflict(false);
+                    Ok(true)
+                }
+                KeyCode::Char('b') => {
+                    self.close_lsp_popup();
+                    self.resolve_current_conflict_base();
+                    Ok(true)
+                }
+                KeyCode::Char('k') => {
+                    self.close_lsp_popup();
+                    self.resolve_current_conflict_both();
+                    Ok(true)
+                }
+                KeyCode::Esc => {
+                    self.close_lsp_popup();
+                    Ok(true)
+                }
+                _ => Ok(false),
+            },
             LspPopup::Info(_) => {
                 if matches!(key.code, KeyCode::Esc) {
                     self.close_lsp_popup();
@@ -5677,6 +6792,85 @@ impl App {
             SidebarTab::Branches => Focus::Branches,
         };
     }
+}
+
+fn collect_agent_search_results(
+    path: &Path,
+    query: &str,
+    limit: usize,
+    results: &mut Vec<JsonValue>,
+) {
+    if results.len() >= limit {
+        return;
+    }
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return;
+    };
+    if metadata.is_dir() {
+        let Ok(entries) = fs::read_dir(path) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            collect_agent_search_results(&entry.path(), query, limit, results);
+            if results.len() >= limit {
+                break;
+            }
+        }
+    } else if metadata.is_file() {
+        let Ok(contents) = fs::read_to_string(path) else {
+            return;
+        };
+        for (index, line) in contents.lines().enumerate() {
+            if line.contains(query) {
+                results.push(json!({
+                    "path": path.display().to_string(),
+                    "line": index + 1,
+                    "text": line,
+                }));
+                if results.len() >= limit {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+fn split_unified_diff_text(text: &str) -> String {
+    text.lines()
+        .map(|line| {
+            if line.starts_with("-") && !line.starts_with("---") {
+                format!("{line:<42} │")
+            } else if line.starts_with('+') && !line.starts_with("+++") {
+                format!("{: <42} │ {line}", "")
+            } else {
+                format!("{line:<42} │ {line}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn collapse_plugin_diff_hunks(text: &str, collapsed: &BTreeSet<usize>) -> String {
+    let mut hunk = None;
+    let mut marker_added = false;
+    let mut output = Vec::new();
+    for line in text.lines() {
+        if line.starts_with("@@") {
+            hunk = Some(hunk.map_or(0, |index: usize| index + 1));
+            marker_added = false;
+            output.push(line.to_owned());
+            continue;
+        }
+        if hunk.is_some_and(|index| collapsed.contains(&index)) {
+            if !marker_added {
+                output.push("… [hunk collapsed]".to_owned());
+                marker_added = true;
+            }
+        } else {
+            output.push(line.to_owned());
+        }
+    }
+    output.join("\n")
 }
 
 fn list_directory(root: &Path) -> Vec<PathBuf> {
@@ -5909,6 +7103,7 @@ fn builtin_commands() -> Vec<(String, String)> {
         ("view.switchTheme", "Switch Theme"),
         ("workspace.openFile", "Open File"),
         ("settings.open", "Open Settings"),
+        ("plugin.refreshRegistry", "Refresh Plugin Registry"),
     ]
     .into_iter()
     .map(|(id, title)| (id.to_owned(), title.to_owned()))
@@ -6144,10 +7339,43 @@ fn workspace_edit_summary(edit: &serde_json::Value) -> Vec<String> {
             }
         }
     }
-    summary
+    let mut result: Vec<String> = summary
         .into_iter()
         .map(|(path, count)| format!("{count:>3} edit(s)  {path}"))
-        .collect()
+        .collect();
+    for conflict in workspace_edit_resource_conflicts(edit) {
+        result.push(format!("! CONFLICT  {conflict}"));
+    }
+    result
+}
+
+fn workspace_edit_resource_conflicts(edit: &serde_json::Value) -> Vec<String> {
+    let Some(changes) = edit
+        .get("documentChanges")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return Vec::new();
+    };
+    let mut conflicts = Vec::new();
+    for change in changes {
+        let kind = change.get("kind").and_then(serde_json::Value::as_str);
+        let path = match kind {
+            Some("create") | Some("rename") => change
+                .get("uri")
+                .or_else(|| change.get("newUri"))
+                .and_then(serde_json::Value::as_str)
+                .and_then(uri_to_path),
+            _ => None,
+        };
+        let Some(path) = path else { continue };
+        if path.exists() {
+            conflicts.push(format!(
+                "resource target already exists: {}",
+                path.display()
+            ));
+        }
+    }
+    conflicts
 }
 
 fn uri_to_path(uri: &str) -> Option<PathBuf> {
@@ -6324,6 +7552,33 @@ struct TargetSpec {
     column: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PullRequestTarget {
+    repository: String,
+    number: u64,
+}
+
+#[allow(dead_code)]
+fn parse_github_pull_request_url(value: &str) -> Option<PullRequestTarget> {
+    let rest = value
+        .strip_prefix("https://github.com/")
+        .or_else(|| value.strip_prefix("http://github.com/"))?;
+    let mut parts = rest.trim_end_matches('/').split('/');
+    let owner = parts.next()?.trim();
+    let repository = parts.next()?.trim_end_matches(".git").trim();
+    if owner.is_empty() || repository.is_empty() || parts.next()? != "pull" {
+        return None;
+    }
+    let number = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(PullRequestTarget {
+        repository: format!("https://github.com/{owner}/{repository}.git"),
+        number,
+    })
+}
+
 #[derive(Debug, Deserialize)]
 struct WorkspaceFile {
     #[serde(default)]
@@ -6333,6 +7588,41 @@ struct WorkspaceFile {
 #[derive(Debug, Deserialize)]
 struct WorkspaceFolder {
     path: PathBuf,
+}
+
+fn default_workspace_roots(settings: &Settings) -> AppResult<Vec<PathBuf>> {
+    if settings.default_folders.is_empty() {
+        return workspace_roots(None);
+    }
+    let mut roots = Vec::with_capacity(settings.default_folders.len());
+    for folder in &settings.default_folders {
+        let path = if folder == "~" {
+            dirs_home().unwrap_or_else(|| PathBuf::from(folder))
+        } else if let Some(relative) = folder.strip_prefix("~/") {
+            dirs_home()
+                .map(|home| home.join(relative))
+                .unwrap_or_else(|| PathBuf::from(folder))
+        } else {
+            PathBuf::from(folder)
+        };
+        let path = path.canonicalize().map_err(|error| {
+            crate::error::AppError::Workspace(format!("default folder {}: {error}", path.display()))
+        })?;
+        if !path.is_dir() {
+            return Err(crate::error::AppError::Workspace(format!(
+                "default folder is not a directory: {}",
+                path.display()
+            )));
+        }
+        roots.push(path);
+    }
+    Ok(roots)
+}
+
+fn dirs_home() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
 }
 
 fn workspace_roots(target: Option<&TargetSpec>) -> AppResult<Vec<PathBuf>> {
@@ -6383,6 +7673,17 @@ fn workspace_roots(target: Option<&TargetSpec>) -> AppResult<Vec<PathBuf>> {
         ));
     }
     Ok(roots)
+}
+
+fn parse_new_hunk_line(header: &str) -> Option<u32> {
+    let plus = header
+        .split_whitespace()
+        .find(|part| part.starts_with('+'))?;
+    plus.trim_start_matches('+')
+        .split(',')
+        .next()?
+        .parse::<u32>()
+        .ok()
 }
 
 fn parse_location_target(target: &str) -> TargetSpec {
@@ -6568,6 +7869,109 @@ mod tests {
     }
 
     #[test]
+    fn exec_script_value_does_not_become_editor_target() {
+        let app = App::new(&["--exec".into(), "[]".into()]).expect("exec app");
+        assert_eq!(app.file_lines()[0], "# mtide");
+    }
+
+    #[test]
+    fn workspace_option_value_does_not_become_editor_target() {
+        let root = std::env::temp_dir().join(format!(
+            "mtide-workspace-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("workspace root");
+        let workspace = root.join("project.ttt");
+        std::fs::write(
+            &workspace,
+            format!(r#"{{"folders":[{{"path":"{}"}}]}}"#, root.display()),
+        )
+        .expect("workspace file");
+        let app = App::new(&["--workspace".into(), workspace.to_string_lossy().into()])
+            .expect("workspace app");
+        assert_eq!(app.buffer().path(), None);
+        assert_eq!(
+            app.workspace_roots,
+            vec![root.canonicalize().expect("canonical root")]
+        );
+    }
+
+    #[test]
+    fn default_folders_create_a_multi_root_workspace_without_an_explicit_target() {
+        let root = std::env::temp_dir().join(format!(
+            "mtide-default-folders-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let first = root.join("one");
+        let second = root.join("two");
+        std::fs::create_dir_all(&first).expect("first folder");
+        std::fs::create_dir_all(&second).expect("second folder");
+        let config = root.join("settings.json");
+        std::fs::write(
+            &config,
+            format!(
+                r#"{{"defaultFolders":["{}","{}"]}}"#,
+                first.display(),
+                second.display()
+            ),
+        )
+        .expect("settings");
+        let app = App::new(&["--config".into(), config.to_string_lossy().into()])
+            .expect("default folders app");
+        assert_eq!(app.buffer().path(), None);
+        assert_eq!(
+            app.workspace_roots,
+            vec![
+                first.canonicalize().expect("first canonical"),
+                second.canonicalize().expect("second canonical")
+            ]
+        );
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn clear_default_folders_persists_to_explicit_config() {
+        let root = std::env::temp_dir().join(format!(
+            "mtide-clear-folders-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let folder = root.join("folder");
+        std::fs::create_dir_all(&folder).expect("folder");
+        let config = root.join("settings.json");
+        std::fs::write(
+            &config,
+            format!(r#"{{"defaultFolders":["{}"]}}"#, folder.display()),
+        )
+        .expect("settings");
+        let app = App::new(&[
+            "--config".into(),
+            config.to_string_lossy().into(),
+            "--clear-default-folders".into(),
+        ])
+        .expect("cleared app");
+        assert_eq!(
+            app.workspace_roots,
+            vec![std::env::current_dir().expect("cwd")]
+        );
+        let loaded = Settings::load_from_path(&config);
+        assert!(loaded.default_folders.is_empty());
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
     fn summarizes_completion_response() {
         assert_eq!(
             summarize_lsp_result(
@@ -6629,6 +8033,56 @@ mod tests {
     }
 
     #[test]
+    fn parses_github_pull_request_targets() {
+        assert_eq!(
+            parse_github_pull_request_url("https://github.com/acme/editor/pull/42"),
+            Some(PullRequestTarget {
+                repository: "https://github.com/acme/editor.git".into(),
+                number: 42,
+            })
+        );
+        assert!(
+            parse_github_pull_request_url("https://github.com/acme/editor/issues/42").is_none()
+        );
+        assert!(parse_github_pull_request_url("/tmp/project").is_none());
+    }
+
+    #[test]
+    fn parses_new_file_line_from_diff_hunk_header() {
+        assert_eq!(parse_new_hunk_line("@ -4,2 +9,3 @@ function"), Some(9));
+        assert_eq!(parse_new_hunk_line("@ -1 +1 @@"), Some(1));
+        assert_eq!(parse_new_hunk_line("not a hunk"), None);
+    }
+
+    #[test]
+    fn pull_request_review_rejects_invalid_repository_before_mutating_view() {
+        let mut app = App::new(&[]).expect("welcome app");
+        let initial_diff = app.change_diff.clone();
+        assert!(app.load_pull_request_review("", 1).is_err());
+        assert_eq!(app.change_diff, initial_diff);
+    }
+
+    #[test]
+    fn pull_request_comment_enter_jumps_to_file_line() {
+        let mut app = App::new(&[]).expect("welcome app");
+        app.pull_request_comments.push(PullRequestComment {
+            id: 1,
+            body: "review".into(),
+            path: "src/main.rs".into(),
+            line: Some(10),
+            side: Some("RIGHT".into()),
+            user: Some(crate::git::PullRequestCommentUser {
+                login: "reviewer".into(),
+            }),
+        });
+        app.focus = Focus::Output;
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("jump comment");
+        assert_eq!(app.focus, Focus::Editor);
+        assert_eq!(app.cursor().line, 9);
+    }
+
+    #[test]
     fn horizontal_viewport_is_keyboard_scrollable() {
         let mut app = App::new(&[]).expect("welcome app");
         app.handle_key(key(
@@ -6662,6 +8116,27 @@ mod tests {
         app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
             .expect("close plugin tab");
         assert!(app.plugin_file_view().is_none());
+    }
+
+    #[test]
+    fn split_plugin_diff_preserves_sides() {
+        let text = "diff --git a/a b/a\n-old\n+new\n context";
+        let rendered = split_unified_diff_text(text);
+        assert!(rendered.contains("-old"));
+        assert!(rendered.contains("+new"));
+        assert!(rendered.contains("context"));
+        assert!(rendered.lines().all(|line| line.contains('│')));
+    }
+
+    #[test]
+    fn collapses_selected_plugin_diff_hunk() {
+        let text = "diff --git a/a b/a\n@@ -1 +1 @@\n-old\n+new\n@@ -4 +4 @@\n-old2\n+new2";
+        let mut collapsed = BTreeSet::new();
+        collapsed.insert(1);
+        let rendered = collapse_plugin_diff_hunks(text, &collapsed);
+        assert!(rendered.contains("-old\n+new"));
+        assert!(rendered.contains("… [hunk collapsed]"));
+        assert!(!rendered.contains("-old2\n+new2"));
     }
 
     #[test]
@@ -6803,6 +8278,39 @@ mod tests {
     }
 
     #[test]
+    fn conflict_preview_shows_three_way_sides_and_can_resolve() {
+        let mut app = App::new(&[]).expect("welcome app");
+        app.buffers[0] = Buffer::new(
+            vec![
+                "<<<<<<< ours".into(),
+                "ours".into(),
+                "||||||| base".into(),
+                "base".into(),
+                "=======".into(),
+                "theirs".into(),
+                ">>>>>>> theirs".into(),
+            ],
+            None,
+        );
+        app.handle_key(key(
+            KeyCode::Char('p'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ))
+        .expect("preview");
+        match app.lsp_popup() {
+            Some(LspPopup::ConflictPreview { lines }) => {
+                assert!(lines.iter().any(|line| line == "Ours"));
+                assert!(lines.iter().any(|line| line == "Base"));
+                assert!(lines.iter().any(|line| line == "Theirs"));
+            }
+            _ => panic!("expected conflict preview"),
+        }
+        app.handle_key(key(KeyCode::Char('b'), KeyModifiers::NONE))
+            .expect("choose base");
+        assert_eq!(app.file_lines(), &["base"]);
+    }
+
+    #[test]
     fn inline_conflict_resolution_can_choose_base() {
         let mut app = App::new(&[]).expect("welcome app");
         app.buffers[0] = Buffer::new(
@@ -6823,6 +8331,29 @@ mod tests {
         ))
         .expect("resolve base");
         assert_eq!(app.file_lines(), &["base"]);
+    }
+
+    #[test]
+    fn inline_conflict_resolution_can_keep_both_sides() {
+        let mut app = App::new(&[]).expect("welcome app");
+        app.buffers[0] = Buffer::new(
+            vec![
+                "<<<<<<< ours".into(),
+                "ours".into(),
+                "=======".into(),
+                "theirs".into(),
+                ">>>>>>> theirs".into(),
+            ],
+            None,
+        );
+        app.handle_key(key(
+            KeyCode::Char('k'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ))
+        .expect("resolve both");
+        assert_eq!(app.file_lines(), &["ours", "theirs"]);
+        app.buffer_mut().undo();
+        assert_eq!(app.file_lines()[0], "<<<<<<< ours");
     }
 
     #[test]
@@ -6910,10 +8441,12 @@ mod tests {
         app.settings.agent.providers.insert(
             "test".to_owned(),
             crate::config::AgentProviderConfig {
+                extra: std::collections::BTreeMap::new(),
                 name: "Test".to_owned(),
                 command: vec!["sh".to_owned()],
                 cwd: None,
                 install: Some("echo install".to_owned()),
+                tools: Vec::new(),
             },
         );
         app.agent_provider = "test".to_owned();
@@ -6928,6 +8461,18 @@ mod tests {
         let mut app = App::new(&[]).expect("welcome app");
         app.open_terminal_link("file:///etc/passwd");
         assert!(app.status_message().contains("only http(s)"));
+    }
+
+    #[test]
+    fn terminal_link_lookup_works_while_scrolled_into_history() {
+        let mut app = App::new(&[]).expect("welcome app");
+        app.terminals[app.active_terminal]
+            .feed_output(b"\x1b]8;;https://example.com\x07link\x1b]8;;\x07\n");
+        app.terminals[app.active_terminal].scroll(1);
+        assert_eq!(
+            app.terminal_link_at(0, 0).as_deref(),
+            Some("https://example.com")
+        );
     }
 
     #[test]
@@ -7051,6 +8596,52 @@ mod tests {
         app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
             .expect("close command palette");
         assert_eq!(app.focus(), Focus::Search);
+    }
+
+    #[test]
+    fn registry_refresh_is_exposed_as_a_builtin_command() {
+        assert!(builtin_commands()
+            .iter()
+            .any(|(id, _)| id == "plugin.refreshRegistry"));
+    }
+
+    #[test]
+    fn output_end_navigates_to_last_registry_entry() {
+        let mut app = App::new(&[]).expect("app");
+        app.plugin_registry_entries = (0..12)
+            .map(|index| PluginRegistryEntry {
+                name: format!("plugin-{index}"),
+                version: "1.0.0".into(),
+                url: "https://example.com/plugin.zip".into(),
+                sha256: None,
+            })
+            .collect();
+        app.focus = Focus::Output;
+        app.handle_key(key(KeyCode::End, KeyModifiers::NONE))
+            .expect("output end");
+        assert_eq!(app.output_scroll(), 11);
+    }
+
+    #[test]
+    fn output_down_is_clamped_to_last_registry_entry() {
+        let mut app = App::new(&[]).expect("app");
+        app.plugin_registry_entries = (0..3)
+            .map(|index| PluginRegistryEntry {
+                name: format!("plugin-{index}"),
+                version: "1.0.0".into(),
+                url: "https://example.com/plugin.zip".into(),
+                sha256: None,
+            })
+            .collect();
+        app.change_diff.clear();
+        app.history.clear();
+        app.blame_lines.clear();
+        app.focus = Focus::Output;
+        for _ in 0..8 {
+            app.handle_key(key(KeyCode::Down, KeyModifiers::NONE))
+                .expect("output down");
+        }
+        assert_eq!(app.output_scroll(), 2);
     }
 
     #[test]
@@ -7592,6 +9183,20 @@ mod tests {
     }
 
     #[test]
+    fn summarizes_existing_resource_targets_as_conflicts() {
+        let summary = workspace_edit_summary(&json!({
+            "documentChanges": [{
+                "kind": "create",
+                "uri": "file:///tmp"
+            }]
+        }));
+        assert_eq!(
+            summary,
+            vec!["! CONFLICT  resource target already exists: /tmp"]
+        );
+    }
+
+    #[test]
     fn rejects_overlapping_workspace_edits_before_mutating() {
         let mut app = App::new(&[]).expect("welcome app");
         app.buffers[0] = Buffer::new(vec!["abcdef".into()], None);
@@ -7625,6 +9230,105 @@ mod tests {
         assert_eq!(app.file_lines(), &["bar bar"]);
         app.buffer_mut().undo();
         assert_eq!(app.file_lines(), &["foo foo"]);
+    }
+
+    #[test]
+    fn applies_lsp_workspace_resource_operations_with_preflight() {
+        let root = std::env::temp_dir().join(format!("mtide-lsp-resources-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("directory");
+        let source = root.join("source.txt");
+        let renamed = root.join("renamed.txt");
+        let created = root.join("created.txt");
+        std::fs::write(&source, "source").expect("source");
+        let mut app = App::new(&[]).expect("welcome app");
+        let edit = json!({
+            "documentChanges": [
+                {"kind":"create", "uri": format!("file://{}", created.display())},
+                {"kind":"rename", "oldUri": format!("file://{}", source.display()), "newUri": format!("file://{}", renamed.display())},
+                {"kind":"delete", "uri": format!("file://{}", created.display())}
+            ]
+        });
+        assert_eq!(
+            app.apply_workspace_edit("file:///tmp/current.rs", &edit)
+                .expect("resources"),
+            3
+        );
+        assert!(!source.exists());
+        assert!(renamed.is_file());
+        assert!(!created.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn git_output_toggles_split_diff_view() {
+        let mut app = App::new(&[]).expect("welcome app");
+        app.change_diff = vec![DiffLine {
+            kind: '+',
+            text: "added".into(),
+        }];
+        app.focus = Focus::Output;
+        app.handle_key(key(KeyCode::Char('v'), KeyModifiers::NONE))
+            .expect("toggle split diff");
+        assert!(app.diff_split());
+        app.handle_key(key(KeyCode::Char('v'), KeyModifiers::NONE))
+            .expect("toggle unified diff");
+        assert!(!app.diff_split());
+    }
+
+    #[test]
+    fn git_output_split_enter_opens_current_change_for_editing() {
+        let root = std::env::temp_dir().join(format!("mtide-split-edit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("root");
+        std::fs::write(root.join("file.txt"), "changed").expect("file");
+        let mut app = App::new(&[root.to_string_lossy().into()]).expect("app");
+        app.changes = vec![GitChange {
+            index: ' ',
+            worktree: 'M',
+            path: "file.txt".into(),
+        }];
+        app.change_diff = vec![DiffLine {
+            kind: '+',
+            text: "changed".into(),
+        }];
+        app.diff_split = true;
+        app.focus = Focus::Output;
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("open split edit");
+        assert_eq!(app.focus, Focus::Editor);
+        assert_eq!(app.file_lines(), &["changed".to_owned()]);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn git_changes_open_an_independent_split_diff_tab() {
+        let mut app = App::new(&[]).expect("app");
+        app.change_diff = vec![
+            DiffLine {
+                kind: '@',
+                text: "@@ -1 +1 @@".into(),
+            },
+            DiffLine {
+                kind: '-',
+                text: "-old".into(),
+            },
+            DiffLine {
+                kind: '+',
+                text: "+new".into(),
+            },
+        ];
+        app.open_git_diff_tab();
+        assert_eq!(
+            app.plugin_file_view().map(|(title, _)| title),
+            Some("Git diff")
+        );
+        assert!(app
+            .plugin_file_view()
+            .is_some_and(|(_, text)| text.contains("│")));
+        app.handle_plugin_file_key(key(KeyCode::Char('v'), KeyModifiers::NONE));
+        assert!(app
+            .plugin_file_view()
+            .is_some_and(|(_, text)| !text.contains("│")));
     }
 
     #[test]
@@ -7729,6 +9433,25 @@ mod tests {
             .expect("skip pair");
         assert_eq!(app.cursor().column, 2);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn editor_can_disable_auto_closing_brackets() {
+        let path = std::env::temp_dir().join(format!("mtide-no-autopair-{}", std::process::id()));
+        std::fs::write(&path, "").expect("file");
+        let config = path.with_extension("json");
+        std::fs::write(&config, r#"{"editor":{"autoClosingBrackets":false}}"#).expect("config");
+        let args = vec![
+            "--config".to_owned(),
+            config.to_string_lossy().into_owned(),
+            path.to_string_lossy().into_owned(),
+        ];
+        let mut app = App::new(&args).expect("app");
+        app.handle_key(key(KeyCode::Char('('), KeyModifiers::NONE))
+            .expect("insert");
+        assert_eq!(app.file_lines(), &["("]);
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(config);
     }
 
     #[test]
@@ -7850,19 +9573,23 @@ mod tests {
         settings.agent.providers.insert(
             "local".to_owned(),
             crate::config::AgentProviderConfig {
+                extra: std::collections::BTreeMap::new(),
                 name: "Local".to_owned(),
                 command: vec!["sh".to_owned()],
                 cwd: None,
                 install: None,
+                tools: Vec::new(),
             },
         );
         settings.agent.providers.insert(
             "review".to_owned(),
             crate::config::AgentProviderConfig {
+                extra: std::collections::BTreeMap::new(),
                 name: "Review".to_owned(),
                 command: vec!["sh".to_owned()],
                 cwd: None,
                 install: None,
+                tools: Vec::new(),
             },
         );
         let session = AgentSession {
@@ -7872,6 +9599,88 @@ mod tests {
         };
         assert_eq!(select_agent_provider(&settings, Some(&session)), "review");
         assert_eq!(select_agent_provider(&settings, None), "local");
+    }
+
+    #[test]
+    fn agent_tool_permissions_are_provider_scoped_and_default_deny() {
+        let mut app = App::new(&[]).expect("app");
+        app.settings.agent.tools = vec!["read_file".to_owned()];
+        app.settings.agent.providers.insert(
+            "local".to_owned(),
+            crate::config::AgentProviderConfig {
+                extra: std::collections::BTreeMap::new(),
+                name: "Local".to_owned(),
+                command: vec!["sh".to_owned()],
+                cwd: None,
+                install: None,
+                tools: vec!["shell".to_owned()],
+            },
+        );
+        app.agent_provider = "local".to_owned();
+        assert!(app.agent_tool_allowed("shell"));
+        assert!(!app.agent_tool_allowed("read_file"));
+        assert!(!app.agent_tool_allowed("network"));
+        app.settings
+            .agent
+            .providers
+            .get_mut("local")
+            .unwrap()
+            .tools
+            .clear();
+        assert!(app.agent_tool_allowed("read_file"));
+    }
+
+    #[test]
+    fn agent_structured_tools_are_permission_gated_and_workspace_scoped() {
+        let root = std::env::temp_dir().join(format!("mtide-agent-tools-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("root");
+        std::fs::write(root.join("note.txt"), "hello").expect("file");
+        let mut app = App::new(&[root.to_string_lossy().into()]).expect("app");
+        app.settings.agent.tools = vec![
+            "read_file".into(),
+            "list_files".into(),
+            "write_file".into(),
+            "search".into(),
+        ];
+        let result = app
+            .agent_tool_call("read_file", &json!({"path": "note.txt"}))
+            .expect("read tool");
+        assert_eq!(result["content"], "hello");
+        let written = app
+            .agent_tool_call(
+                "write_file",
+                &json!({"path": "note.txt", "content": "updated"}),
+            )
+            .expect("write tool");
+        assert_eq!(written["bytes"], 7);
+        assert_eq!(
+            std::fs::read_to_string(root.join("note.txt")).expect("updated"),
+            "updated"
+        );
+        app.agent_tool_call(
+            "write_file",
+            &json!({"path": "created.txt", "content": "created"}),
+        )
+        .expect("create tool");
+        assert_eq!(
+            std::fs::read_to_string(root.join("created.txt")).expect("created"),
+            "created"
+        );
+        let search = app
+            .agent_tool_call(
+                "search",
+                &json!({"path": ".", "query": "updated", "limit": 5}),
+            )
+            .expect("search tool");
+        assert_eq!(search["results"][0]["line"], 1);
+        assert!(app
+            .agent_tool_call("shell", &json!({"path": "note.txt"}))
+            .is_err());
+        assert!(app
+            .agent_tool_call("read_file", &json!({"path": "/etc/hosts"}))
+            .is_err());
+        std::fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]

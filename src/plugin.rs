@@ -16,6 +16,7 @@ use crate::{error::AppResult, terminal::TerminalScreen};
 use mlua::LuaSerdeExt;
 use mlua::{Function, Lua, MultiValue, RegistryKey, Table, Value as LuaValue, Variadic};
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
+use ring::digest::{digest, SHA256};
 use serde::Deserialize;
 use serde_json::{json, Value as JsonValue};
 use std::{cell::RefCell, rc::Rc};
@@ -23,6 +24,301 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 pub const SUPPORTED_API: u32 = 2;
 const PLUGIN_TERMINAL_OUTPUT_LIMIT: usize = 1_048_576;
+const PLUGIN_REGISTRY_RESPONSE_LIMIT: usize = 4 * 1024 * 1024;
+const PLUGIN_PACKAGE_RESPONSE_LIMIT: usize = 64 * 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct PluginRegistryEntry {
+    pub name: String,
+    pub version: String,
+    pub url: String,
+    #[serde(default)]
+    pub sha256: Option<String>,
+}
+
+#[allow(dead_code)]
+pub fn fetch_plugin_registry(endpoint: &str) -> AppResult<Vec<PluginRegistryEntry>> {
+    if !endpoint.starts_with("https://") || endpoint.contains([' ', '\n', '\r']) {
+        return Err(crate::error::AppError::Plugin(
+            "plugin registry must use an HTTPS endpoint".into(),
+        ));
+    }
+    let response = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|error| crate::error::AppError::Plugin(format!("build registry client: {error}")))?
+        .get(endpoint)
+        .header("Accept", "application/json")
+        .header("User-Agent", "mtide")
+        .send()
+        .map_err(|error| {
+            crate::error::AppError::Plugin(format!("fetch plugin registry: {error}"))
+        })?;
+    if !response.status().is_success() {
+        return Err(crate::error::AppError::Plugin(format!(
+            "plugin registry returned HTTP {}",
+            response.status()
+        )));
+    }
+    let bytes = response.bytes().map_err(|error| {
+        crate::error::AppError::Plugin(format!("read plugin registry: {error}"))
+    })?;
+    if bytes.len() > PLUGIN_REGISTRY_RESPONSE_LIMIT {
+        return Err(crate::error::AppError::Plugin(
+            "plugin registry response is too large".into(),
+        ));
+    }
+    let entries: Vec<PluginRegistryEntry> = serde_json::from_slice(&bytes).map_err(|error| {
+        crate::error::AppError::Plugin(format!("decode plugin registry: {error}"))
+    })?;
+    for entry in &entries {
+        if entry.name.trim().is_empty()
+            || entry.version.trim().is_empty()
+            || !entry.url.starts_with("https://")
+        {
+            return Err(crate::error::AppError::Plugin(
+                "plugin registry contains an invalid entry".into(),
+            ));
+        }
+    }
+    Ok(entries)
+}
+
+#[allow(dead_code)]
+pub fn select_plugin_registry_entry(
+    entries: &[PluginRegistryEntry],
+    name: &str,
+    version: Option<&str>,
+) -> AppResult<PluginRegistryEntry> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(crate::error::AppError::Plugin(
+            "plugin name must not be empty".into(),
+        ));
+    }
+    let candidates: Vec<_> = entries
+        .iter()
+        .filter(|entry| {
+            entry.name == name && version.is_none_or(|version| entry.version == version)
+        })
+        .collect();
+    let Some(entry) = candidates
+        .iter()
+        .max_by(|left, right| compare_plugin_versions(&left.version, &right.version))
+    else {
+        return Err(crate::error::AppError::Plugin(format!(
+            "plugin {name} was not found in registry"
+        )));
+    };
+    if version.is_some() && candidates.len() > 1 {
+        return Err(crate::error::AppError::Plugin(format!(
+            "plugin {name} has multiple matching registry entries"
+        )));
+    }
+    Ok((*entry).clone())
+}
+
+fn compare_plugin_versions(left: &str, right: &str) -> std::cmp::Ordering {
+    let left_parts = left
+        .split('.')
+        .map(|part| part.parse::<u64>().unwrap_or(0))
+        .collect::<Vec<_>>();
+    let right_parts = right
+        .split('.')
+        .map(|part| part.parse::<u64>().unwrap_or(0))
+        .collect::<Vec<_>>();
+    left_parts.cmp(&right_parts).then_with(|| left.cmp(right))
+}
+
+#[allow(dead_code)]
+pub fn download_plugin_registry_entry(entry: &PluginRegistryEntry) -> AppResult<Vec<u8>> {
+    if entry.name.trim().is_empty()
+        || entry.version.trim().is_empty()
+        || !entry.url.starts_with("https://")
+        || entry.url.contains([' ', '\n', '\r'])
+    {
+        return Err(crate::error::AppError::Plugin(
+            "invalid plugin registry download entry".into(),
+        ));
+    }
+    let response = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|error| crate::error::AppError::Plugin(format!("build package client: {error}")))?
+        .get(&entry.url)
+        .header("Accept", "application/octet-stream")
+        .header("User-Agent", "mtide")
+        .send()
+        .map_err(|error| {
+            crate::error::AppError::Plugin(format!("download plugin package: {error}"))
+        })?;
+    if !response.status().is_success() {
+        return Err(crate::error::AppError::Plugin(format!(
+            "plugin package returned HTTP {}",
+            response.status()
+        )));
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > PLUGIN_PACKAGE_RESPONSE_LIMIT as u64)
+    {
+        return Err(crate::error::AppError::Plugin(
+            "plugin package is too large".into(),
+        ));
+    }
+    let bytes = response
+        .bytes()
+        .map_err(|error| crate::error::AppError::Plugin(format!("read plugin package: {error}")))?;
+    if bytes.len() > PLUGIN_PACKAGE_RESPONSE_LIMIT {
+        return Err(crate::error::AppError::Plugin(
+            "plugin package is too large".into(),
+        ));
+    }
+    if let Some(expected) = &entry.sha256 {
+        if !plugin_package_hash_matches(&bytes, expected) {
+            return Err(crate::error::AppError::Plugin(
+                "plugin package SHA-256 mismatch".into(),
+            ));
+        }
+    }
+    Ok(bytes.to_vec())
+}
+
+#[allow(dead_code)]
+pub fn install_plugin_archive(bytes: &[u8], destination: &Path) -> AppResult<PluginPackage> {
+    if bytes.is_empty() {
+        return Err(crate::error::AppError::Plugin(
+            "plugin package is empty".into(),
+        ));
+    }
+    if destination.exists() {
+        return Err(crate::error::AppError::Plugin(format!(
+            "plugin destination already exists: {}",
+            destination.display()
+        )));
+    }
+    let parent = destination.parent().ok_or_else(|| {
+        crate::error::AppError::Plugin("plugin destination has no parent directory".into())
+    })?;
+    fs::create_dir_all(parent)?;
+    let staging = parent.join(format!(
+        ".{}.staging-{}",
+        destination
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("plugin"),
+        std::process::id()
+    ));
+    if staging.exists() {
+        fs::remove_dir_all(&staging)?;
+    }
+    fs::create_dir_all(&staging)?;
+    let archive = staging.join("package.zip");
+    fs::write(&archive, bytes)?;
+    let listing = Command::new("unzip")
+        .args(["-Z1"])
+        .arg(&archive)
+        .output()
+        .map_err(|error| {
+            crate::error::AppError::Plugin(format!("inspect plugin archive: {error}"))
+        })?;
+    if !listing.status.success() {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(crate::error::AppError::Plugin(
+            "plugin archive is not a valid zip file".into(),
+        ));
+    }
+    for member in String::from_utf8_lossy(&listing.stdout).lines() {
+        if !safe_plugin_archive_member(member) {
+            let _ = fs::remove_dir_all(&staging);
+            return Err(crate::error::AppError::Plugin(
+                "plugin archive contains an unsafe path".into(),
+            ));
+        }
+    }
+    let extracted = Command::new("unzip")
+        .args(["-q", "-o"])
+        .arg(&archive)
+        .arg("-d")
+        .arg(&staging)
+        .status()
+        .map_err(|error| {
+            crate::error::AppError::Plugin(format!("extract plugin archive: {error}"))
+        })?;
+    if !extracted.success() {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(crate::error::AppError::Plugin(
+            "extract plugin archive failed".into(),
+        ));
+    }
+    let _ = fs::remove_file(&archive);
+    PluginPackage::load(&staging)?;
+    fs::rename(&staging, destination)?;
+    PluginPackage::load(destination).map_err(|error| {
+        crate::error::AppError::Plugin(format!("validate installed plugin: {error}"))
+    })
+}
+
+#[allow(dead_code)]
+pub fn update_plugin_archive(bytes: &[u8], destination: &Path) -> AppResult<PluginPackage> {
+    if !destination.is_dir() {
+        return install_plugin_archive(bytes, destination);
+    }
+    let parent = destination.parent().ok_or_else(|| {
+        crate::error::AppError::Plugin("plugin destination has no parent directory".into())
+    })?;
+    let backup = parent.join(format!(
+        ".{}.backup-{}",
+        destination
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("plugin"),
+        std::process::id()
+    ));
+    if backup.exists() {
+        fs::remove_dir_all(&backup)?;
+    }
+    fs::rename(destination, &backup)?;
+    match install_plugin_archive(bytes, destination) {
+        Ok(package) => Ok(package),
+        Err(error) => {
+            if destination.exists() {
+                let _ = fs::remove_dir_all(destination);
+            }
+            fs::rename(&backup, destination).map_err(|restore_error| {
+                crate::error::AppError::Plugin(format!(
+                    "plugin update failed: {error}; rollback failed: {restore_error}"
+                ))
+            })?;
+            Err(error)
+        }
+    }
+}
+
+fn safe_plugin_archive_member(member: &str) -> bool {
+    let member = member.trim_end_matches('/');
+    !member.is_empty()
+        && !member.starts_with('/')
+        && !member.contains('\\')
+        && member
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..")
+}
+
+fn plugin_package_hash_matches(bytes: &[u8], expected: &str) -> bool {
+    let expected = expected.trim().to_ascii_lowercase();
+    if expected.len() != 64 || !expected.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return false;
+    }
+    let actual = digest(&SHA256, bytes)
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    expected == actual
+}
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct Manifest {
@@ -144,6 +440,12 @@ pub enum PluginPanelRequest {
     OpenTab {
         id: String,
         title: String,
+        focus: bool,
+    },
+    OpenChangesTab {
+        id: String,
+        title: String,
+        file_path: Option<String>,
         focus: bool,
     },
     CloseTab {
@@ -432,17 +734,39 @@ struct PluginCustomDialogCallbacks {
 struct PluginDialogWidgetState {
     input_text: String,
     input_initialized: bool,
+    input_masked: bool,
     input_on_change: Option<RegistryKey>,
-    button_label: Option<String>,
-    button_on_click: Option<RegistryKey>,
+    buttons: Vec<PluginDialogButtonState>,
+    dropdown: Option<PluginDialogDropdownState>,
+    checkbox: Option<PluginDialogCheckboxState>,
     focus: PluginDialogFocus,
+}
+
+#[derive(Debug)]
+struct PluginDialogCheckboxState {
+    checked: bool,
+    on_change: Option<RegistryKey>,
+}
+
+#[derive(Debug)]
+struct PluginDialogButtonState {
+    on_click: Option<RegistryKey>,
+}
+
+#[derive(Debug)]
+struct PluginDialogDropdownState {
+    options: Vec<String>,
+    selected: usize,
+    on_change: Option<RegistryKey>,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 enum PluginDialogFocus {
     #[default]
     Input,
-    Button,
+    Dropdown,
+    Checkbox,
+    Button(usize),
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -456,6 +780,8 @@ pub struct PluginEditorSnapshot {
     pub cursors: Vec<(usize, usize)>,
     pub selection: Option<(usize, usize, usize, usize)>,
     pub selection_text: String,
+    pub viewport_top_line: usize,
+    pub viewport_left_col: usize,
 }
 
 #[derive(Debug)]
@@ -1643,6 +1969,7 @@ impl PluginRuntime {
                     let description = config
                         .get::<Option<String>>("description")?
                         .unwrap_or_default();
+                    let file_path = config.get::<Option<String>>("file_path")?;
                     let lines = diff.lines().map(str::to_owned).collect::<Vec<_>>();
                     let render = lua.create_function(move |lua, panel: Table| {
                         let label = panel.get::<Function>("label")?;
@@ -1666,9 +1993,10 @@ impl PluginRuntime {
                     changes_tabs_sink.borrow_mut().insert(id.clone(), None);
                     changes_request_sink
                         .borrow_mut()
-                        .push(PluginPanelRequest::OpenTab {
+                        .push(PluginPanelRequest::OpenChangesTab {
                             id: id.clone(),
                             title,
+                            file_path,
                             focus: true,
                         });
                     Ok(id)
@@ -2831,9 +3159,12 @@ impl PluginRuntime {
                     }
                     let snapshot = viewport_snapshot.borrow();
                     let viewport = lua.create_table()?;
-                    viewport.set("top_line", 1usize)?;
-                    viewport.set("bottom_line", snapshot.lines.len().max(1))?;
-                    viewport.set("left_col", 1usize)?;
+                    viewport.set("top_line", snapshot.viewport_top_line.max(1))?;
+                    viewport.set(
+                        "bottom_line",
+                        snapshot.lines.len().max(snapshot.viewport_top_line.max(1)),
+                    )?;
+                    viewport.set("left_col", snapshot.viewport_left_col.max(1))?;
                     Ok(viewport)
                 })
                 .map_err(lua_error)?,
@@ -4110,6 +4441,31 @@ impl PluginRuntime {
         self.panel_callbacks
             .borrow_mut()
             .remove(&format!("__dialog:{id}"));
+        if let Some(mut state) = self.dialog_widgets.borrow_mut().remove(&id) {
+            if let Some(key) = state.input_on_change.take() {
+                let _ = self._lua.remove_registry_value(key);
+            }
+            for button in state.buttons.drain(..) {
+                if let Some(key) = button.on_click {
+                    let _ = self._lua.remove_registry_value(key);
+                }
+            }
+            if let Some(dropdown) = state.dropdown.take() {
+                if let Some(key) = dropdown.on_change {
+                    let _ = self._lua.remove_registry_value(key);
+                }
+            }
+            if let Some(checkbox) = state.checkbox.take() {
+                if let Some(key) = checkbox.on_change {
+                    let _ = self._lua.remove_registry_value(key);
+                }
+            }
+            if let Some(dropdown) = state.dropdown {
+                if let Some(key) = dropdown.on_change {
+                    let _ = self._lua.remove_registry_value(key);
+                }
+            }
+        }
         let Some(callbacks) = self.custom_dialog_callbacks.borrow_mut().remove(&id) else {
             return Ok(false);
         };
@@ -4144,9 +4500,16 @@ impl PluginRuntime {
     pub fn dialog_click(&self, id: u64) -> AppResult<bool> {
         let callback = {
             let widgets = self.dialog_widgets.borrow();
-            widgets
-                .get(&id)
-                .and_then(|state| state.button_on_click.as_ref())
+            let Some(state) = widgets.get(&id) else {
+                return Ok(false);
+            };
+            let PluginDialogFocus::Button(index) = state.focus else {
+                return Ok(false);
+            };
+            state
+                .buttons
+                .get(index)
+                .and_then(|button| button.on_click.as_ref())
                 .map(|key| self._lua.registry_value::<Function>(key))
                 .transpose()
                 .map_err(lua_error)?
@@ -4164,36 +4527,186 @@ impl PluginRuntime {
         let Some(state) = widgets.get_mut(&id) else {
             return false;
         };
-        if state.button_on_click.is_some() {
+        if state.dropdown.is_some() || state.checkbox.is_some() || !state.buttons.is_empty() {
             state.focus = match state.focus {
-                PluginDialogFocus::Input => PluginDialogFocus::Button,
-                PluginDialogFocus::Button => PluginDialogFocus::Input,
+                PluginDialogFocus::Input if state.dropdown.is_some() => PluginDialogFocus::Dropdown,
+                PluginDialogFocus::Input if state.checkbox.is_some() => PluginDialogFocus::Checkbox,
+                PluginDialogFocus::Input => PluginDialogFocus::Button(0),
+                PluginDialogFocus::Checkbox if !state.buttons.is_empty() => {
+                    PluginDialogFocus::Button(0)
+                }
+                PluginDialogFocus::Checkbox => PluginDialogFocus::Input,
+                PluginDialogFocus::Dropdown if state.checkbox.is_some() => {
+                    PluginDialogFocus::Checkbox
+                }
+                PluginDialogFocus::Dropdown if !state.buttons.is_empty() => {
+                    PluginDialogFocus::Button(0)
+                }
+                PluginDialogFocus::Dropdown => PluginDialogFocus::Input,
+                PluginDialogFocus::Button(index) if index + 1 < state.buttons.len() => {
+                    PluginDialogFocus::Button(index + 1)
+                }
+                PluginDialogFocus::Button(_) if state.dropdown.is_some() => {
+                    PluginDialogFocus::Dropdown
+                }
+                PluginDialogFocus::Button(_) if state.checkbox.is_some() => {
+                    PluginDialogFocus::Checkbox
+                }
+                PluginDialogFocus::Button(_) => PluginDialogFocus::Input,
             };
         }
         true
     }
+    pub fn dialog_focus_previous(&self, id: u64) -> bool {
+        let mut widgets = self.dialog_widgets.borrow_mut();
+        let Some(state) = widgets.get_mut(&id) else {
+            return false;
+        };
+        if state.dropdown.is_some() || !state.buttons.is_empty() {
+            state.focus = match state.focus {
+                PluginDialogFocus::Input if !state.buttons.is_empty() => {
+                    PluginDialogFocus::Button(state.buttons.len() - 1)
+                }
+                PluginDialogFocus::Input if state.checkbox.is_some() => PluginDialogFocus::Checkbox,
+                PluginDialogFocus::Input => PluginDialogFocus::Dropdown,
+                PluginDialogFocus::Dropdown => PluginDialogFocus::Input,
+                PluginDialogFocus::Checkbox if state.dropdown.is_some() => {
+                    PluginDialogFocus::Dropdown
+                }
+                PluginDialogFocus::Checkbox => PluginDialogFocus::Input,
+                PluginDialogFocus::Button(0) if state.checkbox.is_some() => {
+                    PluginDialogFocus::Checkbox
+                }
+                PluginDialogFocus::Button(0) if state.dropdown.is_some() => {
+                    PluginDialogFocus::Dropdown
+                }
+                PluginDialogFocus::Button(0) => PluginDialogFocus::Input,
+                PluginDialogFocus::Button(index) => PluginDialogFocus::Button(index - 1),
+            };
+        }
+        true
+    }
+    pub fn dialog_dropdown_move(&self, id: u64, delta: isize) -> AppResult<bool> {
+        let callback = {
+            let mut widgets = self.dialog_widgets.borrow_mut();
+            let Some(state) = widgets.get_mut(&id) else {
+                return Ok(false);
+            };
+            if state.focus != PluginDialogFocus::Dropdown {
+                return Ok(false);
+            }
+            let Some(dropdown) = state.dropdown.as_mut() else {
+                return Ok(false);
+            };
+            if dropdown.options.is_empty() {
+                return Ok(true);
+            }
+            dropdown.selected = (dropdown.selected as isize + delta)
+                .rem_euclid(dropdown.options.len() as isize)
+                as usize;
+            dropdown
+                .on_change
+                .as_ref()
+                .map(|key| self._lua.registry_value::<Function>(key))
+                .transpose()
+                .map_err(lua_error)?
+                .map(|callback| (callback, dropdown.selected + 1))
+        };
+        if let Some((callback, selected)) = callback {
+            callback
+                .call::<()>(selected)
+                .map_err(|error| plugin_error(format!("dropdown on_change failed: {error}")))?;
+        }
+        Ok(true)
+    }
+    pub fn dialog_focus_at_line(&self, id: u64, line: usize) -> bool {
+        let mut widgets = self.dialog_widgets.borrow_mut();
+        let Some(state) = widgets.get_mut(&id) else {
+            return false;
+        };
+        if line == 0 {
+            state.focus = PluginDialogFocus::Input;
+            return true;
+        }
+        if state.dropdown.is_some() && line == 1 {
+            state.focus = PluginDialogFocus::Dropdown;
+            return true;
+        }
+        let checkbox_line = 1 + usize::from(state.dropdown.is_some());
+        if state.checkbox.is_some() && line == checkbox_line {
+            state.focus = PluginDialogFocus::Checkbox;
+            return true;
+        }
+        let button_line =
+            line.saturating_sub(checkbox_line + usize::from(state.checkbox.is_some()));
+        if button_line < state.buttons.len() {
+            state.focus = PluginDialogFocus::Button(button_line);
+            return true;
+        }
+        false
+    }
+
     pub fn dialog_focus_button(&self, id: u64) -> bool {
         let mut widgets = self.dialog_widgets.borrow_mut();
         let Some(state) = widgets.get_mut(&id) else {
             return false;
         };
-        if state.button_on_click.is_none() {
+        if state.buttons.is_empty() {
             return false;
         }
-        state.focus = PluginDialogFocus::Button;
+        state.focus = PluginDialogFocus::Button(0);
         true
     }
+
     pub fn dialog_activate(&self, id: u64) -> AppResult<bool> {
         let focus = self
             .dialog_widgets
             .borrow()
             .get(&id)
             .map(|state| state.focus);
-        if focus == Some(PluginDialogFocus::Button) {
+        if matches!(focus, Some(PluginDialogFocus::Button(_))) {
             self.dialog_click(id)
+        } else if matches!(focus, Some(PluginDialogFocus::Dropdown)) {
+            self.dialog_dropdown_move(id, 0)
+        } else if matches!(focus, Some(PluginDialogFocus::Checkbox)) {
+            self.dialog_checkbox_toggle(id)
         } else {
             Ok(false)
         }
+    }
+
+    pub fn dialog_checkbox_toggle(&self, id: u64) -> AppResult<bool> {
+        let callback = {
+            let mut widgets = self.dialog_widgets.borrow_mut();
+            let Some(state) = widgets.get_mut(&id) else {
+                return Ok(false);
+            };
+            if state.focus != PluginDialogFocus::Checkbox {
+                return Ok(false);
+            }
+            let Some(checkbox) = state.checkbox.as_mut() else {
+                return Ok(false);
+            };
+            checkbox.checked = !checkbox.checked;
+            checkbox
+                .on_change
+                .as_ref()
+                .map(|key| self._lua.registry_value::<Function>(key))
+                .transpose()
+                .map_err(lua_error)?
+        };
+        if let Some(callback) = callback {
+            let checked = self
+                .dialog_widgets
+                .borrow()
+                .get(&id)
+                .and_then(|s| s.checkbox.as_ref())
+                .is_some_and(|c| c.checked);
+            callback
+                .call::<()>(checked)
+                .map_err(|error| plugin_error(format!("checkbox on_change failed: {error}")))?;
+        }
+        Ok(true)
     }
     pub fn dialog_append(&self, id: u64, value: char) -> AppResult<bool> {
         let text = {
@@ -4697,9 +5210,19 @@ impl PluginRuntime {
         if let Some(dialog_id) = dialog_id {
             let mut widgets = self.dialog_widgets.borrow_mut();
             let state = widgets.entry(dialog_id).or_default();
-            state.input_on_change = None;
-            state.button_label = None;
-            state.button_on_click = None;
+            if let Some(key) = state.input_on_change.take() {
+                let _ = self._lua.remove_registry_value(key);
+            }
+            for button in state.buttons.drain(..) {
+                if let Some(key) = button.on_click {
+                    let _ = self._lua.remove_registry_value(key);
+                }
+            }
+            if let Some(dropdown) = state.dropdown.take() {
+                if let Some(key) = dropdown.on_change {
+                    let _ = self._lua.remove_registry_value(key);
+                }
+            }
         }
         let callbacks = self.panel_callbacks.borrow();
         let Some(key) = callbacks.get(id) else {
@@ -4758,7 +5281,13 @@ impl PluginRuntime {
                             input_widgets
                                 .borrow()
                                 .get(&dialog_id)
-                                .map(|state| state.input_text.clone())
+                                .map(|state| {
+                                    if state.input_masked {
+                                        "•".repeat(state.input_text.chars().count())
+                                    } else {
+                                        state.input_text.clone()
+                                    }
+                                })
                                 .unwrap_or(text)
                         } else {
                             text
@@ -4791,12 +5320,24 @@ impl PluginRuntime {
                         if let Some(dialog_id) = dialog_id {
                             let mut widgets = button_widgets.borrow_mut();
                             let state = widgets.entry(dialog_id).or_default();
-                            state.button_label = Some(label.clone());
-                            if let Some(callback) = value.get::<Option<Function>>("on_click")? {
-                                state.button_on_click = Some(lua.create_registry_value(callback)?);
-                            }
+                            let on_click = value
+                                .get::<Option<Function>>("on_click")?
+                                .map(|callback| lua.create_registry_value(callback))
+                                .transpose()?;
+                            state.buttons.push(PluginDialogButtonState { on_click });
                         }
-                        button_sink.borrow_mut().push(format!("[ {label} ]"));
+                        let focused = dialog_id.is_some_and(|dialog_id| {
+                            let widgets = button_widgets.borrow();
+                            let Some(state) = widgets.get(&dialog_id) else {
+                                return false;
+                            };
+                            matches!(state.focus, PluginDialogFocus::Button(index) if index + 1 == state.buttons.len())
+                        });
+                        button_sink.borrow_mut().push(if focused {
+                            format!("▶[ {label} ]")
+                        } else {
+                            format!("[ {label} ]")
+                        });
                         Ok(())
                     })
                     .map_err(lua_error)?,
@@ -4866,9 +5407,7 @@ impl PluginRuntime {
             "badge",
             "border",
             "dialog",
-            "dropdown",
             "hstack",
-            "password",
             "raw",
             "row_action",
             "title",
@@ -4897,6 +5436,162 @@ impl PluginRuntime {
                 )
                 .map_err(lua_error)?;
         }
+        let checkbox_sink = Rc::clone(&lines);
+        let checkbox_widgets = Rc::clone(&self.dialog_widgets);
+        panel
+            .set(
+                "checkbox",
+                self._lua
+                    .create_function(move |lua, (_panel, value): (Table, Option<LuaValue>)| {
+                        if let Some(LuaValue::Table(value)) = value {
+                            let checked = value.get::<Option<bool>>("checked")?.unwrap_or(false);
+                            let label = value
+                                .get::<Option<String>>("label")?
+                                .or_else(|| value.get::<Option<String>>("text").ok().flatten())
+                                .unwrap_or_default();
+                            let mut displayed_checked = checked;
+                            if let Some(dialog_id) = dialog_id {
+                                let mut widgets = checkbox_widgets.borrow_mut();
+                                let state = widgets.entry(dialog_id).or_default();
+                                if state.checkbox.is_none() {
+                                    state.checkbox = Some(PluginDialogCheckboxState {
+                                        checked,
+                                        on_change: None,
+                                    });
+                                }
+                                displayed_checked = state
+                                    .checkbox
+                                    .as_ref()
+                                    .map(|item| item.checked)
+                                    .unwrap_or(checked);
+                                if let Some(callback) =
+                                    value.get::<Option<Function>>("on_change")?
+                                {
+                                    if let Some(existing) = state
+                                        .checkbox
+                                        .as_mut()
+                                        .and_then(|item| item.on_change.take())
+                                    {
+                                        let _ = lua.remove_registry_value(existing);
+                                    }
+                                    state
+                                        .checkbox
+                                        .as_mut()
+                                        .expect("checkbox inserted")
+                                        .on_change = Some(lua.create_registry_value(callback)?);
+                                }
+                            }
+                            let focused = dialog_id.is_some_and(|id| {
+                                checkbox_widgets
+                                    .borrow()
+                                    .get(&id)
+                                    .is_some_and(|state| state.focus == PluginDialogFocus::Checkbox)
+                            });
+                            checkbox_sink.borrow_mut().push(format!(
+                                "{}[{}] {}",
+                                if focused { "▶" } else { "" },
+                                if displayed_checked { 'x' } else { ' ' },
+                                label
+                            ));
+                        }
+                        Ok(())
+                    })
+                    .map_err(lua_error)?,
+            )
+            .map_err(lua_error)?;
+        let password_sink = Rc::clone(&lines);
+        let password_widgets = Rc::clone(&self.dialog_widgets);
+        panel
+            .set(
+                "password",
+                self._lua
+                    .create_function(move |lua, (_panel, value): (Table, Option<Table>)| {
+                        if let Some(value) = value {
+                            if let Some(dialog_id) = dialog_id {
+                                let text = value
+                                    .get::<Option<String>>("text")?
+                                    .or_else(|| value.get::<Option<String>>("value").ok().flatten())
+                                    .unwrap_or_default();
+                                let mut widgets = password_widgets.borrow_mut();
+                                let state = widgets.entry(dialog_id).or_default();
+                                if !state.input_initialized {
+                                    state.input_text = text;
+                                    state.input_initialized = true;
+                                }
+                                state.input_masked = true;
+                                if let Some(callback) =
+                                    value.get::<Option<Function>>("on_change")?
+                                {
+                                    if let Some(existing) = state.input_on_change.take() {
+                                        let _ = lua.remove_registry_value(existing);
+                                    }
+                                    state.input_on_change =
+                                        Some(lua.create_registry_value(callback)?);
+                                }
+                                let focused = state.focus == PluginDialogFocus::Input;
+                                password_sink.borrow_mut().push(format!(
+                                    "{}❯ {}",
+                                    if focused { "▶" } else { "" },
+                                    "•".repeat(state.input_text.chars().count())
+                                ));
+                            } else {
+                                password_sink
+                                    .borrow_mut()
+                                    .push(password_widget_text(lua, LuaValue::Table(value)));
+                            }
+                        }
+                        Ok(())
+                    })
+                    .map_err(lua_error)?,
+            )
+            .map_err(lua_error)?;
+        let dropdown_sink = Rc::clone(&lines);
+        let dropdown_widgets = Rc::clone(&self.dialog_widgets);
+        panel
+            .set(
+                "dropdown",
+                self._lua
+                    .create_function(move |lua, (_panel, value): (Table, Option<Table>)| {
+                        if let Some(value) = value {
+                            if let Some(dialog_id) = dialog_id {
+                                let options = value
+                                    .get::<Option<Table>>("options")?
+                                    .map(|options| {
+                                        options
+                                            .sequence_values::<LuaValue>()
+                                            .flatten()
+                                            .map(|item| collection_item_text(lua, item, false))
+                                            .collect::<Vec<_>>()
+                                    })
+                                    .unwrap_or_default();
+                                let selected = value
+                                    .get::<Option<u64>>("selected")?
+                                    .unwrap_or(1)
+                                    .saturating_sub(1)
+                                    as usize;
+                                let on_change = value
+                                    .get::<Option<Function>>("on_change")?
+                                    .map(|callback| lua.create_registry_value(callback))
+                                    .transpose()?;
+                                dropdown_widgets
+                                    .borrow_mut()
+                                    .entry(dialog_id)
+                                    .or_default()
+                                    .dropdown = Some(PluginDialogDropdownState {
+                                    selected: selected.min(options.len().saturating_sub(1)),
+                                    options,
+                                    on_change,
+                                });
+                            }
+                            dropdown_sink
+                                .borrow_mut()
+                                .push(dropdown_widget_text(lua, value));
+                        }
+                        Ok(())
+                    })
+                    .map_err(lua_error)?,
+            )
+            .map_err(lua_error)?;
         let separator_sink = Rc::clone(&lines);
         panel
             .set(
@@ -5034,6 +5729,20 @@ impl PluginRuntime {
                     .map_err(lua_error)?,
             )
             .map_err(lua_error)?;
+        let checkbox_sink = Rc::clone(&lines);
+        panel
+            .set(
+                "checkbox",
+                self._lua
+                    .create_function(move |_lua, (_panel, value): (Table, Option<LuaValue>)| {
+                        if let Some(LuaValue::Table(value)) = value {
+                            checkbox_sink.borrow_mut().push(checkbox_widget_text(value));
+                        }
+                        Ok(())
+                    })
+                    .map_err(lua_error)?,
+            )
+            .map_err(lua_error)?;
         for (name, table_mode) in [("list", false), ("table", true)] {
             let sink = Rc::clone(&lines);
             panel
@@ -5098,9 +5807,7 @@ impl PluginRuntime {
             "badge",
             "border",
             "dialog",
-            "dropdown",
             "hstack",
-            "password",
             "raw",
             "row_action",
             "title",
@@ -5129,6 +5836,38 @@ impl PluginRuntime {
                 )
                 .map_err(lua_error)?;
         }
+        let password_sink = Rc::clone(&lines);
+        panel
+            .set(
+                "password",
+                self._lua
+                    .create_function(move |lua, (_panel, value): (Table, Option<LuaValue>)| {
+                        if let Some(value) = value {
+                            password_sink
+                                .borrow_mut()
+                                .push(password_widget_text(lua, value));
+                        }
+                        Ok(())
+                    })
+                    .map_err(lua_error)?,
+            )
+            .map_err(lua_error)?;
+        let dropdown_sink = Rc::clone(&lines);
+        panel
+            .set(
+                "dropdown",
+                self._lua
+                    .create_function(move |lua, (_panel, value): (Table, Option<Table>)| {
+                        if let Some(value) = value {
+                            dropdown_sink
+                                .borrow_mut()
+                                .push(dropdown_widget_text(lua, value));
+                        }
+                        Ok(())
+                    })
+                    .map_err(lua_error)?,
+            )
+            .map_err(lua_error)?;
         let rendered = render.call::<LuaValue>(panel).map_err(lua_error)?;
         if let LuaValue::String(text) = rendered {
             lines.borrow_mut().push(
@@ -5153,7 +5892,9 @@ impl PluginRuntime {
             return Ok(());
         };
         let callback: Function = self._lua.registry_value(&key).map_err(lua_error)?;
-        callback.call::<()>(()).map_err(lua_error)
+        let result = callback.call::<()>(()).map_err(lua_error);
+        let _ = self._lua.remove_registry_value(key);
+        result
     }
 
     pub fn close_tab(&self, id: &str) -> AppResult<bool> {
@@ -5162,10 +5903,11 @@ impl PluginRuntime {
             return Ok(false);
         };
         let callback: Function = self._lua.registry_value(&key).map_err(lua_error)?;
-        callback
+        let result = callback
             .call::<()>(())
-            .map_err(|error| plugin_error(format!("tab on_close failed: {error}")))?;
-        Ok(true)
+            .map_err(|error| plugin_error(format!("tab on_close failed: {error}")));
+        let _ = self._lua.remove_registry_value(key);
+        result.map(|()| true)
     }
 }
 
@@ -5644,6 +6386,11 @@ fn collection_widget_text(lua: &Lua, value: LuaValue, table_mode: bool) -> Strin
         .enumerate()
         .map(|(index, value)| {
             let text = collection_item_text(lua, value, table_mode);
+            let text = if table_mode {
+                horizontal_table_slice(&table, &text)
+            } else {
+                text
+            };
             if selected == Some(index) {
                 format!("▶ {text}")
             } else {
@@ -5652,6 +6399,65 @@ fn collection_widget_text(lua: &Lua, value: LuaValue, table_mode: bool) -> Strin
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn horizontal_table_slice(table: &Table, text: &str) -> String {
+    let offset = table
+        .get::<Option<u64>>("scroll_x")
+        .ok()
+        .flatten()
+        .or_else(|| table.get::<Option<u64>>("horizontal_scroll").ok().flatten())
+        .unwrap_or(0) as usize;
+    let width = table
+        .get::<Option<u64>>("width")
+        .ok()
+        .flatten()
+        .map(|value| value as usize);
+    let chars: Vec<char> = text.chars().collect();
+    let start = offset.min(chars.len());
+    let end = width.map_or(chars.len(), |width| {
+        start.saturating_add(width).min(chars.len())
+    });
+    chars[start..end].iter().collect()
+}
+
+fn dropdown_widget_text(lua: &Lua, table: Table) -> String {
+    let selected = table
+        .get::<Option<u64>>("selected")
+        .ok()
+        .flatten()
+        .and_then(|value| value.checked_sub(1))
+        .map(|value| value as usize);
+    let options = table
+        .get::<Option<Table>>("options")
+        .ok()
+        .flatten()
+        .map(|options| {
+            options
+                .sequence_values::<LuaValue>()
+                .flatten()
+                .enumerate()
+                .map(|(index, value)| {
+                    let text = collection_item_text(lua, value, false);
+                    if selected == Some(index) {
+                        format!("▼ {text}")
+                    } else {
+                        format!("  {text}")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
+    if options.is_empty() {
+        table
+            .get::<Option<String>>("label")
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "▼".to_owned())
+    } else {
+        options
+    }
 }
 
 fn markdown_to_lua(lua: &Lua, markdown: &str) -> mlua::Result<Table> {
@@ -5736,6 +6542,45 @@ fn markdown_inline_spans(line: &str) -> Vec<(String, String)> {
     spans
 }
 
+fn password_widget_text(lua: &Lua, value: LuaValue) -> String {
+    let (text, placeholder) = match &value {
+        LuaValue::Table(table) => (
+            table
+                .get::<Option<String>>("text")
+                .ok()
+                .flatten()
+                .or_else(|| table.get::<Option<String>>("value").ok().flatten())
+                .unwrap_or_default(),
+            table
+                .get::<Option<String>>("placeholder")
+                .ok()
+                .flatten()
+                .unwrap_or_default(),
+        ),
+        _ => (lua_value_text(lua, value), String::new()),
+    };
+    if text.is_empty() && !placeholder.is_empty() {
+        format!("[{placeholder}]")
+    } else {
+        format!("❯ {}", "•".repeat(text.chars().count()))
+    }
+}
+
+fn checkbox_widget_text(table: Table) -> String {
+    let checked = table
+        .get::<Option<bool>>("checked")
+        .ok()
+        .flatten()
+        .unwrap_or(false);
+    let label = table
+        .get::<Option<String>>("label")
+        .ok()
+        .flatten()
+        .or_else(|| table.get::<Option<String>>("text").ok().flatten())
+        .unwrap_or_default();
+    format!("[{}] {label}", if checked { 'x' } else { ' ' })
+}
+
 fn collection_item_text(lua: &Lua, value: LuaValue, table_mode: bool) -> String {
     let LuaValue::Table(item) = value else {
         return lua_value_text(lua, value);
@@ -5762,10 +6607,35 @@ fn collection_item_text(lua: &Lua, value: LuaValue, table_mode: bool) -> String 
             .or_else(|| item.get::<Option<String>>("text").ok().flatten())
     }
     .unwrap_or_else(|| lua_value_text(lua, LuaValue::Table(item.clone())));
-    item.get::<Option<String>>("right")
+    let text = item
+        .get::<Option<String>>("right")
         .ok()
         .flatten()
-        .map_or(text.clone(), |right| format!("{text}  {right}"))
+        .map_or(text.clone(), |right| format!("{text}  {right}"));
+    item.get::<Option<Table>>("actions")
+        .ok()
+        .flatten()
+        .map(|actions| {
+            let labels = actions
+                .sequence_values::<LuaValue>()
+                .flatten()
+                .filter_map(|action| match action {
+                    LuaValue::String(value) => value.to_str().ok().map(|text| text.to_string()),
+                    LuaValue::Table(action) => action
+                        .get::<Option<String>>("label")
+                        .ok()
+                        .flatten()
+                        .or_else(|| action.get::<Option<String>>("id").ok().flatten()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            if labels.is_empty() {
+                text.clone()
+            } else {
+                format!("{text}  [{}]", labels.join(" | "))
+            }
+        })
+        .unwrap_or(text)
 }
 
 fn lua_error(error: mlua::Error) -> crate::error::AppError {
@@ -6081,6 +6951,91 @@ mod tests {
     }
 
     #[test]
+    fn dropdown_widget_renders_selected_option() {
+        let lua = Lua::new();
+        let table = lua.create_table().expect("table");
+        let options = lua.create_table().expect("options");
+        options.set(1, "one").expect("option");
+        options.set(2, "two").expect("option");
+        table.set("options", options).expect("options");
+        table.set("selected", 2_u64).expect("selected");
+        assert_eq!(dropdown_widget_text(&lua, table), "  one\n▼ two");
+    }
+
+    #[test]
+    fn checkbox_widget_renders_checked_state_and_label() {
+        let lua = Lua::new();
+        let checked = lua.create_table().expect("table");
+        checked.set("checked", true).expect("checked");
+        checked.set("label", "Enabled").expect("label");
+        assert_eq!(checkbox_widget_text(checked), "[x] Enabled");
+        let unchecked = lua.create_table().expect("table");
+        unchecked.set("label", "Disabled").expect("label");
+        assert_eq!(checkbox_widget_text(unchecked), "[ ] Disabled");
+    }
+
+    #[test]
+    fn password_widget_masks_value_and_keeps_placeholder() {
+        let lua = Lua::new();
+        let table = lua.create_table().expect("table");
+        table.set("text", "secret").expect("text");
+        assert_eq!(
+            password_widget_text(&lua, LuaValue::Table(table)),
+            "❯ ••••••"
+        );
+
+        let empty = lua.create_table().expect("empty table");
+        empty.set("placeholder", "Password").expect("placeholder");
+        assert_eq!(
+            password_widget_text(&lua, LuaValue::Table(empty)),
+            "[Password]"
+        );
+    }
+
+    #[test]
+    fn table_widget_applies_unicode_safe_horizontal_scroll() {
+        let lua = Lua::new();
+        let table = lua.create_table().expect("table");
+        let rows = lua.create_table().expect("rows");
+        let row = lua.create_table().expect("row");
+        row.set("label", "甲乙丙丁").expect("label");
+        rows.set(1, row).expect("row");
+        table.set("rows", rows).expect("rows");
+        table.set("scroll_x", 1_u64).expect("scroll");
+        table.set("width", 2_u64).expect("width");
+        assert_eq!(
+            collection_widget_text(&lua, LuaValue::Table(table), true),
+            "  乙丙"
+        );
+    }
+
+    #[test]
+    fn collection_rows_render_action_labels() {
+        let lua = Lua::new();
+        let row = lua.create_table().expect("row");
+        row.set("label", "item").expect("label");
+        let actions = lua.create_table().expect("actions");
+        let action = lua.create_table().expect("action");
+        action.set("id", "open").expect("id");
+        action.set("label", "Open").expect("label");
+        actions.set(1, action).expect("action");
+        row.set("actions", actions).expect("actions");
+        assert_eq!(
+            collection_item_text(&lua, LuaValue::Table(row), false),
+            "item  [Open]"
+        );
+        let string_row = lua.create_table().expect("string row");
+        string_row.set("label", "item").expect("label");
+        let string_actions = lua.create_table().expect("string actions");
+        string_actions.set(1, "Delete").expect("action");
+        string_row.set("actions", string_actions).expect("actions");
+        assert_eq!(
+            collection_item_text(&lua, LuaValue::Table(string_row), false),
+            "item  [Delete]"
+        );
+    }
+
+    #[test]
     fn editor_read_api_exposes_snapshot_with_one_based_positions() {
         let root = std::env::temp_dir().join(format!("mtide-editor-api-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
@@ -6175,6 +7130,8 @@ end)
             cursors: vec![(1, 2)],
             selection: Some((0, 0, 1, 2)),
             selection_text: "one\ntw".into(),
+            viewport_top_line: 0,
+            viewport_left_col: 0,
         });
         runtime.poll_async().expect("timer");
         assert!(runtime.logs().iter().any(|line| line == "[info] timer-ok"));
@@ -6352,6 +7309,106 @@ assert(line.active() == true)
     }
 
     #[test]
+    fn plugin_registry_rejects_insecure_endpoints_before_network_access() {
+        assert!(fetch_plugin_registry("http://registry.example/plugins.json").is_err());
+        assert!(fetch_plugin_registry("https://registry.example/plugins.json\n").is_err());
+    }
+
+    #[test]
+    fn plugin_registry_entry_requires_secure_download_url() {
+        let raw = r#"[{"name":"demo","version":"1","url":"http://example.com/demo.zip"}]"#;
+        let entries: Vec<PluginRegistryEntry> = serde_json::from_str(raw).expect("index");
+        assert!(!entries[0].url.starts_with("https://"));
+    }
+
+    #[test]
+    fn plugin_registry_selection_requires_unique_name_and_version() {
+        let entries = vec![
+            PluginRegistryEntry {
+                name: "demo".into(),
+                version: "1.0.0".into(),
+                url: "https://example.com/demo.zip".into(),
+                sha256: None,
+            },
+            PluginRegistryEntry {
+                name: "demo".into(),
+                version: "2.0.0".into(),
+                url: "https://example.com/demo-2.zip".into(),
+                sha256: None,
+            },
+        ];
+        assert_eq!(
+            select_plugin_registry_entry(&entries, "demo", Some("2.0.0"))
+                .expect("version")
+                .url,
+            "https://example.com/demo-2.zip"
+        );
+        assert_eq!(
+            select_plugin_registry_entry(&entries, "demo", None)
+                .expect("latest")
+                .version,
+            "2.0.0"
+        );
+        assert!(select_plugin_registry_entry(&entries, "missing", None).is_err());
+    }
+
+    #[test]
+    fn plugin_registry_download_rejects_invalid_entry_before_network_access() {
+        let entry = PluginRegistryEntry {
+            name: "demo".into(),
+            version: "1.0.0".into(),
+            url: "http://example.com/demo.zip".into(),
+            sha256: None,
+        };
+        assert!(download_plugin_registry_entry(&entry).is_err());
+    }
+
+    #[test]
+    fn plugin_package_sha256_is_verified() {
+        assert!(plugin_package_hash_matches(
+            b"",
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        ));
+        assert!(!plugin_package_hash_matches(b"plugin", "bad"));
+    }
+
+    #[test]
+    fn plugin_archive_member_paths_are_restricted() {
+        assert!(safe_plugin_archive_member("plugin.ttt.json"));
+        assert!(safe_plugin_archive_member("nested/init.lua"));
+        assert!(!safe_plugin_archive_member("../escape.lua"));
+        assert!(!safe_plugin_archive_member("/absolute.lua"));
+        assert!(!safe_plugin_archive_member("nested\\escape.lua"));
+    }
+
+    #[test]
+    fn plugin_archive_install_rejects_empty_and_existing_destinations() {
+        let root = std::env::temp_dir().join(format!("mtide-install-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("directory");
+        let destination = root.join("plugin");
+        fs::create_dir_all(&destination).expect("destination");
+        assert!(install_plugin_archive(b"", &destination).is_err());
+        assert!(install_plugin_archive(b"not zip", &destination).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn plugin_archive_update_rolls_back_when_new_archive_is_invalid() {
+        let root = std::env::temp_dir().join(format!("mtide-update-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let destination = root.join("plugin");
+        fs::create_dir_all(&destination).expect("destination");
+        fs::write(destination.join("keep.txt"), "old").expect("old plugin");
+        assert!(update_plugin_archive(b"not zip", &destination).is_err());
+        assert_eq!(
+            fs::read_to_string(destination.join("keep.txt")).expect("restored"),
+            "old"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn network_api_returns_bounded_response_shape_and_async_errors() {
         let root = std::env::temp_dir().join(format!("mtide-network-api-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
@@ -6424,7 +7481,7 @@ end)
             root.join("init.lua"),
             r#"
 local ttt = require("ttt")
-assert(ttt.open_dialog({title = "Review", width = 40, height = 8, render = function(panel) panel:label("dialog body"); panel:input({text = "old", on_change = function(text) ttt.log("input:" .. text) end}); panel:button({label = "Submit", on_click = function() ttt.log("clicked") end}) end, on_close = function() ttt.log("dialog-closed") end}) == true)
+assert(ttt.open_dialog({title = "Review", width = 40, height = 8, render = function(panel) panel:label("dialog body"); panel:password({text = "old", on_change = function(text) ttt.log("input:" .. text) end}); panel:checkbox({checked = false, label = "Remember", on_change = function(value) ttt.log("checked:" .. tostring(value)) end}); panel:button({label = "Submit", on_click = function() ttt.log("clicked") end}); panel:button({label = "Cancel", on_click = function() ttt.log("cancelled") end}) end, on_close = function() ttt.log("dialog-closed") end}) == true)
 "#,
         )
         .expect("script");
@@ -6441,21 +7498,81 @@ assert(ttt.open_dialog({title = "Review", width = 40, height = 8, render = funct
         );
         assert_eq!(
             runtime.render_panel("__dialog:1").expect("render"),
-            Some("dialog body\n❯ old\n[ Submit ]".into())
+            Some("dialog body\n▶❯ •••\n[ ] Remember\n[ Submit ]\n[ Cancel ]".into())
         );
         assert!(runtime.dialog_input(1, "new".into()).expect("input"));
         assert!(runtime.dialog_focus_next(1));
+        assert!(runtime.dialog_activate(1).expect("checkbox"));
+        assert!(runtime
+            .render_panel("__dialog:1")
+            .expect("rerender")
+            .expect("dialog")
+            .contains("[x] Remember"));
         assert!(!runtime.dialog_append(1, 'x').expect("button focus"));
         assert!(runtime.dialog_activate(1).expect("button"));
+        assert!(runtime.dialog_focus_next(1));
+        assert!(runtime.dialog_activate(1).expect("second button"));
         assert!(runtime.dialog_focus_button(1));
         assert!(runtime.dialog_activate(1).expect("button again"));
         assert!(runtime.logs().iter().any(|line| line == "[info] input:new"));
         assert!(runtime.logs().iter().any(|line| line == "[info] clicked"));
+        assert!(runtime
+            .logs()
+            .iter()
+            .any(|line| line == "[info] checked:true"));
         assert!(runtime.close_custom_dialog(1).expect("close"));
         assert!(runtime
             .logs()
             .iter()
             .any(|line| line == "[info] dialog-closed"));
+        assert!(!runtime
+            .dialog_input(1, "after-close".into())
+            .expect("closed input"));
+    }
+
+    #[test]
+    fn custom_dialog_dropdown_has_focus_and_change_callback() {
+        let root =
+            std::env::temp_dir().join(format!("mtide-dropdown-dialog-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("directory");
+        fs::write(
+            root.join("plugin.ttt.json"),
+            r#"{"name":"dropdown-dialog","entry":"init.lua","api":2}"#,
+        )
+        .expect("manifest");
+        fs::write(
+            root.join("init.lua"),
+            r#"
+local ttt = require("ttt")
+ttt.open_dialog({title = "Pick", render = function(panel)
+  panel:input({text = "query"})
+  panel:dropdown({options = {"one", "two"}, selected = 1, on_change = function(value) ttt.log("selected:" .. value) end})
+  panel:checkbox({label = "Remember", on_change = function(value) ttt.log("remember:" .. tostring(value)) end})
+  panel:button({label = "Done", on_click = function() ttt.log("done") end})
+end})
+"#,
+        )
+        .expect("script");
+        let package = PluginPackage::load(&root).expect("package");
+        let runtime = PluginRuntime::load(&package).expect("runtime");
+        runtime.drain_panel_requests();
+        assert!(runtime
+            .render_panel("__dialog:1")
+            .expect("render")
+            .is_some());
+        assert!(runtime.dialog_focus_next(1));
+        assert!(runtime.dialog_dropdown_move(1, 1).expect("move"));
+        assert!(runtime.dialog_focus_next(1));
+        assert!(runtime.dialog_activate(1).expect("checkbox"));
+        assert!(runtime.dialog_focus_next(1));
+        assert!(runtime.dialog_activate(1).expect("button"));
+        assert!(runtime.dialog_focus_at_line(1, 1));
+        assert!(runtime
+            .logs()
+            .iter()
+            .any(|line| line == "[info] selected:2"));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -6540,7 +7657,7 @@ run("latest")
             root.join("init.lua"),
             r#"
 local ttt = require("ttt")
-assert(ttt.open_changes({id = "review", title = "Review", description = "summary", diff = "diff --git a/a.txt b/a.txt\n@@ -1 +1 @@\n-old\n+new"}) == "review")
+assert(ttt.open_changes({id = "review", title = "Review", description = "summary", file_path = "a.txt", diff = "diff --git a/a.txt b/a.txt\n@@ -1 +1 @@\n-old\n+new"}) == "review")
 "#,
         )
         .expect("script");
@@ -6548,9 +7665,10 @@ assert(ttt.open_changes({id = "review", title = "Review", description = "summary
         let runtime = PluginRuntime::load(&package).expect("runtime");
         assert_eq!(
             runtime.drain_panel_requests(),
-            vec![PluginPanelRequest::OpenTab {
+            vec![PluginPanelRequest::OpenChangesTab {
                 id: "review".into(),
                 title: "Review".into(),
+                file_path: Some("a.txt".into()),
                 focus: true,
             }]
         );
@@ -6832,7 +7950,7 @@ ttt.on("test.event", function() assert(ttt.close_drawer() == true); assert(ttt.c
 ttt.on("tab.open", function() ttt.log("tab-open") end)
 ttt.on("tab.activate", function() ttt.log("tab-activate") end)
 ttt.on("tab.close", function() ttt.log("tab-close") end)
-ttt.register({sidebar = {title = "Demo", render = function(panel) panel:label("panel text"); panel:list({items = {"one", "two"}, selected = 2}); panel:table({rows = {{cells = {"row", "value"}, right = "R"}}}); panel:tabs({items = {"A", "B"}, selected = 2}); panel:pager({page = 2, pages = 4}); panel:scrollview({items = {"scroll"}, selected = 1}); panel:dialog() end}, bottom = {id = "demo.bottom", title = "Bottom", render = function(panel) panel:label("bottom text") end}, commands = {{id = "demo.run", title = "Run", handler = function() local commands = ttt.list_commands(); assert(#commands == 2); assert(ttt.exec_command("demo.other") == true); assert(ttt.show_panel("sidebar") == true); assert(ttt.focus_panel("bottom") == true); assert(ttt.open_drawer({side = "left", width = 32, min_width = 12, render = function(panel) panel:label("drawer text") end}) == true); assert(ttt.open_tab({id = "demo-tab", title = "Demo Tab", focus = true, render = function(panel) panel:label("tab text") end, on_close = function() ttt.log("tab-closed") end}) == "demo-tab"); assert(ttt.focus_tab("demo-tab") == true); ttt.set_status_item("right", "live", "Live", {priority = 10}); ttt.remove_status_item("demo.status"); ttt.log("ran") end}, {id = "demo.other", title = "Other", handler = function() assert(ttt.open_readonly("Read-only", {"one", "two"}, "note.txt") == "Read-only"); assert(ttt.open_diff("Diff", {"old"}, {"new"}, "note.txt") == "Diff"); assert(ttt.open_file("src/main.rs", 12, true) == true); assert(ttt.clipboard_write("plugin clipboard") == true); assert(ttt.clipboard_read() == "plugin clipboard"); ttt.log("other") end}}, keybindings = {{key = "ctrl-r", command = "demo.run"}}, status_items = {{id = "demo.status", text = "Demo"}}, file_handlers = {{id = "demo.pdf", extensions = {"pdf"}, open = function(path, tab) assert(tab.id == "demo.pdf"); assert(tab.title == "demo.pdf"); tab:focus(); tab:set_title("PDF"); tab.on_close = function() ttt.log("closed") end return "view:" .. path end}, {id = "demo.view", extensions = {"view"}, open = function(_path, tab) tab.render = function(panel) panel:label("file view"); panel:list({items = {"first", "second"}, selected = 2}); panel:pager({page = 1, total = 3}) end end}}})"#,
+ttt.register({sidebar = {title = "Demo", render = function(panel) panel:label("panel text"); panel:list({items = {"one", "two"}, selected = 2}); panel:checkbox({checked = true, label = "Check"}); panel:table({rows = {{cells = {"row", "value"}, right = "R"}}}); panel:tabs({items = {"A", "B"}, selected = 2}); panel:pager({page = 2, pages = 4}); panel:scrollview({items = {"scroll"}, selected = 1}); panel:dialog() end}, bottom = {id = "demo.bottom", title = "Bottom", render = function(panel) panel:label("bottom text") end}, commands = {{id = "demo.run", title = "Run", handler = function() local commands = ttt.list_commands(); assert(#commands == 2); assert(ttt.exec_command("demo.other") == true); assert(ttt.show_panel("sidebar") == true); assert(ttt.focus_panel("bottom") == true); assert(ttt.open_drawer({side = "left", width = 32, min_width = 12, render = function(panel) panel:label("drawer text") end}) == true); assert(ttt.open_tab({id = "demo-tab", title = "Demo Tab", focus = true, render = function(panel) panel:label("tab text") end, on_close = function() ttt.log("tab-closed") end}) == "demo-tab"); assert(ttt.focus_tab("demo-tab") == true); ttt.set_status_item("right", "live", "Live", {priority = 10}); ttt.remove_status_item("demo.status"); ttt.log("ran") end}, {id = "demo.other", title = "Other", handler = function() assert(ttt.open_readonly("Read-only", {"one", "two"}, "note.txt") == "Read-only"); assert(ttt.open_diff("Diff", {"old"}, {"new"}, "note.txt") == "Diff"); assert(ttt.open_file("src/main.rs", 12, true) == true); assert(ttt.clipboard_write("plugin clipboard") == true); assert(ttt.clipboard_read() == "plugin clipboard"); ttt.log("other") end}}, keybindings = {{key = "ctrl-r", command = "demo.run"}}, status_items = {{id = "demo.status", text = "Demo"}}, file_handlers = {{id = "demo.pdf", extensions = {"pdf"}, open = function(path, tab) assert(tab.id == "demo.pdf"); assert(tab.title == "demo.pdf"); tab:focus(); tab:set_title("PDF"); tab.on_close = function() ttt.log("closed") end return "view:" .. path end}, {id = "demo.view", extensions = {"view"}, open = function(_path, tab) tab.render = function(panel) panel:label("file view"); panel:list({items = {"first", "second"}, selected = 2}); panel:pager({page = 1, total = 3}) end end}}})"#,
         )
         .expect("script");
         let package = PluginPackage::load(&root).expect("package");
@@ -6856,7 +7974,7 @@ ttt.register({sidebar = {title = "Demo", render = function(panel) panel:label("p
         assert_eq!(runtime.registration().panels[0].id, "demo");
         assert_eq!(
             runtime.render_panel("demo").expect("panel"),
-            Some("panel text\n  one\n▶ two\n  row  value  R\n  A\n▶ B\nPage 2/4\n▶ scroll".into())
+            Some("panel text\n  one\n▶ two\n[x] Check\n  row  value  R\n  A\n▶ B\nPage 2/4\n▶ scroll".into())
         );
         let pdf = root.join("sample.pdf");
         fs::write(&pdf, b"%PDF-").expect("pdf");

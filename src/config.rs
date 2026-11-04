@@ -106,6 +106,8 @@ fn parse_color(value: &str) -> Option<Color> {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Settings {
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
     pub sidebar_visible: bool,
     pub bottom_visible: bool,
     pub agent_visible: bool,
@@ -118,6 +120,8 @@ pub struct Settings {
     pub default_folders: Vec<String>,
     #[serde(rename = "saveAllOnQuit", alias = "save_all_on_quit")]
     pub save_all_on_quit: bool,
+    #[serde(rename = "reuseWindow", alias = "reuse_window")]
+    pub reuse_window: bool,
     pub sidebar_width: u16,
     pub agent_width: u16,
     pub theme: Option<String>,
@@ -133,8 +137,14 @@ pub struct Settings {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct EditorSettings {
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
     #[serde(default)]
     pub language: Option<String>,
+    #[serde(rename = "autoClosingBrackets", alias = "auto_closing_brackets")]
+    pub auto_closing_brackets: bool,
+    #[serde(rename = "selectionStyle", alias = "selection_style")]
+    pub selection_style: String,
     #[serde(rename = "wordWrap", alias = "word_wrap")]
     pub word_wrap: bool,
     #[serde(rename = "wordWrapMaxColumn", alias = "word_wrap_column")]
@@ -156,6 +166,8 @@ pub struct EditorSettings {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct SearchSettings {
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
     pub include: Vec<String>,
     pub exclude: Vec<String>,
 }
@@ -163,6 +175,7 @@ pub struct SearchSettings {
 impl Default for SearchSettings {
     fn default() -> Self {
         Self {
+            extra: BTreeMap::new(),
             include: Vec::new(),
             exclude: vec![
                 "target/**".to_owned(),
@@ -176,7 +189,10 @@ impl Default for SearchSettings {
 impl Default for EditorSettings {
     fn default() -> Self {
         Self {
+            extra: BTreeMap::new(),
             language: None,
+            auto_closing_brackets: true,
+            selection_style: "background".to_owned(),
             word_wrap: false,
             word_wrap_column: 120,
             trim_trailing_whitespace: false,
@@ -192,6 +208,8 @@ impl Default for EditorSettings {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct TerminalSettings {
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
     pub shell: Option<String>,
     pub args: Vec<String>,
     pub scrollback: usize,
@@ -202,6 +220,8 @@ pub struct TerminalSettings {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct AgentSettings {
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
     pub enabled: bool,
     pub name: String,
     pub command: Vec<String>,
@@ -209,14 +229,18 @@ pub struct AgentSettings {
     pub install: Option<String>,
     pub active: Option<String>,
     pub providers: BTreeMap<String, AgentProviderConfig>,
+    pub tools: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct AgentProviderConfig {
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
     pub name: String,
     pub command: Vec<String>,
     pub cwd: Option<String>,
     pub install: Option<String>,
+    pub tools: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -229,12 +253,15 @@ enum StringOrList {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 struct RawAgentProviderConfig {
+    #[serde(flatten)]
+    extra: BTreeMap<String, serde_json::Value>,
     name: String,
     command: Option<StringOrList>,
     cli: Option<String>,
     args: Option<StringOrList>,
     cwd: Option<String>,
     install: Option<String>,
+    tools: Vec<String>,
 }
 
 impl<'de> serde::Deserialize<'de> for AgentProviderConfig {
@@ -261,10 +288,12 @@ impl<'de> serde::Deserialize<'de> for AgentProviderConfig {
             Vec::new()
         };
         Ok(Self {
+            extra: raw.extra,
             name: raw.name,
             command,
             cwd: raw.cwd,
             install: raw.install,
+            tools: raw.tools,
         })
     }
 }
@@ -272,6 +301,8 @@ impl<'de> serde::Deserialize<'de> for AgentProviderConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct LspSettings {
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
     pub enabled: bool,
     pub servers: BTreeMap<String, LspServerConfig>,
 }
@@ -286,11 +317,13 @@ pub struct LspServerConfig {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            extra: BTreeMap::new(),
             sidebar_visible: true,
             bottom_visible: true,
             agent_visible: true,
             default_folders: Vec::new(),
             save_all_on_quit: false,
+            reuse_window: true,
             sidebar_width: 25,
             agent_width: 29,
             theme: None,
@@ -307,6 +340,7 @@ impl Default for Settings {
 impl Default for LspSettings {
     fn default() -> Self {
         Self {
+            extra: BTreeMap::new(),
             enabled: true,
             servers: BTreeMap::new(),
         }
@@ -316,6 +350,7 @@ impl Default for LspSettings {
 impl Default for AgentSettings {
     fn default() -> Self {
         Self {
+            extra: BTreeMap::new(),
             enabled: true,
             name: "Agent".to_owned(),
             command: Vec::new(),
@@ -323,6 +358,7 @@ impl Default for AgentSettings {
             install: None,
             active: None,
             providers: BTreeMap::new(),
+            tools: Vec::new(),
         }
     }
 }
@@ -330,6 +366,7 @@ impl Default for AgentSettings {
 impl Default for TerminalSettings {
     fn default() -> Self {
         Self {
+            extra: BTreeMap::new(),
             shell: None,
             args: Vec::new(),
             scrollback: 10_000,
@@ -592,6 +629,17 @@ mod tests {
     }
 
     #[test]
+    fn parses_agent_tool_permissions_without_granting_defaults() {
+        let settings: Settings = serde_json::from_str(
+            r#"{"agent":{"tools":["read_file"],"providers":{"local":{"command":["codex"],"tools":["shell"]}}}}"#,
+        )
+        .expect("settings");
+        assert_eq!(settings.agent.tools, vec!["read_file"]);
+        assert_eq!(settings.agent.providers["local"].tools, vec!["shell"]);
+        assert!(Settings::default().agent.tools.is_empty());
+    }
+
+    #[test]
     fn parses_ttt_agents_schema_and_normalizes_it() {
         let mut settings: Settings = serde_json::from_str(
             r#"{"agents":{"codex":{"cli":"codex","args":"--interactive","install":"npm install -g @openai/codex"},"claude":{"cli":"claude","args":["--print"]}}}"#,
@@ -633,10 +681,12 @@ mod tests {
     #[test]
     fn parses_editor_word_wrap_configuration() {
         let settings: Settings = serde_json::from_str(
-            r#"{"editor":{"language":"python","wordWrap":true,"wordWrapMaxColumn":88}}"#,
+            r#"{"editor":{"language":"python","autoClosingBrackets":false,"selectionStyle":"invert","wordWrap":true,"wordWrapMaxColumn":88}}"#,
         )
         .expect("settings");
         assert_eq!(settings.editor.language.as_deref(), Some("python"));
+        assert!(!settings.editor.auto_closing_brackets);
+        assert_eq!(settings.editor.selection_style, "invert");
         assert!(settings.editor.word_wrap);
         assert_eq!(settings.editor.word_wrap_column, 88);
         assert!(!settings.editor.trim_trailing_whitespace);
@@ -651,6 +701,35 @@ mod tests {
         let format_settings: Settings =
             serde_json::from_str(r#"{"editor":{"formatOnSave":true}}"#).expect("format settings");
         assert!(format_settings.editor.format_on_save);
+    }
+
+    #[test]
+    fn preserves_unknown_settings_fields_across_json_round_trip() {
+        let settings: Settings = serde_json::from_str(
+            r#"{"futureSetting":{"enabled":true},"editor":{"futureEditorOption":"keep"},"search":{"futureSearchOption":1},"terminal":{"futureTerminalOption":true},"agent":{"futureAgentOption":"a","providers":{"local":{"cli":"sh","futureProviderOption":false}}},"lsp":{"futureLspOption":[1,2]}}"#,
+        )
+        .expect("settings");
+        let value = serde_json::to_value(&settings).expect("serialize");
+        assert_eq!(value["futureSetting"]["enabled"], true);
+        assert_eq!(value["editor"]["futureEditorOption"], "keep");
+        assert_eq!(value["search"]["futureSearchOption"], 1);
+        assert_eq!(value["terminal"]["futureTerminalOption"], true);
+        assert_eq!(value["agent"]["futureAgentOption"], "a");
+        assert_eq!(
+            value["agent"]["providers"]["local"]["futureProviderOption"],
+            false
+        );
+        assert_eq!(value["lsp"]["futureLspOption"], serde_json::json!([1, 2]));
+    }
+
+    #[test]
+    fn parses_reuse_window_setting_and_defaults_to_enabled() {
+        let disabled: Settings =
+            serde_json::from_str(r#"{"reuseWindow":false}"#).expect("reuse setting");
+        assert!(!disabled.reuse_window);
+        assert!(Settings::default().reuse_window);
+        let serialized = serde_json::to_value(&disabled).expect("serialize reuse setting");
+        assert_eq!(serialized["reuseWindow"], false);
     }
 
     #[test]

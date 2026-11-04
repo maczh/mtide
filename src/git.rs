@@ -5,6 +5,8 @@ use std::{
     process::{Command, Stdio},
 };
 
+use serde::{Deserialize, Serialize};
+
 use crate::error::{AppError, AppResult};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,6 +26,137 @@ impl GitChange {
 pub struct DiffLine {
     pub kind: char,
     pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct PullRequestComment {
+    pub id: u64,
+    pub body: String,
+    pub path: String,
+    pub line: Option<u32>,
+    pub side: Option<String>,
+    pub user: Option<PullRequestCommentUser>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct PullRequestCommentUser {
+    pub login: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PullRequestCommentRequest<'a> {
+    body: &'a str,
+    commit_id: &'a str,
+    path: &'a str,
+    line: u32,
+    side: &'a str,
+}
+
+#[allow(dead_code)]
+pub fn list_pull_request_comments(
+    repository: &str,
+    number: u64,
+) -> AppResult<Vec<PullRequestComment>> {
+    let endpoint = github_pull_request_api_endpoint(repository, number)?;
+    let token = github_token()?;
+    let response = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|error| AppError::Git(format!("build GitHub client: {error}")))?
+        .get(endpoint)
+        .bearer_auth(token)
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "mtide")
+        .send()
+        .map_err(|error| AppError::Git(format!("list pull request comments: {error}")))?;
+    if !response.status().is_success() {
+        return Err(AppError::Git(format!(
+            "list pull request comments: HTTP {}",
+            response.status()
+        )));
+    }
+    let body = response
+        .text()
+        .map_err(|error| AppError::Git(format!("read pull request comments: {error}")))?;
+    serde_json::from_str(&body)
+        .map_err(|error| AppError::Git(format!("decode pull request comments: {error}")))
+}
+
+#[allow(dead_code)]
+pub fn create_pull_request_comment(
+    repository: &str,
+    number: u64,
+    commit_id: &str,
+    path: &str,
+    line: u32,
+    body: &str,
+) -> AppResult<PullRequestComment> {
+    if commit_id.trim().is_empty() || path.trim().is_empty() || line == 0 || body.trim().is_empty()
+    {
+        return Err(AppError::Git("invalid pull request comment".into()));
+    }
+    let endpoint = github_pull_request_api_endpoint(repository, number)?;
+    let token = github_token()?;
+    let payload = PullRequestCommentRequest {
+        body,
+        commit_id,
+        path,
+        line,
+        side: "RIGHT",
+    };
+    let response = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|error| AppError::Git(format!("build GitHub client: {error}")))?
+        .post(endpoint)
+        .bearer_auth(token)
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "mtide")
+        .header("Content-Type", "application/json")
+        .body(
+            serde_json::to_vec(&payload)
+                .map_err(|error| AppError::Git(format!("encode pull request comment: {error}")))?,
+        )
+        .send()
+        .map_err(|error| AppError::Git(format!("create pull request comment: {error}")))?;
+    if !response.status().is_success() {
+        return Err(AppError::Git(format!(
+            "create pull request comment: HTTP {}",
+            response.status()
+        )));
+    }
+    let body = response
+        .text()
+        .map_err(|error| AppError::Git(format!("read pull request comment: {error}")))?;
+    serde_json::from_str(&body)
+        .map_err(|error| AppError::Git(format!("decode pull request comment: {error}")))
+}
+
+fn github_pull_request_api_endpoint(repository: &str, number: u64) -> AppResult<String> {
+    if number == 0 || !repository.starts_with("https://github.com/") {
+        return Err(AppError::Git("invalid GitHub pull request target".into()));
+    }
+    let path = repository
+        .trim_start_matches("https://github.com/")
+        .trim_end_matches(".git");
+    let valid = path.split('/').count() == 2 && path.split('/').all(|part| !part.is_empty());
+    if !valid || path.contains(['?', '#', ' ']) {
+        return Err(AppError::Git("invalid GitHub repository".into()));
+    }
+    Ok(format!(
+        "https://api.github.com/repos/{path}/pulls/{number}/comments"
+    ))
+}
+
+fn github_token() -> AppResult<String> {
+    std::env::var("GITHUB_TOKEN")
+        .or_else(|_| std::env::var("GH_TOKEN"))
+        .map_err(|_| AppError::Git("GITHUB_TOKEN or GH_TOKEN is required".into()))
+        .and_then(|token| {
+            (!token.trim().is_empty())
+                .then_some(token)
+                .ok_or_else(|| AppError::Git("GitHub token must not be empty".into()))
+        })
 }
 
 pub fn hunk_count(lines: &[DiffLine]) -> usize {
@@ -231,6 +364,42 @@ pub fn diff(root: &Path, change: &GitChange) -> Vec<DiffLine> {
     Vec::new()
 }
 
+#[allow(dead_code)]
+pub fn diff_refs(root: &Path, base: &str, head: &str) -> Vec<DiffLine> {
+    if base.trim().is_empty() || head.trim().is_empty() {
+        return Vec::new();
+    }
+    let output = Command::new("git")
+        .args(["diff", "--no-ext-diff", "--unified=3", base, head, "--"])
+        .current_dir(root)
+        .output();
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    parse_diff(&String::from_utf8_lossy(&output.stdout))
+}
+
+#[allow(dead_code)]
+pub fn resolve_ref(root: &Path, reference: &str) -> AppResult<String> {
+    if reference.trim().is_empty() {
+        return Err(AppError::Git("reference must not be empty".into()));
+    }
+    let output = Command::new("git")
+        .args(["rev-parse", "--verify", reference])
+        .current_dir(root)
+        .output()?;
+    if !output.status.success() {
+        return Err(AppError::Git(format!("unable to resolve ref {reference}")));
+    }
+    let oid = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    (!oid.is_empty())
+        .then_some(oid)
+        .ok_or_else(|| AppError::Git(format!("unable to resolve ref {reference}")))
+}
+
 pub fn base_file(root: &Path, path: &str) -> Option<Vec<String>> {
     let output = Command::new("git")
         .args(["show", &format!("HEAD:{path}")])
@@ -385,6 +554,27 @@ pub fn history(root: &Path, limit: usize) -> Vec<GitCommit> {
 
 pub fn fetch(root: &Path) -> AppResult<()> {
     remote_action(root, ["fetch", "--all", "--prune"])
+}
+
+#[allow(dead_code)]
+pub fn fetch_pull_request(root: &Path, repository: &str, number: u64) -> AppResult<String> {
+    if number == 0 || !is_remote_repository(repository) {
+        return Err(AppError::Git(
+            "invalid pull request repository or number".into(),
+        ));
+    }
+    let destination = format!("refs/mtide/pr/{number}");
+    let refspec = format!("pull/{number}/head:{destination}");
+    run_git_with_args(root, &["fetch", "--no-tags", repository, &refspec])?;
+    Ok(destination)
+}
+
+#[allow(dead_code)]
+fn is_remote_repository(repository: &str) -> bool {
+    repository.starts_with("https://")
+        || repository.starts_with("http://")
+        || repository.starts_with("git@")
+        || repository.starts_with("ssh://")
 }
 
 pub fn pull(root: &Path) -> AppResult<()> {
@@ -718,6 +908,42 @@ mod tests {
     #[test]
     fn rejects_empty_commit_message() {
         assert!(commit(Path::new("/tmp"), " ").is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_pull_request_fetch_arguments() {
+        assert!(fetch_pull_request(Path::new("/tmp"), "", 1).is_err());
+        assert!(fetch_pull_request(Path::new("/tmp"), "https://github.com/a/b.git", 0).is_err());
+    }
+
+    #[test]
+    fn rejects_empty_ref_diff_requests_without_spawning_git() {
+        assert!(diff_refs(Path::new("/tmp"), "", "HEAD").is_empty());
+        assert!(diff_refs(Path::new("/tmp"), "HEAD", "").is_empty());
+    }
+
+    #[test]
+    fn validates_github_comment_target_before_reading_credentials() {
+        let error = github_pull_request_api_endpoint("https://example.com/org/repo", 1)
+            .expect_err("non-GitHub repository");
+        assert!(error.to_string().contains("invalid GitHub"));
+        let error = github_pull_request_api_endpoint("https://github.com/org/repo", 0)
+            .expect_err("zero PR number");
+        assert!(error.to_string().contains("invalid GitHub"));
+    }
+
+    #[test]
+    fn rejects_empty_comment_fields_without_network_access() {
+        let error = create_pull_request_comment(
+            "https://github.com/org/repo",
+            1,
+            "",
+            "src/lib.rs",
+            1,
+            "comment",
+        )
+        .expect_err("empty commit");
+        assert!(error.to_string().contains("invalid pull request comment"));
     }
 
     #[test]

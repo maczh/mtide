@@ -12,7 +12,7 @@ use crate::app::{App, BottomTab, Focus, LspPopup, PluginDialog, SidebarTab};
 use crate::config::Theme;
 use crate::git::ConflictBlock;
 use crate::lsp::LspServerState;
-use crate::terminal::{AnsiColor, TerminalStyle};
+use crate::terminal::{AnsiColor, CursorShape, TerminalStyle};
 use unicode_width::UnicodeWidthChar;
 
 static ACTIVE_THEME: OnceLock<RwLock<Theme>> = OnceLock::new();
@@ -248,10 +248,11 @@ pub fn handle_mouse(app: &mut App, event: MouseEvent, area: Rect) {
         if matches!(event.kind, MouseEventKind::Down(MouseButton::Left))
             && event.column >= popup.x
             && event.column < popup.right()
-            && event.row >= popup.bottom().saturating_sub(3)
+            && event.row >= popup.y
             && event.row < popup.bottom()
         {
-            if let Err(error) = app.plugin_dialog_button_click() {
+            let content_line = event.row.saturating_sub(popup.y.saturating_add(1)) as usize;
+            if let Err(error) = app.plugin_dialog_mouse_click(content_line) {
                 app.set_status_message(format!("Plugin dialog click failed: {error}"));
             }
         }
@@ -872,26 +873,32 @@ fn draw_center(frame: &mut Frame<'_>, area: Rect, app: &App) {
             } else {
                 theme.foreground
             };
+            let selection_modifier = if selected && app.selection_style_inverted() {
+                Modifier::REVERSED
+            } else {
+                Modifier::empty()
+            };
             let mut spans = vec![Span::styled(
                 line_number,
-                Style::default().fg(if chunk_index == 0 {
-                    match marker {
-                        "E" | "!" => theme.error,
-                        "O" => theme.positive,
-                        "T" => theme.warning,
-                        "B" => theme.accent,
-                        _ => theme.muted,
-                    }
-                } else {
-                    theme.muted
-                }),
+                Style::default()
+                    .fg(if chunk_index == 0 {
+                        match marker {
+                            "E" | "!" => theme.error,
+                            "O" => theme.positive,
+                            "T" => theme.warning,
+                            "B" => theme.accent,
+                            _ => theme.muted,
+                        }
+                    } else {
+                        theme.muted
+                    })
+                    .add_modifier(selection_modifier),
             )];
-            spans.extend(highlight_line(
-                &chunk,
-                app.language(),
-                foreground,
-                background,
-            ));
+            let mut highlighted = highlight_line(&chunk, app.language(), foreground, background);
+            for span in &mut highlighted {
+                span.style = span.style.add_modifier(selection_modifier);
+            }
+            spans.extend(highlighted);
             editor_lines.push(Line::from(spans));
             visual_row += 1;
         }
@@ -1002,6 +1009,7 @@ fn draw_center(frame: &mut Frame<'_>, area: Rect, app: &App) {
                     summary.join("\n")
                 ),
             ),
+            LspPopup::ConflictPreview { lines } => ("Three-way conflict", lines.join("\n")),
             LspPopup::Info(text) => ("Hover", text.clone()),
         };
         frame.render_widget(Clear, popup_area);
@@ -1084,6 +1092,14 @@ fn draw_center(frame: &mut Frame<'_>, area: Rect, app: &App) {
                     })
                     .collect::<Vec<_>>()
                     .join("\n")
+            } else if !app.plugin_registry_entries().is_empty() {
+                app.plugin_registry_entries()
+                    .iter()
+                    .skip(app.output_scroll())
+                    .take(8)
+                    .map(|entry| format!("{} {} · {}", entry.name, entry.version, entry.url))
+                    .collect::<Vec<_>>()
+                    .join("\n")
             } else if app.change_diff().is_empty() {
                 let logs = app.plugin_logs();
                 if logs.is_empty() {
@@ -1098,12 +1114,42 @@ fn draw_center(frame: &mut Frame<'_>, area: Rect, app: &App) {
                         .collect::<Vec<_>>()
                         .join("\n")
                 }
+            } else if !app.pull_request_comments().is_empty() {
+                app.pull_request_comments()
+                    .iter()
+                    .skip(app.output_scroll())
+                    .take(8)
+                    .map(|comment| {
+                        format!(
+                            "{}:{} {}: {}",
+                            comment.path,
+                            comment.line.unwrap_or_default(),
+                            comment
+                                .user
+                                .as_ref()
+                                .map_or("unknown", |user| user.login.as_str()),
+                            comment.body.replace('\n', " ")
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
             } else {
                 app.change_diff()
                     .iter()
                     .skip(app.output_scroll())
                     .take(8)
-                    .map(|line| format!("{}{}", line.kind, line.text))
+                    .map(|line| {
+                        if app.diff_split() {
+                            let (left, right) = match line.kind {
+                                '-' => (line.text.as_str(), ""),
+                                '+' => ("", line.text.as_str()),
+                                _ => (line.text.as_str(), line.text.as_str()),
+                            };
+                            format!("{left:<42} │ {right}")
+                        } else {
+                            format!("{}{}", line.kind, line.text)
+                        }
+                    })
                     .collect::<Vec<_>>()
                     .join("\n")
             };
@@ -1111,6 +1157,11 @@ fn draw_center(frame: &mut Frame<'_>, area: Rect, app: &App) {
         }
     };
     let mut bottom = bottom;
+    if app.pull_request_comment_mode() {
+        bottom
+            .lines
+            .push(Line::from(format!("Comment: {}", app.commit_message())));
+    }
     if let Some(panel_text) = app.plugin_bottom_panel_text() {
         bottom.lines.push(Line::from(Span::styled(
             "Plugin panel",
@@ -1121,11 +1172,26 @@ fn draw_center(frame: &mut Frame<'_>, area: Rect, app: &App) {
             .extend(panel_text.lines().map(|line| Line::from(line.to_owned())));
     }
     let bottom_title = if app.bottom_tab() == BottomTab::Terminal {
-        format!(
-            "Terminal {}/{} · Ctrl-Shift-T new · Ctrl-Alt-Left/Right switch",
-            app.active_terminal() + 1,
-            app.terminal_count()
-        )
+        let title = app.terminal_title();
+        let terminal_name = if title.is_empty() {
+            format!(
+                "Terminal {}/{}",
+                app.active_terminal() + 1,
+                app.terminal_count()
+            )
+        } else {
+            format!(
+                "{} ({}/{})",
+                title,
+                app.active_terminal() + 1,
+                app.terminal_count()
+            )
+        };
+        format!("{terminal_name} · Ctrl-Shift-T new · Ctrl-Alt-Left/Right switch")
+    } else if app.pull_request_comment_mode() {
+        "PR comment · Enter submit · Esc cancel".to_owned()
+    } else if app.diff_split() && !app.change_diff().is_empty() {
+        "Output · Git diff split · v unified".to_owned()
     } else {
         app.bottom_tab().label().to_owned()
     };
@@ -1401,6 +1467,9 @@ fn terminal_style(style: TerminalStyle) -> Style {
     if style.inverse {
         std::mem::swap(&mut foreground, &mut background);
     }
+    if style.conceal {
+        foreground = Some(background.unwrap_or(Color::Reset));
+    }
     let mut result = Style::default().fg(foreground.unwrap_or(Color::White));
     if let Some(background) = background {
         result = result.bg(background);
@@ -1408,7 +1477,25 @@ fn terminal_style(style: TerminalStyle) -> Style {
     if style.bold {
         result = result.add_modifier(Modifier::BOLD);
     }
+    if style.dim {
+        result = result.add_modifier(Modifier::DIM);
+    }
+    if style.italic {
+        result = result.add_modifier(Modifier::ITALIC);
+    }
+    if style.strikethrough {
+        result = result.add_modifier(Modifier::CROSSED_OUT);
+    }
+    if style.blink {
+        result = result.add_modifier(Modifier::SLOW_BLINK);
+    }
     if style.underline {
+        result = result.add_modifier(Modifier::UNDERLINED);
+    }
+    if matches!(
+        style.cursor_shape,
+        Some(CursorShape::Underline | CursorShape::Bar)
+    ) {
         result = result.add_modifier(Modifier::UNDERLINED);
     }
     result

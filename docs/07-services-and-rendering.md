@@ -24,9 +24,9 @@ Unified diff parser 必须接受 `@@ -4 +4 @@` 这类省略 count=1 的 hunk hea
 
 ## 4. PTY 与 VT
 
-PTY session 负责 spawn、resize、write bytes、read bytes、关闭。Rust 当前已接入 portable-pty，维持多个独立持久 shell tab、后台 reader channel、输入写入和 resize；Terminal 焦点下 `Ctrl-Shift-T` 创建 tab，`Ctrl-Alt-Left/Right` 切换 tab。Close 必须幂等且只执行一次，能处理命令退出后仍存活的 background jobs。VT parser 维护 cursor、application cursor key mode、attributes、alternate screen、scrollback、OSC/链接等状态，并按单元记录 OSC 8 超链接。终端未启用鼠标协议时，点击 `http://` 或 `https://` 链接可调用系统打开器；非 HTTP(S) 协议会被拒绝，启用终端鼠标协议的应用则优先接管鼠标事件。终端色彩允许直接 RGB；其他 widget 使用语义主题色。Ctrl+V 是否粘贴由配置决定。
+PTY session 负责 spawn、resize、write bytes、read bytes、关闭。Rust 当前已接入 portable-pty，维持多个独立持久 shell tab、后台 reader channel、输入写入和 resize；Terminal 焦点下 `Ctrl-Shift-T` 创建 tab，`Ctrl-Alt-Left/Right` 切换 tab。Close 必须幂等且只执行一次，能处理命令退出后仍存活的 background jobs。VT parser 维护 cursor、application cursor/keypad mode、attributes、alternate screen、scrollback、OSC/链接等状态，并按单元记录 OSC 8 超链接。终端未启用鼠标协议时，点击 `http://` 或 `https://` 链接可调用系统打开器；非 HTTP(S) 协议会被拒绝，启用终端鼠标协议的应用则优先接管鼠标事件。终端色彩允许直接 RGB；其他 widget 使用语义主题色。Ctrl+V 是否粘贴由配置决定。
 
-终端 focus 时实现 `RawKeyConsumer` 语义：一般输入转成 VT bytes；force keys（至少 terminal.toggle）优先由应用处理。PTY 输出事件唤醒主循环。
+终端 focus 时实现 `RawKeyConsumer` 语义：一般输入转成 VT bytes；force keys（至少 terminal.toggle）优先由应用处理。PTY 输出事件唤醒主循环。终端输出中的 OSC52 剪贴板内容会经过 64 KiB、Base64 和 UTF-8 校验后同步到 Host 内部剪贴板。
 
 ## 5. 渲染
 
