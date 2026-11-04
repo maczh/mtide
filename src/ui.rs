@@ -105,6 +105,39 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
     if app.plugin_command_line().is_some() {
         draw_plugin_command_line(frame, area, app);
     }
+    if app.git_credential_prompt().is_some() {
+        draw_git_credential_prompt(frame, area, app);
+    }
+}
+
+fn draw_git_credential_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let theme = active_theme();
+    let Some(prompt) = app.git_credential_prompt() else {
+        return;
+    };
+    let width = 60.min(area.width.saturating_sub(2)).max(30);
+    let height = 8.min(area.height).max(5);
+    let popup = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 3,
+        width,
+        height,
+    );
+    let username_marker = if prompt.password_focus { " " } else { "▶" };
+    let password_marker = if prompt.password_focus { "▶" } else { " " };
+    let password = "•".repeat(prompt.password.chars().count());
+    let text = format!(
+        "Operation: {}\n{} Username: {}\n{} Password: {}\n\nTab switch · Enter retry · Esc cancel",
+        prompt.operation, username_marker, prompt.username, password_marker, password
+    );
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(text)
+            .style(Style::default().fg(theme.foreground).bg(theme.panel))
+            .block(panel("Git credentials · memory only", true))
+            .wrap(Wrap { trim: false }),
+        popup,
+    );
 }
 
 fn draw_plugin_command_line(frame: &mut Frame<'_>, area: Rect, app: &App) {

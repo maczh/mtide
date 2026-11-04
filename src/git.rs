@@ -395,6 +395,44 @@ pub fn push(root: &Path) -> AppResult<()> {
     remote_action(root, ["push"])
 }
 
+pub fn remote_with_credentials(
+    root: &Path,
+    operation: &str,
+    username: &str,
+    password: &str,
+) -> AppResult<()> {
+    let args: &[&str] = match operation {
+        "fetch" => &["fetch", "--all", "--prune"],
+        "pull" => &["pull", "--ff-only"],
+        "push" => &["push"],
+        _ => {
+            return Err(AppError::Git(format!(
+                "unsupported remote operation: {operation}"
+            )))
+        }
+    };
+    let helper = "!f() { printf 'username=%s\\npassword=%s\\n' \"$MTIDE_GIT_USERNAME\" \"$MTIDE_GIT_PASSWORD\"; }; f";
+    let output = Command::new("git")
+        .arg("-c")
+        .arg(format!("credential.helper={helper}"))
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("MTIDE_GIT_USERNAME", username)
+        .env("MTIDE_GIT_PASSWORD", password)
+        .current_dir(root)
+        .output()?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let message = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        Err(AppError::Git(if message.is_empty() {
+            format!("git exited with {}", output.status)
+        } else {
+            message
+        }))
+    }
+}
+
 fn run_git<const N: usize>(root: &Path, args: [&str; N]) -> AppResult<()> {
     run_git_with_args(root, &args)
 }
@@ -569,6 +607,13 @@ mod tests {
     #[test]
     fn ignores_short_lines() {
         assert!(parse_status_line("M").is_none());
+    }
+
+    #[test]
+    fn rejects_unknown_credential_operation_before_spawning_git() {
+        let error = remote_with_credentials(Path::new("/missing"), "sync", "user", "secret")
+            .expect_err("unknown operation");
+        assert!(error.to_string().contains("unsupported remote operation"));
     }
 
     #[test]

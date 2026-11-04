@@ -34,7 +34,7 @@ mtide [options] [files|folders|urls...]
 
 近期兼容配置还包括 `reuseWindow`、`autoClosingBrackets`、`selectionStyle`/selection color invert、`wordWrapMaxColumn` 及按语言覆盖、`language` override、`saveAllOnQuit`、`terminal.ctrlV` 和 quick-open 的独立 hidden/gitignored visibility。启用 `saveAllOnQuit` 后退出会先保存所有 dirty 标签，任一保存失败则取消退出并保留错误状态。配置迁移必须保留未知字段并支持默认值。
 
-编辑器焦点下 `Ctrl-O` 打开 Open File 路径弹层；相对路径相对于当前工作区根目录，Enter 打开文件，Esc 取消。`Ctrl-Shift-S` 打开 Save As，保存到新路径后更新当前 tab，已有路径不会被覆盖；`Ctrl-G` 打开 Go to Line，输入 `line` 或 `line:column` 定位；检测到脏文件发生外部变更后，`Ctrl-Alt-R` 显式从磁盘重载并清空该标签撤销栈；`Ctrl-Alt-L` 循环当前 tab 的语言覆盖。`Ctrl-Alt-T` 在已加载主题间循环切换。LSP 快捷键包括 `Ctrl-Space` 补全、`Ctrl-H` 悬停、`Ctrl-Alt-S` 签名帮助、`Ctrl-D` 定义。
+编辑器焦点下 `Ctrl-O` 打开 Open File 路径弹层；相对路径相对于当前工作区根目录，Enter 打开文件，Esc 取消。`Ctrl-Shift-S` 打开 Save As，保存到新路径后更新当前 tab，已有路径不会被覆盖；`Ctrl-G` 打开 Go to Line，输入 `line` 或 `line:column` 定位；`Ctrl-Backspace`/`Ctrl-Delete` 删除光标前/后的一个词（必要时跨越行边界），选区存在时仍删除选区；检测到脏文件发生外部变更后，`Ctrl-Alt-R` 显式从磁盘重载并清空该标签撤销栈；`Ctrl-Alt-L` 循环当前 tab 的语言覆盖。`Ctrl-Alt-T` 在已加载主题间循环切换。LSP 快捷键包括 `Ctrl-Space` 补全、`Ctrl-H` 悬停、`Ctrl-Alt-S` 签名帮助、`Ctrl-D` 定义。
 
 终端包括 `terminal.shell`、`terminal.args`、`terminal.scrollback` 和 `terminal.ctrlV`；`ctrlV` 默认关闭，开启后将内部剪贴板发送到当前 PTY。搜索包括 `debounce`（原项目默认 350ms）。LSP 包括 enabled、hover、servers、saveOnRename、codeActionsOnSave、hoverDelay（默认 500ms）。Agent 当前支持 `agent.enabled`、兼容旧格式的 `agent.name`/`agent.command`/`agent.cwd`，以及 `agent.active` 和 `agent.providers` 多 Provider 配置；每个 Agent 使用独立 PTY。面板焦点下按 `[`/`]` 切换 Provider。自动补全默认启用，debounce 默认 150ms。
 

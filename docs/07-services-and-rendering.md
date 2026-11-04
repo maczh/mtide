@@ -16,7 +16,7 @@ Unified diff parser 必须接受 `@@ -4 +4 @@` 这类省略 count=1 的 hunk hea
 
 工作树 diff 使用只读 overlay；working-tree diff 绑定原 editor buffer，可编辑且 debounce 重算。staged、unstaged、untracked、renamed 等状态必须保留。
 
-当前实现保存文件后立即重新读取 Git status 和选中变更 diff，避免 Changes 面板停留在保存前状态；Changes 面板还提供受控的 commit、log、fetch、pull 和 push 操作，远程操作关闭交互式凭据提示并将失败反馈到状态栏。冲突状态会被明确标记，`o`/`t` 可分别检出 ours/theirs，随后用 `s` 暂存解决结果。仅已暂存修改会自动使用 `git diff --cached` 展示 staged diff。
+当前实现保存文件后立即重新读取 Git status 和选中变更 diff，避免 Changes 面板停留在保存前状态；Changes 面板还提供受控的 commit、log、fetch、pull 和 push 操作。远程操作在后台线程执行，结果由主循环接收；默认关闭交互式凭据提示，认证失败时由 TUI 提供内存凭据 overlay 和一次性重试。冲突状态会被明确标记，`o`/`t` 可分别检出 ours/theirs，随后用 `s` 暂存解决结果。仅已暂存修改会自动使用 `git diff --cached` 展示 staged diff。
 
 ## 3. 搜索与 watcher
 

@@ -1,7 +1,11 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-use std::{fs, path::Path};
+use std::{
+    fs,
+    path::Path,
+    sync::mpsc::{self, Receiver, Sender},
+};
 
 use crate::{
     config::{Settings, Theme},
@@ -13,8 +17,9 @@ use crate::{
         commit as git_commit, conflict_blocks, create_branch as git_create_branch,
         current_branch as git_branch, delete_branch as git_delete_branch, diff as git_diff,
         fetch as git_fetch, history as git_history, hunk_count as git_hunk_count, hunk_start_line,
-        pull as git_pull, push as git_push, stage as git_stage, status as git_status,
-        unstage as git_unstage, BlameLine, DiffLine, GitChange, GitCommit,
+        pull as git_pull, push as git_push, remote_with_credentials as git_remote_credentials,
+        stage as git_stage, status as git_status, unstage as git_unstage, BlameLine, DiffLine,
+        GitChange, GitCommit,
     },
     lsp::{LspManager, LspServerState},
     plugin::{
@@ -69,6 +74,20 @@ pub struct PluginCommandLine {
     pub id: u64,
     pub prefix: String,
     pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitCredentialPrompt {
+    pub operation: String,
+    pub username: String,
+    pub password: String,
+    pub password_focus: bool,
+}
+
+#[derive(Debug)]
+struct GitRemoteCompletion {
+    operation: String,
+    result: Result<(), String>,
 }
 impl Focus {
     pub const ALL: [Self; 8] = [
@@ -227,6 +246,10 @@ pub struct App {
     plugin_file_close: Option<(usize, u64)>,
     plugin_dialog: Option<PluginDialog>,
     plugin_command_line: Option<PluginCommandLine>,
+    git_credential_prompt: Option<GitCredentialPrompt>,
+    git_remote_rx: Receiver<GitRemoteCompletion>,
+    git_remote_tx: Sender<GitRemoteCompletion>,
+    git_remote_pending: Option<String>,
     lsp: LspManager,
     lsp_popup: Option<LspPopup>,
     rename_mode: bool,
@@ -447,6 +470,7 @@ impl App {
                 },
             )
         });
+        let (git_remote_tx, git_remote_rx) = mpsc::channel();
         let mut app = Self {
             focus: Focus::Editor,
             sidebar_tab: SidebarTab::Explorer,
@@ -506,6 +530,10 @@ impl App {
             plugin_file_close: None,
             plugin_dialog: None,
             plugin_command_line: None,
+            git_credential_prompt: None,
+            git_remote_rx,
+            git_remote_tx,
+            git_remote_pending: None,
             lsp,
             lsp_popup: None,
             rename_mode: false,
@@ -1045,6 +1073,16 @@ impl App {
         self.osc52_clipboard = Some(self.clipboard.clone());
     }
     pub fn poll_background(&mut self) {
+        while let Ok(completion) = self.git_remote_rx.try_recv() {
+            self.git_remote_pending = None;
+            match completion.result {
+                Ok(()) => {
+                    self.refresh_git_state();
+                    self.status_message = format!("Git {} completed", completion.operation);
+                }
+                Err(error) => self.handle_git_remote_failure(&completion.operation, &error),
+            }
+        }
         let mut active_reloaded = false;
         for index in 0..self.buffers.len() {
             let path = self.buffers[index].path().map(Path::to_path_buf);
@@ -1568,6 +1606,9 @@ impl App {
     pub fn plugin_command_line(&self) -> Option<&PluginCommandLine> {
         self.plugin_command_line.as_ref()
     }
+    pub fn git_credential_prompt(&self) -> Option<&GitCredentialPrompt> {
+        self.git_credential_prompt.as_ref()
+    }
     pub const fn settings_overlay_open(&self) -> bool {
         self.settings_overlay
     }
@@ -1959,6 +2000,10 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> AppResult<()> {
+        if self.git_credential_prompt.is_some() {
+            self.handle_git_credential_key(key);
+            return Ok(());
+        }
         if self.plugin_command_line.is_some() {
             self.handle_plugin_command_line_key(key)?;
             return Ok(());
@@ -2050,6 +2095,72 @@ impl App {
         }
         self.handle_navigation(key);
         Ok(())
+    }
+
+    fn handle_git_credential_key(&mut self, key: KeyEvent) {
+        match (key.modifiers, key.code) {
+            (KeyModifiers::NONE, KeyCode::Tab) => {
+                if let Some(prompt) = self.git_credential_prompt.as_mut() {
+                    prompt.password_focus = !prompt.password_focus;
+                }
+            }
+            (KeyModifiers::NONE, KeyCode::Backspace) => {
+                if let Some(prompt) = self.git_credential_prompt.as_mut() {
+                    if prompt.password_focus {
+                        prompt.password.pop();
+                    } else {
+                        prompt.username.pop();
+                    }
+                }
+            }
+            (KeyModifiers::NONE, KeyCode::Char(character)) => {
+                if let Some(prompt) = self.git_credential_prompt.as_mut() {
+                    if prompt.password_focus {
+                        prompt.password.push(character);
+                    } else {
+                        prompt.username.push(character);
+                    }
+                }
+            }
+            (KeyModifiers::NONE, KeyCode::Esc) => {
+                self.git_credential_prompt = None;
+                self.status_message = "Git authentication cancelled".to_owned();
+            }
+            (KeyModifiers::NONE, KeyCode::Enter) => {
+                let Some(prompt) = self.git_credential_prompt.clone() else {
+                    return;
+                };
+                if self.git_remote_pending.is_some() {
+                    return;
+                }
+                let root = self.search_root.clone();
+                let sender = self.git_remote_tx.clone();
+                let operation = prompt.operation.clone();
+                let username = prompt.username.clone();
+                let password = prompt.password.clone();
+                let worker_operation = operation.clone();
+                if std::thread::Builder::new()
+                    .name("mtide-git-remote-auth".to_owned())
+                    .spawn(move || {
+                        let result =
+                            git_remote_credentials(&root, &worker_operation, &username, &password)
+                                .map_err(|error| error.to_string());
+                        let _ = sender.send(GitRemoteCompletion {
+                            operation: worker_operation,
+                            result,
+                        });
+                    })
+                    .is_err()
+                {
+                    self.status_message = "Unable to start Git authentication retry".to_owned();
+                    return;
+                }
+                self.git_credential_prompt = None;
+                self.git_remote_pending = Some(operation.clone());
+                self.status_message = format!("Git {operation} retry running…");
+            }
+            _ => {}
+        }
     }
     fn open_quick_open(&mut self) {
         self.begin_overlay();
@@ -2384,6 +2495,8 @@ impl App {
                 KeyCode::Char('k'),
                 KeyModifiers::CONTROL | KeyModifiers::SHIFT,
             ),
+            "editor.deleteWordBackward" => KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL),
+            "editor.deleteWordForward" => KeyEvent::new(KeyCode::Delete, KeyModifiers::CONTROL),
             "editor.toggleComment" => KeyEvent::new(KeyCode::Char('/'), KeyModifiers::CONTROL),
             "view.toggleSidebar" => KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
             "view.toggleTerminal" => KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
@@ -2448,13 +2561,21 @@ impl App {
             "document.open" | "document.reload" | "document.save" => {
                 vec![PluginEventArg::Text(path.clone())]
             }
-            "tab.activate" | "tab.open" | "tab.close" | "editor.change" | "cursor.change" => {
+            "tab.activate" | "tab.open" | "tab.close" => {
                 vec![
                     PluginEventArg::Text(path.clone()),
                     PluginEventArg::Number(cursor.line + 1),
                     PluginEventArg::Number(cursor.column + 1),
                 ]
             }
+            "editor.change" | "cursor.change" => vec![
+                PluginEventArg::Text(path.clone()),
+                PluginEventArg::Number(cursor.line + 1),
+                PluginEventArg::Number(cursor.column + 1),
+                PluginEventArg::Text(snapshot.language.clone()),
+                PluginEventArg::Bool(snapshot.selection.is_some()),
+                PluginEventArg::Text(snapshot.selection_text.clone()),
+            ],
             _ => Vec::new(),
         };
         let event_names: Vec<&str> = match event {
@@ -3023,18 +3144,60 @@ impl App {
     }
 
     fn run_git_remote(&mut self, operation: &str) {
-        let result = match operation {
-            "fetch" => git_fetch(&self.search_root),
-            "pull" => git_pull(&self.search_root),
-            "push" => git_push(&self.search_root),
-            _ => return,
-        };
-        match result {
-            Ok(()) => {
-                self.refresh_git_state();
-                self.status_message = format!("Git {operation} completed");
-            }
-            Err(error) => self.status_message = format!("Git {operation} failed: {error}"),
+        if self.git_remote_pending.is_some() {
+            self.status_message = "A Git remote operation is already running".to_owned();
+            return;
+        }
+        if !matches!(operation, "fetch" | "pull" | "push") {
+            return;
+        }
+        let root = self.search_root.clone();
+        let operation = operation.to_owned();
+        let sender = self.git_remote_tx.clone();
+        let worker_operation = operation.clone();
+        if std::thread::Builder::new()
+            .name("mtide-git-remote".to_owned())
+            .spawn(move || {
+                let result = match worker_operation.as_str() {
+                    "fetch" => git_fetch(&root),
+                    "pull" => git_pull(&root),
+                    "push" => git_push(&root),
+                    _ => unreachable!("validated Git remote operation"),
+                }
+                .map_err(|error| error.to_string());
+                let _ = sender.send(GitRemoteCompletion {
+                    operation: worker_operation,
+                    result,
+                });
+            })
+            .is_err()
+        {
+            self.status_message = format!("Unable to start Git {operation}");
+            return;
+        }
+        self.git_remote_pending = Some(operation.clone());
+        self.status_message = format!("Git {operation} running…");
+    }
+
+    fn handle_git_remote_failure(&mut self, operation: &str, message: &str) {
+        let lower = message.to_ascii_lowercase();
+        if lower.contains("could not read username")
+            || lower.contains("authentication failed")
+            || lower.contains("authentication required")
+            || lower.contains("terminal prompts disabled")
+            || lower.contains("http 401")
+            || lower.contains("http 403")
+        {
+            self.git_credential_prompt = Some(GitCredentialPrompt {
+                operation: operation.to_owned(),
+                username: String::new(),
+                password: String::new(),
+                password_focus: false,
+            });
+            self.status_message =
+                "Git credentials · Tab password · Enter retry · Esc cancel".to_owned();
+        } else {
+            self.status_message = format!("Git {operation} failed: {message}");
         }
     }
     fn handle_branches_key(&mut self, key: KeyEvent) -> AppResult<()> {
@@ -4032,6 +4195,20 @@ impl App {
         }
         if key.modifiers == KeyModifiers::CONTROL {
             match key.code {
+                KeyCode::Backspace => {
+                    if self.selection_anchor.is_some() || !self.secondary_selections.is_empty() {
+                        self.replace_active_selections("");
+                    } else if self.secondary_cursors.is_empty() {
+                        self.buffer_mut().delete_word_backward();
+                    }
+                }
+                KeyCode::Delete => {
+                    if self.selection_anchor.is_some() || !self.secondary_selections.is_empty() {
+                        self.replace_active_selections("");
+                    } else if self.secondary_cursors.is_empty() {
+                        self.buffer_mut().delete_word_forward();
+                    }
+                }
                 KeyCode::Char('o') => {
                     self.open_quick_open();
                     return Ok(());
@@ -4182,6 +4359,7 @@ impl App {
         let modifies_document = matches!(
             (key.modifiers, key.code),
             (KeyModifiers::CONTROL, KeyCode::Char('s' | 'z' | 'y'))
+                | (KeyModifiers::CONTROL, KeyCode::Backspace | KeyCode::Delete)
                 | (KeyModifiers::NONE, KeyCode::Char(_))
                 | (KeyModifiers::NONE, KeyCode::Enter)
                 | (KeyModifiers::NONE, KeyCode::Backspace)
@@ -5722,6 +5900,8 @@ fn builtin_commands() -> Vec<(String, String)> {
         ("editor.splitSelectionLines", "Split Selection into Lines"),
         ("editor.duplicateLine", "Duplicate Line"),
         ("editor.deleteLine", "Delete Line"),
+        ("editor.deleteWordBackward", "Delete Word Backward"),
+        ("editor.deleteWordForward", "Delete Word Forward"),
         ("editor.toggleComment", "Toggle Comment"),
         ("view.toggleSidebar", "Toggle Sidebar"),
         ("view.toggleTerminal", "Toggle Terminal"),
@@ -6482,6 +6662,50 @@ mod tests {
         app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
             .expect("close plugin tab");
         assert!(app.plugin_file_view().is_none());
+    }
+
+    #[test]
+    fn git_credential_prompt_keeps_password_in_memory_and_masks_focus_flow() {
+        let mut app = App::new(&[]).expect("welcome app");
+        app.git_credential_prompt = Some(GitCredentialPrompt {
+            operation: "push".to_owned(),
+            username: String::new(),
+            password: String::new(),
+            password_focus: false,
+        });
+        app.handle_key(key(KeyCode::Char('u'), KeyModifiers::NONE))
+            .expect("username");
+        app.handle_key(key(KeyCode::Tab, KeyModifiers::NONE))
+            .expect("password focus");
+        for character in "secret".chars() {
+            app.handle_key(key(KeyCode::Char(character), KeyModifiers::NONE))
+                .expect("password");
+        }
+        let prompt = app.git_credential_prompt().expect("prompt");
+        assert_eq!(prompt.username, "u");
+        assert_eq!(prompt.password, "secret");
+        assert!(prompt.password_focus);
+        app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("cancel credentials");
+        assert!(app.git_credential_prompt().is_none());
+    }
+
+    #[test]
+    fn git_remote_operations_are_reaped_by_the_background_poll() {
+        let root = std::env::temp_dir().join(format!("mtide-git-worker-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("workspace");
+        let mut app = App::new(&[root.to_string_lossy().into_owned()]).expect("app");
+        app.run_git_remote("fetch");
+        assert_eq!(app.git_remote_pending.as_deref(), Some("fetch"));
+        for _ in 0..100 {
+            app.poll_background();
+            if app.git_remote_pending.is_none() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(app.git_remote_pending.is_none());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

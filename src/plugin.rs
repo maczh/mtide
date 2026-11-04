@@ -239,6 +239,7 @@ pub enum PluginEditorRequest {
 pub enum PluginEventArg {
     Text(String),
     Number(usize),
+    Bool(bool),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -482,6 +483,7 @@ enum SpawnEventKind {
     Stdout(String),
     Stderr(String),
     Exit(Option<i32>),
+    StreamClosed { stderr: bool },
 }
 
 #[derive(Debug)]
@@ -495,6 +497,9 @@ struct SpawnRegistration {
     on_stdout: Option<RegistryKey>,
     on_stderr: Option<RegistryKey>,
     on_exit: Option<RegistryKey>,
+    stdout_open: bool,
+    stderr_open: bool,
+    exited: bool,
 }
 
 #[derive(Debug)]
@@ -553,6 +558,10 @@ fn spawn_reader_thread<R: Read + Send + 'static>(
                 }
             }
         }
+        let _ = events.send(SpawnEvent {
+            id,
+            kind: SpawnEventKind::StreamClosed { stderr },
+        });
     });
 }
 
@@ -2614,14 +2623,6 @@ impl PluginRuntime {
                         .get::<Option<Function>>("on_exit")?
                         .map(|callback| lua.create_registry_value(callback))
                         .transpose()?;
-                    spawn_callbacks_sink.borrow_mut().insert(
-                        id,
-                        SpawnRegistration {
-                            on_stdout,
-                            on_stderr,
-                            on_exit,
-                        },
-                    );
                     let stdout = child
                         .lock()
                         .map_err(|_| mlua::Error::external("spawn child poisoned"))?
@@ -2632,6 +2633,19 @@ impl PluginRuntime {
                         .map_err(|_| mlua::Error::external("spawn child poisoned"))?
                         .stderr
                         .take();
+                    let stdout_open = stdout.is_some();
+                    let stderr_open = stderr.is_some();
+                    spawn_callbacks_sink.borrow_mut().insert(
+                        id,
+                        SpawnRegistration {
+                            on_stdout,
+                            on_stderr,
+                            on_exit,
+                            stdout_open,
+                            stderr_open,
+                            exited: false,
+                        },
+                    );
                     if let Some(stdout) = stdout {
                         spawn_reader_thread(id, stdout, spawn_events.clone(), false);
                     }
@@ -4393,6 +4407,7 @@ impl PluginRuntime {
                         LuaValue::String(self._lua.create_string(value).map_err(lua_error)?)
                     }
                     PluginEventArg::Number(value) => LuaValue::Integer(*value as i64),
+                    PluginEventArg::Bool(value) => LuaValue::Boolean(*value),
                 });
             }
             callback.call::<()>(arguments).map_err(lua_error)?;
@@ -4444,12 +4459,18 @@ impl PluginRuntime {
                     SpawnEventKind::Exit(_) => callbacks
                         .get(&event.id)
                         .and_then(|registration| registration.on_exit.as_ref()),
+                    SpawnEventKind::StreamClosed { .. } => None,
                 };
                 key.map(|key| self._lua.registry_value::<Function>(key))
                     .transpose()
                     .map_err(lua_error)?
             };
+            let is_stream_closed = matches!(&event.kind, SpawnEventKind::StreamClosed { .. });
             let is_exit = matches!(&event.kind, SpawnEventKind::Exit(_));
+            let stream_closed_stderr = match &event.kind {
+                SpawnEventKind::StreamClosed { stderr } => Some(*stderr),
+                _ => None,
+            };
             if let Some(callback) = callback {
                 match event.kind {
                     SpawnEventKind::Stdout(text) | SpawnEventKind::Stderr(text) => {
@@ -4464,10 +4485,33 @@ impl PluginRuntime {
                                 plugin_error(format!("spawn exit callback failed: {error}"))
                             })?;
                     }
+                    SpawnEventKind::StreamClosed { .. } => {}
                 }
             }
-            if is_exit {
-                self.spawn_callbacks.borrow_mut().remove(&event.id);
+            if is_stream_closed {
+                let mut callbacks = self.spawn_callbacks.borrow_mut();
+                let Some(registration) = callbacks.get_mut(&event.id) else {
+                    continue;
+                };
+                if let Some(stderr) = stream_closed_stderr {
+                    if stderr {
+                        registration.stderr_open = false;
+                    } else {
+                        registration.stdout_open = false;
+                    }
+                }
+                if registration.exited && !registration.stdout_open && !registration.stderr_open {
+                    callbacks.remove(&event.id);
+                }
+            } else if is_exit {
+                let mut callbacks = self.spawn_callbacks.borrow_mut();
+                let Some(registration) = callbacks.get_mut(&event.id) else {
+                    continue;
+                };
+                registration.exited = true;
+                if !registration.stdout_open && !registration.stderr_open {
+                    callbacks.remove(&event.id);
+                }
             }
             completed += 1;
         }
@@ -6104,8 +6148,9 @@ ttt.on("probe", function()
   assert(bookmarks.set_all({{line = 1, icon = "◆", style = "bookmark"}}) == true)
 end)
 events.on("probe", function() ttt.log("events-alias") end)
-events.on("payload", function(path, line, col)
+events.on("payload", function(path, line, col, language, selection_active, selection_text)
   assert(path == "/tmp/demo.rs" and line == 2 and col == 3)
+  assert(language == "rust" and selection_active == true and selection_text == "two")
   ttt.log("payload-ok")
 end)
 local timer = ttt.set_timeout(0, function() ttt.log("timer-ok") end)
@@ -6155,6 +6200,9 @@ end)
                     PluginEventArg::Text("/tmp/demo.rs".into()),
                     PluginEventArg::Number(2),
                     PluginEventArg::Number(3),
+                    PluginEventArg::Text("rust".into()),
+                    PluginEventArg::Bool(true),
+                    PluginEventArg::Text("two".into()),
                 ],
             )
             .expect("payload"));
@@ -6527,18 +6575,23 @@ assert(ttt.open_changes({id = "review", title = "Review", description = "summary
             r#"
 local ttt = require("ttt")
 local sys = require("ttt.system")
-local proc = sys.spawn({shell = "/bin/sh", args = {"-c", "printf spawned"}, on_stdout = function(chunk) ttt.log("out:" .. chunk) end, on_exit = function(code) ttt.log("exit:" .. code) end})
+local proc = sys.spawn({shell = "/bin/sh", args = {"-c", "printf spawned; printf warning >&2"}, on_stdout = function(chunk) ttt.log("out:" .. chunk) end, on_stderr = function(chunk) ttt.log("err:" .. chunk) end, on_exit = function(code) ttt.log("exit:" .. code) end})
 assert(proc:pid() > 0)
 assert(proc:close_stdin() == true)
+local input_proc = sys.spawn({shell = "/bin/sh", args = {"-c", "cat"}, on_stdout = function(chunk) ttt.log("in:" .. chunk) end})
+assert(input_proc:write("typed") == true)
+assert(input_proc:close_stdin() == true)
 "#,
         )
         .expect("script");
         let package = PluginPackage::load(&root).expect("package");
         let runtime = PluginRuntime::load(&package).expect("runtime");
-        for _ in 0..100 {
+        for _ in 0..1_000 {
             runtime.poll_async().expect("spawn poll");
             let logs = runtime.logs();
             if logs.iter().any(|line| line == "[info] out:spawned")
+                && logs.iter().any(|line| line == "[info] err:warning")
+                && logs.iter().any(|line| line == "[info] in:typed")
                 && logs.iter().any(|line| line == "[info] exit:0")
             {
                 break;
@@ -6549,6 +6602,11 @@ assert(proc:close_stdin() == true)
             .logs()
             .iter()
             .any(|line| line == "[info] out:spawned"));
+        assert!(runtime
+            .logs()
+            .iter()
+            .any(|line| line == "[info] err:warning"));
+        assert!(runtime.logs().iter().any(|line| line == "[info] in:typed"));
         assert!(runtime.logs().iter().any(|line| line == "[info] exit:0"));
     }
 

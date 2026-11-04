@@ -6,7 +6,7 @@
 2. [总体架构](02-architecture.md)：理解事件循环、分层、线程边界和渲染管线。
 3. [模块设计与 Rust 映射](03-module-design.md)：把 Go 包映射到 Rust crate/module。
 4. [领域模型与状态](04-domain-model.md)：实现工作区、文档、编辑器、Git、终端等状态机。
-5. 根据任务阅读 [CLI 与配置](05-cli-config.md)、[编辑器内核](06-editor-core.md)、[服务与渲染](07-services-and-rendering.md)、[插件与 Agent](08-plugin-and-agent.md)。
+5. 根据任务阅读 [CLI 与配置](05-cli-config.md)、[编辑器内核](06-editor-core.md)、[服务与渲染](07-services-and-rendering.md)、[插件与 Agent](08-plugin-and-agent.md)、[Git 远程凭据交互](15-git-credentials.md)。
 6. 开发前后遵守 [测试](09-testing.md) 与 [开发流程](11-development-workflow.md)。
 7. 每次同步上游前阅读 [上游功能与社区建议研究](13-upstream-research.md)。
 8. 开发过程中用 [当前实现状态](14-implementation-status.md) 区分已落地能力和规划能力。

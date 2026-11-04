@@ -14,7 +14,7 @@ Lua 模块通过 `require("ttt")` 注入，不假设全局变量。插件加载�
 
 声明 `editor.write` 后，插件可调用 `insert(line, col, text)`、`set_line(line, text)`、`replace(start_line, start_col, end_line, end_col, text)`、`set_cursor(line, col)`、`set_selection(...)`、`clear_selection()`、`add_cursor(line, col)` 和 `clear_cursors()`；`begin_undo_group()` / `end_undo_group()` 可将连续写入合并成一次撤销操作，并支持嵌套。写入调用进入 Host 编辑请求队列，在插件回调结束后应用，并复用 Buffer 的 undo checkpoint；非法或越界坐标会被安全限制到当前缓冲区范围。
 
-`require("ttt.events")` 提供与 `ttt.on(event, callback)` 等价的 `events.on(event, callback)` 注册入口。同一事件允许多个插件回调同时订阅，Host 按注册顺序依次触发，单个回调失败会终止当前事件派发并报告插件错误。文件/编辑器事件会附带活动路径及必要的 1-based 行列参数：打开/重载/保存事件传入 `path`，`editor.change`/`cursor.change` 传入 `path, line, col`；旧版忽略额外参数的无参回调保持兼容。
+`require("ttt.events")` 提供与 `ttt.on(event, callback)` 等价的 `events.on(event, callback)` 注册入口。同一事件允许多个插件回调同时订阅，Host 按注册顺序依次触发，单个回调失败会终止当前事件派发并报告插件错误。文件/编辑器事件会附带活动路径及必要的 1-based 行列参数：打开/重载/保存事件传入 `path`，`editor.change`/`cursor.change` 传入 `path, line, col, language, selection_active, selection_text`；旧版忽略额外参数的无参回调保持兼容。
 
 `require("ttt.diagnostics")` 提供 `publish(path, items)` 和 `clear([path])`，需要 `editor.diagnostics` 权限。每个 item 使用 1-based `line/col`，可选 `end_line/end_col`、`severity`（`error`/`warning`/`info`/`hint`）、`message` 和 `source`；重复发布会替换该插件在该文件上的诊断。Host 将插件诊断与 LSP 诊断合并显示，插件禁用或重载时其运行时状态自然清空。
 

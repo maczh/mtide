@@ -506,6 +506,84 @@ impl Buffer {
         result
     }
 
+    /// Deletes the word immediately before the cursor, including the
+    /// whitespace separating it from the previous word.  The operation uses
+    /// rune columns and therefore remains safe for UTF-8 text.
+    pub fn delete_word_backward(&mut self) {
+        if self.readonly {
+            return;
+        }
+        let cursor = self.cursor;
+        if cursor.column == 0 && cursor.line == 0 {
+            return;
+        }
+        let start = if cursor.column > 0 {
+            let characters: Vec<char> = self.lines[cursor.line].chars().collect();
+            let mut column = cursor.column.min(characters.len());
+            while column > 0 && characters[column - 1].is_whitespace() {
+                column -= 1;
+            }
+            while column > 0 && !characters[column - 1].is_whitespace() {
+                column -= 1;
+            }
+            Position {
+                line: cursor.line,
+                column,
+            }
+        } else {
+            let previous_line = cursor.line - 1;
+            let characters: Vec<char> = self.lines[previous_line].chars().collect();
+            let mut column = characters.len();
+            while column > 0 && characters[column - 1].is_whitespace() {
+                column -= 1;
+            }
+            while column > 0 && !characters[column - 1].is_whitespace() {
+                column -= 1;
+            }
+            Position {
+                line: previous_line,
+                column,
+            }
+        };
+        self.delete_between(start, cursor);
+    }
+
+    /// Deletes the word immediately after the cursor, including the
+    /// separating whitespace.  At the end of a line it also removes the line
+    /// break so the next line is joined naturally.
+    pub fn delete_word_forward(&mut self) {
+        if self.readonly {
+            return;
+        }
+        let cursor = self.cursor;
+        let line = &self.lines[cursor.line];
+        let characters: Vec<char> = line.chars().collect();
+        if cursor.column < characters.len() {
+            let mut column = cursor.column;
+            while column < characters.len() && characters[column].is_whitespace() {
+                column += 1;
+            }
+            while column < characters.len() && !characters[column].is_whitespace() {
+                column += 1;
+            }
+            self.delete_between(
+                cursor,
+                Position {
+                    line: cursor.line,
+                    column,
+                },
+            );
+        } else if cursor.line + 1 < self.lines.len() {
+            self.delete_between(
+                cursor,
+                Position {
+                    line: cursor.line + 1,
+                    column: 0,
+                },
+            );
+        }
+    }
+
     pub fn backspace(&mut self) {
         if self.readonly {
             return;
@@ -1067,6 +1145,35 @@ mod tests {
         assert_eq!(b.lines(), &["  value", "  value"]);
         b.delete_line();
         assert_eq!(b.lines(), &["  value"]);
+    }
+
+    #[test]
+    fn word_deletion_is_unicode_safe_and_single_undoable_operation() {
+        let mut backward = Buffer::new(vec!["你好  world".into(), "next line".into()], None);
+        backward.set_cursor(0, 9);
+        backward.delete_word_backward();
+        assert_eq!(
+            backward.lines(),
+            &["你好  ".to_owned(), "next line".to_owned()]
+        );
+        assert_eq!(backward.cursor(), Position { line: 0, column: 4 });
+        backward.undo();
+        assert_eq!(
+            backward.lines(),
+            &["你好  world".to_owned(), "next line".to_owned()]
+        );
+
+        backward.set_cursor(1, 0);
+        backward.delete_word_backward();
+        assert_eq!(backward.lines(), &["你好  next line".to_owned()]);
+
+        let mut forward = Buffer::new(vec!["你好  world".into(), "next".into()], None);
+        forward.set_cursor(0, 3);
+        forward.delete_word_forward();
+        assert_eq!(forward.lines(), &["你好 ".to_owned(), "next".to_owned()]);
+        forward.set_cursor(0, 3);
+        forward.delete_word_forward();
+        assert_eq!(forward.lines(), &["你好 next".to_owned()]);
     }
 
     #[test]
