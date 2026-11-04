@@ -12,6 +12,7 @@ use crate::app::{App, BottomTab, Focus, LspPopup, PluginDialog, SidebarTab};
 use crate::config::Theme;
 use crate::git::ConflictBlock;
 use crate::lsp::LspServerState;
+use crate::plugin::PluginPanelLocation;
 use crate::terminal::{AnsiColor, CursorShape, TerminalStyle};
 use unicode_width::UnicodeWidthChar;
 
@@ -69,6 +70,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
 
     if area.width < 50 || area.height < 10 {
         draw_small(frame, app, area);
+        draw_overlays(frame, area, app);
         return;
     }
 
@@ -83,6 +85,10 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
     draw_menu(frame, vertical[0], app);
     draw_main(frame, vertical[1], app);
     draw_status(frame, vertical[2], app);
+    draw_overlays(frame, area, app);
+}
+
+fn draw_overlays(frame: &mut Frame<'_>, area: Rect, app: &App) {
     draw_plugin_drawer(frame, area, app);
     if app.plugin_palette_open() {
         draw_plugin_palette(frame, area, app);
@@ -101,6 +107,9 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
     }
     if app.plugin_dialog().is_some() {
         draw_plugin_dialog(frame, area, app);
+    }
+    if app.plugin_context_menu().is_some() {
+        draw_plugin_context_menu(frame, area, app);
     }
     if app.plugin_command_line().is_some() {
         draw_plugin_command_line(frame, area, app);
@@ -194,6 +203,57 @@ fn draw_plugin_dialog(frame: &mut Frame<'_>, area: Rect, app: &App) {
     );
 }
 
+fn plugin_context_menu_rect(area: Rect, app: &App) -> Option<Rect> {
+    let menu = app.plugin_context_menu()?;
+    let max_label_width = menu
+        .items
+        .iter()
+        .map(|item| {
+            item.chars()
+                .map(|ch| ch.width().unwrap_or(1))
+                .sum::<usize>()
+        })
+        .max()
+        .unwrap_or(10);
+    let requested_width = (max_label_width as u16).saturating_add(6);
+    let width = requested_width.min(area.width.saturating_sub(2)).max(1);
+    let requested_height = (menu.items.len() as u16).saturating_add(2);
+    let height = requested_height.min(area.height.saturating_sub(2)).max(1);
+    Some(Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    ))
+}
+
+fn draw_plugin_context_menu(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let theme = active_theme();
+    let Some(menu) = app.plugin_context_menu() else {
+        return;
+    };
+    let Some(popup) = plugin_context_menu_rect(area, app) else {
+        return;
+    };
+    let lines = menu
+        .items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            let marker = if index == menu.selected { "▶" } else { " " };
+            format!("{marker} {item}")
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines.join("\n"))
+            .style(Style::default().fg(theme.foreground).bg(theme.panel))
+            .block(panel("Plugin Context Menu", true))
+            .wrap(Wrap { trim: true }),
+        popup,
+    );
+}
+
 fn plugin_dialog_rect(area: Rect, app: &App) -> Option<Rect> {
     app.plugin_dialog()?;
     let (requested_width, requested_height) = match app.plugin_dialog() {
@@ -212,24 +272,18 @@ fn plugin_dialog_rect(area: Rect, app: &App) -> Option<Rect> {
 
 fn draw_plugin_drawer(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let theme = active_theme();
-    let Some((side, requested_width, min_width, text)) = app.plugin_drawer() else {
+    let Some((side, requested_width, min_width, _)) = app.plugin_drawer() else {
         return;
     };
-    let max_width = area.width.saturating_sub(4);
-    if max_width == 0 || area.height < 4 {
+    let Some(drawer) = plugin_drawer_rect(area, side, requested_width, min_width) else {
         return;
-    }
-    let width = requested_width.max(min_width).min(max_width).max(1);
-    let drawer = Rect::new(
-        if side == "left" {
-            1
-        } else {
-            area.right().saturating_sub(width + 1)
-        },
-        1,
-        width,
-        area.height.saturating_sub(2),
-    );
+    };
+    let text = app
+        .plugin_drawer_text_sized(
+            drawer.width.saturating_sub(2),
+            drawer.height.saturating_sub(2),
+        )
+        .unwrap_or_default();
     frame.render_widget(Clear, drawer);
     frame.render_widget(
         Paragraph::new(text)
@@ -240,7 +294,57 @@ fn draw_plugin_drawer(frame: &mut Frame<'_>, area: Rect, app: &App) {
     );
 }
 
+fn plugin_drawer_rect(
+    area: Rect,
+    side: &str,
+    requested_width: u16,
+    min_width: u16,
+) -> Option<Rect> {
+    let max_width = area.width.saturating_sub(4);
+    if max_width == 0 || area.height < 4 {
+        return None;
+    }
+    let width = requested_width.max(min_width).min(max_width).max(1);
+    Some(Rect::new(
+        if side == "left" {
+            1
+        } else {
+            area.right().saturating_sub(width + 1)
+        },
+        1,
+        width,
+        area.height.saturating_sub(2),
+    ))
+}
+
 pub fn handle_mouse(app: &mut App, event: MouseEvent, area: Rect) {
+    if app.plugin_context_menu().is_some() {
+        let Some(popup) = plugin_context_menu_rect(area, app) else {
+            return;
+        };
+        let inside = event.column >= popup.x
+            && event.column < popup.right()
+            && event.row >= popup.y
+            && event.row < popup.bottom();
+        let selected_line =
+            inside.then(|| event.row.saturating_sub(popup.y.saturating_add(1)) as usize);
+        match event.kind {
+            MouseEventKind::Down(MouseButton::Left) if inside => {
+                if let Some(line) = selected_line {
+                    if let Err(error) = app.plugin_context_menu_click(line) {
+                        app.set_status_message(format!(
+                            "Plugin context menu click failed: {error}"
+                        ));
+                    }
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Down(MouseButton::Right) => {
+                app.close_plugin_context_menu()
+            }
+            _ => {}
+        }
+        return;
+    }
     if app.plugin_dialog().is_some() {
         let Some(popup) = plugin_dialog_rect(area, app) else {
             return;
@@ -257,6 +361,40 @@ pub fn handle_mouse(app: &mut App, event: MouseEvent, area: Rect) {
             }
         }
         return;
+    }
+    let drawer_hit = app
+        .plugin_drawer()
+        .and_then(|(side, requested_width, min_width, _)| {
+            plugin_drawer_rect(area, side, requested_width, min_width)
+        });
+    if let Some(drawer) = drawer_hit {
+        let inside = event.column >= drawer.x
+            && event.column < drawer.right()
+            && event.row >= drawer.y
+            && event.row < drawer.bottom();
+        if inside {
+            if matches!(event.kind, MouseEventKind::Down(MouseButton::Left)) {
+                let line = event.row.saturating_sub(drawer.y.saturating_add(1)) as usize;
+                if !app.focus_plugin_drawer_line(line) {
+                    if let Err(error) = app.activate_plugin_drawer_line(line) {
+                        app.set_status_message(format!("Plugin drawer click failed: {error}"));
+                    }
+                }
+            }
+            return;
+        }
+    }
+    if matches!(event.kind, MouseEventKind::Down(MouseButton::Left))
+        && event.row == area.bottom().saturating_sub(1)
+    {
+        match app.activate_plugin_status_at(event.column) {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(error) => {
+                app.set_status_message(format!("Plugin status click failed: {error}"));
+                return;
+            }
+        }
     }
     if let Some(index) = menu_hit(area, event.column, event.row) {
         if matches!(event.kind, MouseEventKind::Down(MouseButton::Left)) {
@@ -280,6 +418,39 @@ pub fn handle_mouse(app: &mut App, event: MouseEvent, area: Rect) {
                 .constraints([Constraint::Length(2), Constraint::Min(3), bottom_height])
                 .split(sidebar);
             let body = parts[1];
+            let body_line = event.row.saturating_sub(body.y.saturating_add(1)) as usize;
+            if app.sidebar_tab() != SidebarTab::Explorer {
+                let button = mouse_event_button(event.kind);
+                let x = event.column.saturating_sub(body.x.saturating_add(1));
+                let y = body_line as u16;
+                match app.emit_plugin_panel_mouse(PluginPanelLocation::Sidebar, x, y, button) {
+                    Ok(true) => return,
+                    Ok(false) => {}
+                    Err(error) => {
+                        app.set_status_message(format!("Plugin sidebar mouse failed: {error}"))
+                    }
+                }
+            }
+            if matches!(event.kind, MouseEventKind::Down(MouseButton::Left))
+                && app.sidebar_tab() != SidebarTab::Explorer
+            {
+                if let Some(start) = app.plugin_panel_line_start(PluginPanelLocation::Sidebar) {
+                    if body_line >= start {
+                        match app.activate_plugin_panel_selection(
+                            PluginPanelLocation::Sidebar,
+                            body_line.saturating_sub(start),
+                        ) {
+                            Ok(true) => return,
+                            Ok(false) => {}
+                            Err(error) => {
+                                app.set_status_message(format!(
+                                    "Plugin sidebar selection failed: {error}"
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
             if event.row < body.y {
                 if !matches!(event.kind, MouseEventKind::Down(MouseButton::Left)) {
                     return;
@@ -318,6 +489,39 @@ pub fn handle_mouse(app: &mut App, event: MouseEvent, area: Rect) {
             && event.row >= bottom.y
             && event.row < bottom.bottom()
         {
+            if app.bottom_tab() == crate::app::BottomTab::Output
+                && matches!(event.kind, MouseEventKind::Down(MouseButton::Left))
+            {
+                let line = event.row.saturating_sub(bottom.y.saturating_add(1)) as usize;
+                if let Some(start) = app.plugin_panel_line_start(PluginPanelLocation::Bottom) {
+                    if line >= start {
+                        match app.activate_plugin_panel_selection(
+                            PluginPanelLocation::Bottom,
+                            line.saturating_sub(start),
+                        ) {
+                            Ok(true) => return,
+                            Ok(false) => {}
+                            Err(error) => {
+                                app.set_status_message(format!(
+                                    "Plugin bottom selection failed: {error}"
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+            if app.bottom_tab() == crate::app::BottomTab::Output {
+                let button = mouse_event_button(event.kind);
+                let x = event.column.saturating_sub(bottom.x.saturating_add(1));
+                let y = event.row.saturating_sub(bottom.y.saturating_add(1));
+                match app.emit_plugin_panel_mouse(PluginPanelLocation::Bottom, x, y, button) {
+                    Ok(true) => return,
+                    Ok(false) => {}
+                    Err(error) => {
+                        app.set_status_message(format!("Plugin bottom mouse failed: {error}"))
+                    }
+                }
+            }
             app.set_focus(if app.bottom_tab() == crate::app::BottomTab::Output {
                 Focus::Output
             } else {
@@ -383,8 +587,66 @@ pub fn handle_mouse(app: &mut App, event: MouseEvent, area: Rect) {
         }
         return;
     }
+    if (app.plugin_custom_tab_active() || app.plugin_file_view().is_some())
+        && app.focus() == Focus::Editor
+    {
+        if let Some(editor) = editor_content_area(app, area) {
+            if event.column >= editor.x
+                && event.column < editor.right()
+                && event.row >= editor.y
+                && event.row < editor.bottom()
+            {
+                let x = event.column.saturating_sub(editor.x);
+                let y = event.row.saturating_sub(editor.y);
+                let button = mouse_event_button(event.kind);
+                let handled = if app.plugin_custom_tab_active() {
+                    app.emit_plugin_tab_mouse(x, y, button)
+                } else {
+                    app.emit_plugin_file_mouse(x, y, button)
+                };
+                match handled {
+                    Ok(true) => return,
+                    Ok(false) => {}
+                    Err(error) => {
+                        app.set_status_message(format!("Plugin tab mouse failed: {error}"))
+                    }
+                }
+            }
+        }
+    }
+    if matches!(event.kind, MouseEventKind::Down(MouseButton::Left)) {
+        if let Some(line) = editor_gutter_line(app, area, event.column, event.row) {
+            match app.emit_plugin_gutter_click(line) {
+                Ok(true) => return,
+                Ok(false) => {}
+                Err(error) => {
+                    app.set_status_message(format!("Plugin gutter event failed: {error}"))
+                }
+            }
+        }
+    }
     let position = editor_mouse_position(app, area, event.column, event.row);
     match event.kind {
+        MouseEventKind::ScrollUp => {
+            if event
+                .modifiers
+                .contains(crossterm::event::KeyModifiers::SHIFT)
+            {
+                app.scroll_editor_horizontal(-4);
+            } else {
+                app.scroll_editor(-3);
+            }
+        }
+        MouseEventKind::ScrollDown => {
+            if event
+                .modifiers
+                .contains(crossterm::event::KeyModifiers::SHIFT)
+            {
+                app.scroll_editor_horizontal(4);
+            } else {
+                app.scroll_editor(3);
+            }
+        }
         MouseEventKind::Down(MouseButton::Left) => {
             if let Some(position) = position {
                 if app.column_selection_active()
@@ -427,7 +689,33 @@ pub fn handle_mouse(app: &mut App, event: MouseEvent, area: Rect) {
             }
         }
         MouseEventKind::Up(MouseButton::Left) => app.mouse_up(),
+        MouseEventKind::Down(MouseButton::Right) => {
+            if let Some(position) = position {
+                if let Err(error) = app.open_plugin_context_menu(position) {
+                    app.set_status_message(format!("Plugin context menu failed: {error}"));
+                }
+            }
+        }
         _ => {}
+    }
+}
+
+fn mouse_event_button(kind: MouseEventKind) -> &'static str {
+    match kind {
+        MouseEventKind::Down(MouseButton::Left)
+        | MouseEventKind::Up(MouseButton::Left)
+        | MouseEventKind::Drag(MouseButton::Left) => "left",
+        MouseEventKind::Down(MouseButton::Right)
+        | MouseEventKind::Up(MouseButton::Right)
+        | MouseEventKind::Drag(MouseButton::Right) => "right",
+        MouseEventKind::Down(MouseButton::Middle)
+        | MouseEventKind::Up(MouseButton::Middle)
+        | MouseEventKind::Drag(MouseButton::Middle) => "middle",
+        MouseEventKind::ScrollUp => "wheel_up",
+        MouseEventKind::ScrollDown => "wheel_down",
+        MouseEventKind::ScrollLeft => "wheel_left",
+        MouseEventKind::ScrollRight => "wheel_right",
+        MouseEventKind::Moved => "none",
     }
 }
 
@@ -480,6 +768,9 @@ fn terminal_area(app: &App, area: Rect) -> Option<Rect> {
             Constraint::Length(1),
         ])
         .split(area)[1];
+    if app.terminal_fullscreen() {
+        return Some(main);
+    }
     let mut horizontal = Vec::new();
     if app.sidebar_visible() {
         horizontal.push(Constraint::Length(app.sidebar_width()));
@@ -537,7 +828,33 @@ fn editor_mouse_position(
     column: u16,
     row: u16,
 ) -> Option<crate::core::Position> {
-    if area.width < 50 || area.height < 10 {
+    let editor = editor_content_area(app, area)?;
+    if column < editor.x.saturating_add(7)
+        || column >= editor.right()
+        || row <= editor.y
+        || row >= editor.bottom()
+    {
+        return None;
+    }
+    let content_width = editor.width.saturating_sub(8) as usize;
+    let scroll_x = app.horizontal_scroll().max(
+        app.cursor()
+            .column
+            .saturating_sub(content_width.saturating_sub(1)),
+    );
+    let scroll_y = app
+        .cursor()
+        .line
+        .saturating_sub(editor.height.saturating_sub(3) as usize);
+    let line = (scroll_y + row.saturating_sub(editor.y + 1) as usize)
+        .min(app.file_lines().len().saturating_sub(1));
+    let column = (scroll_x + column.saturating_sub(editor.x + 7) as usize)
+        .min(app.file_lines()[line].chars().count());
+    Some(crate::core::Position { line, column })
+}
+
+fn editor_content_area(app: &App, area: Rect) -> Option<Rect> {
+    if area.width < 50 || area.height < 10 || app.terminal_fullscreen() {
         return None;
     }
     let main = Layout::default()
@@ -571,32 +888,27 @@ fn editor_mouse_position(
     } else {
         vec![Constraint::Length(2), Constraint::Min(3)]
     };
-    let editor = Layout::default()
+    Layout::default()
         .direction(Direction::Vertical)
         .constraints(center_constraints)
-        .split(center)[1];
-    if column < editor.x.saturating_add(7)
-        || column >= editor.right()
-        || row <= editor.y
-        || row >= editor.bottom()
-    {
+        .split(center)
+        .get(1)
+        .copied()
+}
+
+fn editor_gutter_line(app: &App, area: Rect, column: u16, row: u16) -> Option<usize> {
+    let editor = editor_content_area(app, area)?;
+    if column != editor.x || row <= editor.y || row >= editor.bottom() {
         return None;
     }
-    let content_width = editor.width.saturating_sub(8) as usize;
-    let scroll_x = app.horizontal_scroll().max(
-        app.cursor()
-            .column
-            .saturating_sub(content_width.saturating_sub(1)),
-    );
     let scroll_y = app
         .cursor()
         .line
         .saturating_sub(editor.height.saturating_sub(3) as usize);
-    let line = (scroll_y + row.saturating_sub(editor.y + 1) as usize)
-        .min(app.file_lines().len().saturating_sub(1));
-    let column = (scroll_x + column.saturating_sub(editor.x + 7) as usize)
-        .min(app.file_lines()[line].chars().count());
-    Some(crate::core::Position { line, column })
+    Some(
+        (scroll_y + row.saturating_sub(editor.y + 1) as usize)
+            .min(app.file_lines().len().saturating_sub(1)),
+    )
 }
 
 fn draw_menu(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -670,6 +982,7 @@ fn draw_main(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn draw_sidebar(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    app.set_plugin_panel_line_start(PluginPanelLocation::Sidebar, None);
     let theme = active_theme();
     let bottom_height = if app.sidebar_tab() == SidebarTab::Explorer {
         Constraint::Length(0)
@@ -726,6 +1039,14 @@ fn draw_sidebar(frame: &mut Frame<'_>, area: Rect, app: &App) {
         sidebar_text.lines.push(Line::from(Span::styled(
             format!("Search: {}", app.search_query()),
             Style::default().fg(theme.foreground),
+        )));
+        sidebar_text.lines.push(Line::from(Span::styled(
+            if app.search_regex() {
+                "Mode: Regex · Ctrl-Alt-R to switch"
+            } else {
+                "Mode: Smart-case · Ctrl-Alt-R for regex"
+            },
+            Style::default().fg(theme.muted),
         )));
         if app.replace_mode() {
             sidebar_text.lines.push(Line::from(Span::styled(
@@ -867,7 +1188,16 @@ fn draw_sidebar(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Style::default().fg(theme.muted),
         )));
     }
-    if let Some(panel_text) = app.plugin_panel_text() {
+    let sidebar_panel_area = vertical[1];
+    if let Some(panel_text) = app.plugin_panel_text_sized(
+        PluginPanelLocation::Sidebar,
+        sidebar_panel_area.width.saturating_sub(2),
+        sidebar_panel_area.height.saturating_sub(2),
+    ) {
+        app.set_plugin_panel_line_start(
+            PluginPanelLocation::Sidebar,
+            Some(sidebar_text.lines.len() + 1),
+        );
         sidebar_text.lines.push(Line::from(Span::styled(
             "Plugin panel",
             Style::default().fg(theme.positive),
@@ -896,6 +1226,11 @@ fn draw_sidebar(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn draw_center(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    app.set_plugin_panel_line_start(PluginPanelLocation::Bottom, None);
+    if app.terminal_fullscreen() {
+        draw_terminal_fullscreen(frame, area, app);
+        return;
+    }
     let theme = active_theme();
     let constraints = if app.bottom_visible() {
         vec![
@@ -910,6 +1245,7 @@ fn draw_center(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .direction(Direction::Vertical)
         .constraints(constraints)
         .split(area);
+    app.set_editor_viewport_height(vertical[1].height.saturating_sub(2) as usize);
     let tabs = Tabs::new(app.tab_titles())
         .select(app.active_tab())
         .block(
@@ -1027,7 +1363,15 @@ fn draw_center(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let natural_scroll_y =
         cursor_visual_row.saturating_sub(vertical[1].height.saturating_sub(3) as usize);
     let scroll_y = app.editor_scroll_line().unwrap_or(natural_scroll_y);
-    let editor = if let Some((_, text)) = app.plugin_file_view() {
+    let plugin_text = if app.plugin_custom_tab_active() {
+        app.plugin_file_view_text_sized(
+            vertical[1].width.saturating_sub(2),
+            vertical[1].height.saturating_sub(2),
+        )
+    } else {
+        app.plugin_file_view().map(|(_, text)| text.to_owned())
+    };
+    let editor = if let Some(text) = plugin_text {
         Paragraph::new(text.to_owned())
             .block(panel(
                 plugin_title.as_deref().unwrap_or("Plugin"),
@@ -1079,9 +1423,9 @@ fn draw_center(frame: &mut Frame<'_>, area: Rect, app: &App) {
                     .enumerate()
                     .map(|(index, item)| {
                         if index == *selected {
-                            format!("▶ {item}")
+                            format!("▶ {}", item.label)
                         } else {
-                            format!("  {item}")
+                            format!("  {}", item.label)
                         }
                     })
                     .collect::<Vec<_>>()
@@ -1116,6 +1460,23 @@ fn draw_center(frame: &mut Frame<'_>, area: Rect, app: &App) {
                     .map(|(index, (path, line, column))| {
                         let marker = if index == *selected { "▶" } else { " " };
                         format!("{marker} {}:{}:{}", path.display(), line + 1, column + 1)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+            LspPopup::Symbols { items, selected } => (
+                "Document symbols",
+                items
+                    .iter()
+                    .enumerate()
+                    .map(|(index, (name, path, line, column))| {
+                        let marker = if index == *selected { "▶" } else { " " };
+                        format!(
+                            "{marker} {name} · {}:{}:{}",
+                            path.display(),
+                            line + 1,
+                            column + 1
+                        )
                     })
                     .collect::<Vec<_>>()
                     .join("\n"),
@@ -1280,7 +1641,12 @@ fn draw_center(frame: &mut Frame<'_>, area: Rect, app: &App) {
             .lines
             .push(Line::from(format!("Comment: {}", app.commit_message())));
     }
-    if let Some(panel_text) = app.plugin_bottom_panel_text() {
+    if let Some(panel_text) = app.plugin_panel_text_sized(
+        PluginPanelLocation::Bottom,
+        area.width.saturating_sub(2),
+        area.height.saturating_sub(2),
+    ) {
+        app.set_plugin_panel_line_start(PluginPanelLocation::Bottom, Some(bottom.lines.len() + 1));
         bottom.lines.push(Line::from(Span::styled(
             "Plugin panel",
             Style::default().fg(theme.positive),
@@ -1321,6 +1687,28 @@ fn draw_center(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 app.focus() == Focus::Terminal || app.focus() == Focus::Output,
             )),
         vertical[2],
+    );
+}
+
+fn draw_terminal_fullscreen(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let theme = active_theme();
+    let mut text = Text::default();
+    for row in app.terminal_screen_styled_lines() {
+        text.lines.push(Line::from(
+            row.into_iter()
+                .map(|(character, style)| {
+                    Span::styled(character.to_string(), terminal_style(style))
+                })
+                .collect::<Vec<_>>(),
+        ));
+    }
+    text.lines
+        .push(Line::from(format!("❯ {}", app.terminal_input())));
+    frame.render_widget(
+        Paragraph::new(text)
+            .style(Style::default().fg(theme.foreground).bg(theme.background))
+            .block(panel("Terminal fullscreen · Alt-T restore", true)),
+        area,
     );
 }
 
@@ -1829,31 +2217,71 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .diagnostic_message(cursor.line)
         .map(|message| format!(" · {message}"))
         .unwrap_or_default();
-    let (plugin_left, plugin_right) = app.plugin_status_items_by_side();
-    let plugin_left = plugin_left.join(" · ");
-    let plugin_right = plugin_right.join(" · ");
-    let plugin_left = if plugin_left.is_empty() {
+    let (plugin_left_items, plugin_right_items) = app.plugin_status_items_detailed();
+    let plugin_left = plugin_left_items
+        .iter()
+        .map(|(_, _, text)| text.as_str())
+        .collect::<Vec<_>>()
+        .join(" · ");
+    let plugin_right = plugin_right_items
+        .iter()
+        .map(|(_, _, text)| text.as_str())
+        .collect::<Vec<_>>()
+        .join(" · ");
+    let plugin_left_suffix = if plugin_left.is_empty() {
         String::new()
     } else {
         format!(" · {plugin_left}")
     };
-    let plugin_right = if plugin_right.is_empty() {
+    let plugin_right_suffix = if plugin_right.is_empty() {
         String::new()
     } else {
         format!(" · {plugin_right}")
     };
     let text = format!(
-        " {}{}{}   Ln {}, Col {}   UTF-8   {}   {}   {}{}   Tab: focus · Ctrl+Q: quit",
+        " {}{}{}   Ln {}, Col {}   UTF-8   {}   {}   {}   {}{}   Tab: focus · Ctrl+Q: quit",
         app.status_message(),
         diagnostic,
-        plugin_left,
+        plugin_left_suffix,
         cursor.line + 1,
         cursor.column + 1,
         app.language(),
         app.focus().label(),
         app.branch().map_or("Git:—", |branch| branch),
-        plugin_right,
+        app.indent_summary(),
+        plugin_right_suffix,
     );
+    let width = |value: &str| -> u16 {
+        value
+            .chars()
+            .map(|character| character.width().unwrap_or(1) as u16)
+            .fold(0, u16::saturating_add)
+    };
+    let mut hits = Vec::new();
+    let left_prefix = format!(" {}{}", app.status_message(), diagnostic);
+    let mut position = width(&left_prefix);
+    for (index, (runtime_index, id, item)) in plugin_left_items.iter().enumerate() {
+        position = position.saturating_add(width(" · "));
+        let start = position;
+        position = position.saturating_add(width(item));
+        hits.push((start, position, *runtime_index, id.clone()));
+        if index + 1 < plugin_left_items.len() {
+            position = position.saturating_add(width(" · "));
+        }
+    }
+    if !plugin_right_items.is_empty() {
+        let right_start = width(&text).saturating_sub(width(&plugin_right_suffix));
+        let mut position = right_start.saturating_add(width(" · "));
+        for (index, (runtime_index, id, item)) in plugin_right_items.iter().enumerate() {
+            let start = position;
+            position = position.saturating_add(width(item));
+            hits.push((start, position, *runtime_index, id.clone()));
+            if index + 1 < plugin_right_items.len() {
+                position = position.saturating_add(width(" · "));
+            }
+        }
+    }
+    app.set_plugin_status_hits(hits);
     frame.render_widget(
         Paragraph::new(text).style(Style::default().fg(theme.background).bg(theme.accent)),
         area,
@@ -1861,10 +2289,15 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn draw_small(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    app.set_plugin_status_hits(Vec::new());
     let theme = active_theme();
     frame.render_widget(Clear, area);
+    let cursor = app.cursor();
     let content = format!(
-        "mtide\n\n{}\n\nCtrl+Q quit · Tab focus",
+        "mtide · {}\n\nLine {}, column {}\n\n{}\n\nCtrl+Q quit · Tab focus · Ctrl+B sidebar",
+        app.file_name(),
+        cursor.line + 1,
+        cursor.column + 1,
         app.status_message()
     );
     frame.render_widget(
@@ -1891,6 +2324,8 @@ fn panel<'a>(title: &'a str, focused: bool) -> Block<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::{backend::TestBackend, Terminal};
 
     #[test]
     fn wraps_wide_characters_by_display_columns() {
@@ -1925,5 +2360,25 @@ mod tests {
         assert_eq!(conflict_line_marker(&blocks, 3), "B");
         assert_eq!(conflict_line_marker(&blocks, 5), "T");
         assert_eq!(conflict_line_marker(&blocks, 6), "!");
+    }
+
+    #[test]
+    fn narrow_layout_renders_recovery_text_and_overlays() {
+        let mut app = App::new(&[]).expect("app");
+        app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL))
+            .expect("open file overlay");
+        let backend = TestBackend::new(40, 8);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| draw(frame, &app))
+            .expect("draw narrow layout");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Open File"));
     }
 }

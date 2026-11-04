@@ -161,6 +161,8 @@ pub struct EditorSettings {
     pub tab_size: usize,
     #[serde(rename = "useTabs", alias = "use_tabs")]
     pub use_tabs: bool,
+    #[serde(rename = "autoDetectIndent", alias = "auto_detect_indent")]
+    pub auto_detect_indent: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -201,6 +203,7 @@ impl Default for EditorSettings {
             indent_size: 4,
             tab_size: 4,
             use_tabs: false,
+            auto_detect_indent: true,
         }
     }
 }
@@ -418,12 +421,12 @@ impl Settings {
         }
     }
 
-    pub fn apply_editorconfig(&mut self, root: &Path, language: &str) {
+    pub fn apply_editorconfig(&mut self, root: &Path, language: &str) -> bool {
         let Some(path) = find_editorconfig(root) else {
-            return;
+            return false;
         };
         let Ok(contents) = fs::read_to_string(path) else {
-            return;
+            return false;
         };
         let mut active = false;
         for raw_line in contents.lines() {
@@ -469,6 +472,7 @@ impl Settings {
                 _ => {}
             }
         }
+        true
     }
 }
 

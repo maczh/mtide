@@ -1,5 +1,21 @@
 # 编辑器内核
 
+没有 .editorconfig 时，打开文件会从前 200 行检测 tabs/空格和常见缩进步长；多个步长出现相同频次时选择较小步长，保证结果与目录遍历或 HashMap 顺序无关。
+
+状态栏显示当前缩进模式；Settings overlay 可关闭自动检测并手动切换 spaces/tabs，手动覆盖优先于检测结果。
+
+该覆盖保存为 editor.autoDetectIndent；设置为 false 后重启仍保持手动缩进模式。
+
+Settings overlay 的 Indent size 行可用 Left/Right 或 Enter 在 2、4、8 之间循环，手动步长同样保存到 editor.indentSize。
+
+编辑区鼠标滚轮按 3 行步长滚动垂直 viewport；按住 Shift 滚轮按 4 列步长滚动水平 viewport。
+
+## 编辑区上下文菜单
+
+编辑区右键会向声明 editor.read 权限并注册上下文菜单的插件请求菜单。菜单由 Host
+作为 overlay 绘制，支持鼠标选择、上下键移动、Enter 执行和 Esc 关闭，关闭后恢复
+原编辑器焦点。
+
 ## 1. 文本表示
 
 输入是 UTF-8。内部必须统一定义三种坐标：
@@ -50,7 +66,7 @@ auto-closing 必须处理成对符号、跳过已有 closing rune、选区包裹
 
 当前基础编辑器已支持 `()`、`[]`、`{}`、单引号和双引号自动闭合；输入已有 closing rune 时移动光标而不重复插入。
 
-当前行命令：`Ctrl-Shift-D` 复制行，`Ctrl-Shift-K` 删除行，`Alt-Shift-Up/Down` 移动当前行或选中行，`Ctrl-J` 合并当前行与下一行或选中行，`Alt-Shift-S` 升序排序行，`Alt-Shift-U/L` 转换当前行或选中行大小写，`Ctrl-/` 根据文件类型切换 `//`、`#` 或 `--` 注释；这些行操作均为单个 undo batch。Enter 会继承当前行前导空白，并在 `{` 或 `:` 结尾后增加四个空格的块缩进。
+当前行命令：`Ctrl-Shift-D` 复制行，`Ctrl-Shift-K` 删除行，`Alt-Shift-Up/Down` 移动当前行或选中行，`Ctrl-J` 合并当前行与下一行或选中行，`Alt-Shift-S` 升序排序行，`Alt-Shift-U/L` 转换当前行或选中行大小写，`Ctrl-/` 根据文件类型切换 `//`、`#` 或 `--` 注释；选中多行时 `Tab` 批量缩进、`Shift-Tab` 批量反缩进，无选区时仍保持焦点循环语义；这些行操作均为单个 undo batch。Enter 会继承当前行前导空白，并在 `{` 或 `:` 结尾后增加四个空格的块缩进。
 
 选择与剪贴板：Shift+方向键/Home/End 创建选区；Ctrl-C 复制、Ctrl-X 剪切、Ctrl-V 粘贴。跨行选择以换行连接，选区删除和粘贴保持 UTF-8 字符列。复制或剪切时同时向宿主终端发送有 64 KiB 上限的 OSC52 序列，支持 SSH/无桌面环境的系统剪贴板；超出上限时仍保留内部剪贴板，但不发送外部序列。
 

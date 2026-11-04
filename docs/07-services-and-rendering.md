@@ -4,9 +4,9 @@
 
 传输是 stdio JSON-RPC。Manager 按语言/工作区懒启动 server，完成 initialize/initialized 后服务请求。文档同步采用递增版本的 full `didChange`，保存成功后发送标准 `textDocument/didSave`，标签关闭或应用退出前发送 `textDocument/didClose` 并清理文档版本；异步结果通过 event loop 返回，并校验 server/session/document version。Workspace Edit 支持当前文档内存应用，并将其他文件的 `changes`/`documentChanges` 安全写回磁盘。
 
-首批实现顺序：diagnostics → completion/resolve → hover/signature → definition/implementation/type definition/references → rename → formatting/code actions。当前已接入 diagnostics、completion、hover、definition/implementation/type definition/references 的位置跳转与多位置选择弹层、基础 rename、formatting 和首个 Code Action；缺失能力显示 unavailable，不阻塞编辑。
+首批实现顺序：diagnostics → completion/resolve → hover/signature → definition/implementation/type definition/references → rename → formatting/code actions。当前已接入 diagnostics、completion、hover、definition/implementation/type definition/references 的位置跳转与多位置选择弹层、基础 rename、formatting 和首个 Code Action；completion 会优先应用 `insertText`/`textEdit.newText`，并按 `textEdit.range` 使用 UTF-16 列替换指定范围；缺失能力显示 unavailable，不阻塞编辑。
 当前光标行若落在诊断的多行 range 内，状态栏会显示第一条诊断消息，行号区同时保留严重级别标记。
-JSON-RPC request 等待响应最多 5 秒；超时会发送 `$/cancelRequest` 并返回可显示的 LSP 错误，迟到的旧响应不会作为当前请求结果使用。
+JSON-RPC request 等待响应最多 5 秒；超时会发送 `$/cancelRequest` 并返回可显示的 LSP 错误，迟到的旧响应不会作为当前请求结果使用。服务端主动发送 `workspace/applyEdit` 时，Host 会复用同一套 URI、只读、范围重叠和资源操作预检，应用成功或失败均回复 JSON-RPC `applied`/`failureReason` 结果；`window/showMessage` 与 `window/logMessage` 会进入状态栏，不再静默丢弃。
 
 ## 2. Git
 
@@ -24,7 +24,7 @@ Unified diff parser 必须接受 `@@ -4 +4 @@` 这类省略 count=1 的 hunk hea
 
 ## 4. PTY 与 VT
 
-PTY session 负责 spawn、resize、write bytes、read bytes、关闭。Rust 当前已接入 portable-pty，维持多个独立持久 shell tab、后台 reader channel、输入写入和 resize；Terminal 焦点下 `Ctrl-Shift-T` 创建 tab，`Ctrl-Alt-Left/Right` 切换 tab。Close 必须幂等且只执行一次，能处理命令退出后仍存活的 background jobs。VT parser 维护 cursor、application cursor/keypad mode、attributes、alternate screen、scrollback、OSC/链接等状态，并按单元记录 OSC 8 超链接。终端未启用鼠标协议时，点击 `http://` 或 `https://` 链接可调用系统打开器；非 HTTP(S) 协议会被拒绝，启用终端鼠标协议的应用则优先接管鼠标事件。终端色彩允许直接 RGB；其他 widget 使用语义主题色。Ctrl+V 是否粘贴由配置决定。
+PTY session 负责 spawn、resize、write bytes、read bytes、关闭。Rust 当前已接入 portable-pty，维持多个独立持久 shell tab、后台 reader channel、输入写入和 resize；Terminal 焦点下 `Ctrl-Shift-T` 创建 tab，`Ctrl-Alt-Left/Right` 切换 tab。Close 必须幂等且只执行一次，能处理命令退出后仍存活的 background jobs。VT parser 维护 cursor、application cursor/keypad mode、attributes、alternate screen、scrollback、OSC/链接等状态，并按单元记录 OSC 8 超链接；Terminal 与独立 Agent PTY 在 alternate screen 下均支持 Escape、F1–F12、Home/End、Insert/Delete、PageUp/PageDown VT 序列，方向键继续尊重各自 application cursor mode。终端未启用鼠标协议时，点击 `http://` 或 `https://` 链接可调用系统打开器；非 HTTP(S) 协议会被拒绝，启用终端鼠标协议的应用则优先接管鼠标事件。终端色彩允许直接 RGB；其他 widget 使用语义主题色。Ctrl+V 是否粘贴由配置决定。
 
 终端 focus 时实现 `RawKeyConsumer` 语义：一般输入转成 VT bytes；force keys（至少 terminal.toggle）优先由应用处理。PTY 输出事件唤醒主循环。终端输出中的 OSC52 剪贴板内容会经过 64 KiB、Base64 和 UTF-8 校验后同步到 Host 内部剪贴板。
 

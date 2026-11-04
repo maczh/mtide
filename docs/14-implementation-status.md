@@ -4,16 +4,62 @@
 
 ## 已落地
 
+- 插件 panel proxy 新增 progress widget，支持 value/label/char 和 0 到 1 范围钳制，在 Sidebar、Bottom、Drawer 与插件标签中一致渲染。
+
+- 插件自定义编辑器 Tab 与 file handler 文件视图已支持 `on_event` 鼠标事件：Host 传递内容区相对坐标和按钮类型；回调返回 `true` 时消费事件，返回 `false` 时保留编辑器滚动、选择等宿主行为。
+
+- 插件 RPC 生命周期已加固：响应、取消、断连和挂起请求回调均会回收一次性 Lua registry 资源；单个响应、通知或关闭回调异常会记录日志并继续清理同一连接的其他请求，重复关闭不会重复触发关闭回调。
+
+- 插件 RPC framing 已兼容 TTT/LSP：出站使用 `Content-Length` 帧，入站支持标准头帧与旧换行 JSON，并限制头部 8 KiB、消息体 32 MiB。
+
+- 插件 RPC endpoint scope 已接入：`network.rpc=true` 允许全目标，数组声明按 TCP/Unix endpoint 精确匹配，未授权目标在建立连接前拒绝。
+
+- 插件 `radio` widget 已接入统一面板选择状态：支持数字或字符串选中值、方向键导航、`on_change` 回调和单选标记渲染。
+
+- 插件 `image` widget 已接入；在当前 `graphics.protocol=none` 时以带 alt/src 的文本占位安全降级，避免上游图像插件因未知 widget 失败。
+
+- 插件 `ttt.fs` 已补齐 `exists`/`list` 与 manifest 路径 scope：插件包目录始终可用，`true`/`{workspace}`/绝对路径/`~`/`{config}`/`*` 范围会在 canonical 边界校验后生效；目录结果稳定排序并返回 `{name, is_dir}` Lua 数组，普通 I/O 失败返回 `nil,error`。
+- 插件自动发现已落地：显式 `--plugin` 优先，随后扫描全局 TTT 配置目录与工作区 `plugins/`，按 manifest 名称去重，坏包静默跳过，主题插件复用同一加载路径。
+- 插件 `crypto` 已按 TTT 沙箱语义补齐：提供支持省略 padding/外围空白的 Base64 编解码、系统 CSPRNG 十六进制随机字节和 RFC 4122 v4 UUID，随机请求限制为 1–1024 字节并覆盖无效输入测试。
+- Lua 插件沙箱已收紧：仅保留安全 `os.time/clock/date`，移除 `io`、`debug`、动态加载和危险全局函数，并将 `package` 搜索器限制为内置模块 preload。
+- 插件 Tree 交互已补齐：Enter 在带 `children` 的节点上切换 `expanded` 并派发 `on_expand(node)`，叶节点继续派发 `on_select(node)`，覆盖键盘激活回归测试。
+- 插件 List 命令回调已补齐：`key_commands` 可驱动 `on_command(command, node)`，传递当前节点对象；Table 原有行号参数保持兼容。
+- 插件普通面板 Dropdown 已接入选择状态机：方向键更新选项，Enter 派发 `on_change(value)` 或 `on_menu(command)`，并覆盖 Sidebar 集成测试。
+- 插件 Tree 命令回调已补齐：`key_commands` 可驱动 `on_command(command, node)`，当前节点对象与 List 保持一致。
+- 插件调试快照落盘已补齐：`ttt.screenshot(path)`/`ttt.debug(path)` 在 `screen.read` 与 `fs.write` scope 下写入受限路径并返回成功标记，越界路径拒绝。
+- 插件调试权限已收紧：`ttt.debug` 现在同时要求 `screen.read`、`editor.read`、`terminal.read`，避免低权限插件读取编辑器状态。
+- Lua 安全日期 API 已补齐 `%I`、`%p`、`%Z` 格式，`os.date` 与 TTT 约定的安全格式集合一致。
+
+- 插件 `ttt.system` 已接入 `system.exec` 命令 allowlist：`exec`、`exec_async`、`spawn` 共用 manifest 声明的可执行文件范围，未授权命令不会启动。
+
+- Find 面板已支持 Ctrl-Alt-R 切换 smart-case/正则搜索，并在面板中显示当前模式。
+- 编辑区已接入鼠标滚轮 viewport：普通滚轮垂直滚动，Shift+滚轮水平滚动，并对边界进行钳制。
+- 编辑器已在无 .editorconfig 时自动检测前 200 行的缩进风格与步长，并以确定性的最小步长规则处理频率平票。
+- Settings overlay 已增加缩进自动检测和 tabs 手动覆盖选项，状态栏显示当前缩进模式。
+- 缩进自动检测开关已持久化为 editor.autoDetectIndent，重启后继续尊重手动覆盖。
+- Settings overlay 已支持在 2/4/8 之间循环手动缩进步长，并持久化 editor.indentSize。
+- 插件命令行和自定义 Dialog 输入已接入 bracketed paste 路由，粘贴内容不会落入底层编辑器；Dialog input 支持 Enter 触发 `on_submit` 并传递当前文本。
+- 插件 tree/list/table/tabs 的回调已接入插件标签 Enter、侧栏/底栏面板鼠标点击和面板键盘选择：tree/list 传节点表、table 传 1-based 行号，table Enter 优先调用 on_activate、tabs 传 tab id，并在执行后消费编辑请求；自定义 `open_tab`、`editor.file_handlers` 文件视图和 sidebar/bottom 注册面板均支持 `on_event` 按键回调与事件消费；所有 panel proxy 已支持 `panel:redraw()` 请求异步重绘，文件视图 `tab:focus()`/`tab:close()` 已接入 Host 生命周期请求；`ttt.events` 的 `key.press` 已接入编辑器输入路由，可由插件安全消费按键。
+- 插件 status item 已支持 `opts.on_click`，状态栏按可见文本列范围命中鼠标并执行 Lua 回调。
+
+- 插件编辑器右键上下文菜单已完成：受 editor.read 权限保护，支持 1-based 行列和当前单词参数、菜单项回调、分隔项、鼠标/键盘选择、overlay 焦点恢复和编辑请求消费。
+
 - Ratatui/Crossterm 全屏布局：菜单栏、Explorer/Find/Changes 侧栏、编辑器、Terminal/Output 底栏、AI Agent 区、状态栏、编辑器自动垂直滚动、鼠标捕获、bracketed paste 粘贴事件路由/编辑区定位和窄窗口降级布局；Open File、插件命令面板和 LSP 弹层使用 overlay focus 栈，取消后恢复打开前焦点。
 - CLI 自动化：`--size WxH` 会在启动时调整 PTY/Agent 尺寸并不会污染位置目标；`--exec` 已支持键盘、文本/粘贴、复制、真实鼠标 click/rclick/hover/drag、panel 焦点、文件 open/定位/只读、debug/screenshot 输出和基于文件存在的有界 wait-for；默认实例通过当前用户/目录对应的 loopback Unix socket 接收后续进程的文件目标和行列位置，`--new-window` 可绕过复用，`--listen` 显式声明监听实例。
 - 键盘导航：Tab/Shift-Tab 焦点循环、面板切换、侧栏/底栏标签切换、退出快捷键。
-- 文本编辑：UTF-8 字符列、插入/换行/删除、上下左右/Home/End、`Ctrl-G` 行列定位、`Ctrl-Backspace`/`Ctrl-Delete` 按词删除（含跨行边界和单次撤销）、保存规范化、Save As 新路径保存与覆盖保护、自动缩进、可选 format-on-save、语言覆盖、`saveAllOnQuit` 批量保存、撤销/重做、dirty 状态、括号/引号自动闭合和闭合符跳过、基于缩进的代码折叠/全部展开、当前文档 Replace All 单批次撤销、重叠多选区合并、复制行/删除行/按已知语言切换注释（未知语言会明确提示不可用），以及 Shift 选区、支持按光标/选区逐项 spread 的多光标剪贴板、内部剪贴板和受 64 KiB 限制的 OSC52 外部剪贴板；编辑器支持多标签，每个标签独立保留缓冲区、光标、撤销栈和 dirty 状态。搜索 Replace 模式下按 `Ctrl-Shift-Enter` 可对当前搜索结果覆盖的工作区文件执行全部替换，并遵循与搜索一致的 smart-case 规则；当前打开文件保留内存 dirty/undo 语义，其他文件直接写回磁盘；脏文件检测到磁盘变更后可用 `Ctrl-Alt-R` 显式重载。
+- 文本编辑：UTF-8 字符列、插入/换行/删除、上下左右/Home/End、`Ctrl-Alt-M` 嵌套跨行匹配括号跳转、`PageUp/PageDown` 按视口分页移动及 Shift 选区、`Ctrl-Home/End` 文件首尾跳转及 Shift 扩展、`Ctrl-Shift-Left/Right` 按词移动与选区扩展、未按 Shift 时按词移动、`Ctrl-G` 行列定位、`Alt-Backspace`/`Ctrl-Backspace` 与 `Alt-Delete`/`Ctrl-Delete` 按词删除（含跨行边界和单次撤销）、保存规范化、Save As 新路径保存与覆盖保护、自动缩进、选区 Tab/Shift-Tab 批量缩进和反缩进、可选 format-on-save、语言覆盖、`saveAllOnQuit` 批量保存、撤销/重做、dirty 状态、括号/引号自动闭合和闭合符跳过、基于缩进的代码折叠/全部展开、当前文档 Replace All 单批次撤销、重叠多选区合并、复制行/删除行/按已知语言切换注释（未知语言会明确提示不可用），以及 Shift 选区、支持按光标/选区逐项 spread 的多光标剪贴板、内部剪贴板和受 64 KiB 限制的 OSC52 外部剪贴板；编辑器支持多标签，每个标签独立保留缓冲区、光标、撤销栈和 dirty 状态。搜索 Replace 模式下按 `Ctrl-Shift-Enter` 可对当前搜索结果覆盖的工作区文件执行全部替换，并遵循与搜索一致的 smart-case 规则；当前打开文件保留内存 dirty/undo 语义，其他文件直接写回磁盘；脏标签检测到磁盘变更后可用 `Ctrl-Alt-R` 显式重载。
 - 工作区：目录浏览、文件打开、Explorer 新建文件/目录、重命名、删除确认和刷新、递归 smart-case 搜索、Unicode 字符列结果、可配置 include/exclude glob、编辑器 `Ctrl-F` 继承单行选区、活动缓冲区未保存编辑后的实时搜索结果、跨根结果循环导航和搜索结果跳转、当前搜索结果跨文件 Replace All、`.ttt` 多根 folder 聚合搜索/Explorer、打开文件磁盘 mtime 轮询与干净标签自动重载、脏标签外部变更保护、Git 分支/status、Branches 侧栏创建/切换/删除分支、unstaged/staged unified diff 读取、保存后状态刷新，以及 Changes 面板整文件/单 hunk/批量 stage/unstage、提交消息提交、当前文件 blame、提交历史和后台 fetch/pull/push 操作；远程结果在主循环回收，认证失败进入内存凭据重试 overlay；Changes 面板按 `d` 可进入可滚动 Output diff 视图。
 - 终端：portable-pty 多 tab 持久 shell、settings shell/args/scrollback/ctrlV 配置、后台读取、命令提交、方向键、application cursor mode、PageUp/PageDown 与鼠标滚轮 scrollback 浏览、Tab、Ctrl-C/Ctrl-D/Ctrl-L、可选 Ctrl-V 剪贴板写入、resize，以及 VT screen（光标、滚屏、独立 scrollback、宽字符双列占位、组合字符附着、alternate screen、CSI 移动/清屏、SGR 基础颜色/粗体/下划线/反色），并在底栏按 ANSI 样式渲染；Terminal 焦点下支持 `Ctrl-Shift-T` 创建和 `Ctrl-Alt-Left/Right` 切换；解析终端的 1000/1002/1003/1006 鼠标模式，并按 SGR 或 legacy X10 编码转发鼠标事件至 PTY。
-- LSP：配置模型、按语言选择 server、后台 stdio JSON-RPC reader、request/response 匹配、initialize、initialized、didOpen、按 URI 递增版本的 full didChange、shutdown/exit、事件循环轮询，以及 publishDiagnostics 状态解析和编辑器行号标记、UTF-16 code unit 列与编辑器字符列双向转换、completion/hover/signatureHelp/definition、workspace edit Rename、formatting 和首个 Code Action。
-- TTT 插件基础运行时：manifest 校验、Lua 5.4、`ttt`/`ttt.json`/`ttt.system`/`ttt.fs`/`ttt.text` 模块、权限拒绝、包目录路径约束，以及 commands（`handler`/旧 `run`）/keybindings/sidebar/bottom/file_handlers 注册、兼容 panel proxy、list/table 的 selected/loading/empty 状态、同步/回调式 `system.exec` 与 `exec_async`；扩展名匹配的 file handler 可执行 `open(path, tab)` 并把 `tab.render`/字符串结果显示为插件文件视图，`tab.on_close` 生命周期回调可在视图关闭时执行并清理资源；`tab.open`、`tab.activate`、`tab.close` 覆盖普通编辑 tab 与插件文件视图的生命周期。
-- 配置：`MTIDE_CONFIG_DIR`、`TTT_CONFIG_DIR` 和项目 `.mtide/settings.json` 的基础布局配置；支持 `defaultFolders`/`default_folders`/`startupFolders` 无显式目标时启动默认工作区；启动时读取工作区 `.editorconfig` 的常用缩进/保存规则；Agent 兼容原版 `agents` 顶层 schema，支持 `cli`、字符串/数组 `args`、`install`，并归一化为内部 provider 模型；`autoClosingBrackets`、`selectionStyle`、`reuseWindow` 等兼容设置已接入，未知顶层和 editor 字段会在保存/序列化时保留。
-- 设置 UI：命令面板中的 `Open Settings` 可打开键盘导航的设置覆盖层，支持即时切换侧栏、底部面板、Agent、软换行、保存格式化、退出批量保存、终端 Ctrl-V 和 LSP 开关；当前值作用于本次会话，持久化编辑仍通过 settings 文件完成。
+- LSP：配置模型、按语言选择 server、后台 stdio JSON-RPC reader、request/response 匹配、initialize、initialized、didOpen、按 URI 递增版本的 full didChange、统一 manager 关闭时的 shutdown/exit 与子进程回收、事件循环轮询，以及 publishDiagnostics 状态解析和编辑器行号标记、UTF-16 code unit 列与编辑器字符列双向转换、completion/hover/signatureHelp/definition、workspace edit Rename、formatting 和首个 Code Action。
+- TTT 插件基础运行时：manifest 校验、Lua 5.4、`ttt`/`ttt.json`/`ttt.system`/`ttt.fs`/`ttt.text`/`ttt.storage`/`ttt.regex`/`ttt.settings` 模块、权限拒绝、包目录路径约束，以及 commands（`handler`/旧 `run`）/keybindings/sidebar/bottom/file_handlers 注册、兼容 panel proxy、list/table 的 selected/loading/empty 状态、同步/回调式 `system.exec` 与 `exec_async`；`ttt.storage` 按插件私有 JSON 文件提供 `get`/`set`/`remove`/`keys`，支持嵌套 JSON 值并限制单插件 1 MiB，未声明 `storage` 权限时不暴露函数；`ttt.regex` 提供带捕获组的 `compile`/`find`/`find_all` 和忽略大小写选项；`ttt.settings` 支持受 `settings_keys` 精确/通配约束的点号路径读写、与 Host 相同的默认值并立即持久化；扩展名匹配的 file handler 可执行 `open(path, tab)` 并把 `tab.render`/字符串结果显示为插件文件视图，`tab.on_close` 生命周期回调可在视图关闭时执行并清理资源；`tab.open`、`tab.activate`、`tab.close` 覆盖普通编辑 tab 与插件文件视图的生命周期。
+- 配置：`MTIDE_CONFIG_DIR`、`TTT_CONFIG_DIR`、显式 `--config FILE` 和项目 `.mtide/settings.json` 的基础布局配置；插件 `ttt.settings` 与 Host 共用显式配置文件；支持 `defaultFolders`/`default_folders`/`startupFolders` 无显式目标时启动默认工作区；启动时读取工作区 `.editorconfig` 的常用缩进/保存规则；Agent 兼容原版 `agents` 顶层 schema，支持 `cli`、字符串/数组 `args`、`install`，并归一化为内部 provider 模型；`autoClosingBrackets`、`selectionStyle`、`reuseWindow` 等兼容设置已接入，未知顶层和 editor 字段会在保存/序列化时保留。
+- 插件异步进程与文件安全：`system.exec_async` 返回带 `cancel()`/`id()` 的句柄，`system.cancel_async(id_or_handle)` 兼容显式取消入口，取消会终止后台子进程并在回调结果中标记 `cancelled`；`ttt.fs` 的 read/write/list/exists 已按 manifest scope 做 canonical path 校验，支持工作区、配置目录、用户目录、绝对目录和全局 scope。
+- 插件命令输出治理：`system.exec`/`exec_async` 支持 stdout/stderr 共享的 `max_output_bytes` 上限，超限时终止进程并返回截断输出、`truncated=true`、`exit_code=-1` 和 `ok=false`。
+- 插件流式执行：`exec_async` 支持 `on_stdout(chunk)`/`on_stderr(chunk)`，输出块在线程读取、主线程 Lua 回调，取消、超时和截断后停止继续分发，并保留一次性最终结果回调。
+- 插件标准进程入口：`system.spawn(binary, options)` 已兼容标准二参数签名，支持 `args`/`cwd`/`env`/标准流回调，并保留旧 options-only 写法。
+- 网络权限边界：`network.http` 的空数组、显式 host allowlist 和 `true` 全放行三种状态已区分，同步、异步及重定向请求统一执行目标校验。
+- 插件生命周期：已支持注册与显式执行 `ttt.on_uninstall` 清理钩子，并与已有一次性 `ttt.on_install` hook 一样在执行后清理 Lua registry 资源。
+- 设置 UI：命令面板中的 `Open Settings` 可打开键盘导航的设置覆盖层，支持即时切换侧栏、底部面板、Agent、软换行、保存格式化、退出批量保存、终端 Ctrl-V、LSP、缩进自动检测、tabs 覆盖和 2/4/8 缩进步长；可用 `Ctrl-S` 将当前设置持久化到 settings 文件，状态栏同步显示当前缩进模式。
 - CLI：支持 `--help`、`--version/-v`、文件/目录位置参数、`file:line:column` 定位、`.ttt` 多根工作区解析、`--config FILE`、可重复的 `--plugin DIR`、`--listen`、`--new-window`、`--welcome` 和标准输入目标；无目标时自动检测 pipe/regular file，显式 `-` 可强制读取，标准输入均在进入 raw mode 前读入并作为未保存 tab 打开；显式文件不可读或 `.ttt` 工作区解析失败时回退欢迎缓冲区/当前目录并在状态栏保留错误，编辑器支持 `Ctrl-O` Open File 路径弹层。
 
 ## 当前兼容边界
@@ -21,17 +67,17 @@
 以下能力已经在需求文档中定义，但尚未达到完整产品级实现：
 
 - 编辑器多标签、标签切换和未保存关闭保护已接入；每个 tab 可用 `Ctrl-Alt-L` 单独循环语言覆盖，覆盖会保存到工作区 `.mtide/language-overrides.json` 并在重启/重新打开时恢复，立即驱动状态栏、注释、语法着色和 LSP server 选择；已支持关闭 soft-wrap 时的水平视口和光标可见性、按终端列宽计算的 `editor.wordWrap`/`editor.wordWrapMaxColumn` 软换行，以及软换行开启时按屏幕行移动 Up/Down（含宽字符列位置保持）；还支持常见语言轻量语法着色、Markdown `<details>` 区块折叠（忽略行内代码和 fenced code 中的字面量标签）、鼠标点击/拖动选择、`Alt+Shift` 矩形/列选区、`Ctrl-A` 全选、`Ctrl-Alt-N` 选择下一个相同文本、`Alt-Shift-I` 跨行选区拆分为逐行 selections、缩进代码折叠、`Alt-Shift-Up/Down` 原子化移动行、`Ctrl-J` 原子化合并行、`Alt-Shift-S` 排序行和 `Alt-Shift-U/L` 大小写转换，以及 `Alt-Up/Down`/Alt-click 附加光标和多光标字符/换行/退格/删除；列选区已接入复制、剪切、替换和单次撤销，尚无完整格式化和增量语法高亮引擎。
-- 终端已具备 PTY 字节通道、跨读取边界的 UTF-8 解码、ANSI 样式（基础色、亮色、256 色、真彩色、粗体、faint、italic、strikethrough、conceal、blink，RGB 参数安全截断到 0–255）、光标可见性控制（`CSI ?25 h/l` 以反色渲染当前光标单元）、DECSCUSR `CSI Ps SP q` 光标样式状态（块/下划线/竖线）及 alternate-screen/soft-reset 快照语义、DEC bracketed paste 状态跟踪及标准粘贴包装、alternate screen 下字符/退格/回车/Tab 和 ASCII 控制组合直通 PTY、宽字符 continuation 元数据及按字符退格/覆盖/清除、alternate screen（含主屏 links/样式/光标/滚动区域快照恢复）、独立 scrollback、基础鼠标协议转发（SGR/X10）、OSC 8 超链接点击打开（包括 scrollback 浏览中的可视行）、组合字符附着、保存/恢复光标、`CSI r` 局部滚动区域、`CSI L/M/S/T` 区域行编辑与滚动、IND/RI/NEL、CSI Tab/BackTab、DSR `CSI 5 n`/`CSI 6 n` 及私有 `CSI ?6 n` 光标报告、设备属性 `CSI c` 响应、DECRQM `CSI ?Ps $p` 已跟踪模式查询、窗口/屏幕尺寸 `CSI 18 t`/`CSI 19 t` 响应，以及 `CSI J/K/@/P/X/b` 清除、插入、删除和重复字符与元数据同步清理；链接仅允许 `http://`、`https://`，宽字符 continuation 单元清除时会同步清理样式、组合字符和链接元数据；组合字符在退格/光标回退后的附着语义已覆盖，完整终端交互状态仍待实现。
-- LSP manager、后台通知轮询、didChange/didSave/didClose 同步、5 秒请求超时与 `$/cancelRequest`、diagnostics 行号标记与当前行消息、completion 候选弹层、hover 信息弹层、definition/implementation/type definition/references 位置跳转与多位置选择弹层、workspace-edit Rename、整文件/选区 range formatting 和 Code Action 选择弹层已接入；Workspace Edit 的 `changes`/`documentChanges` 可写回其他文件，并支持 `CreateFile`/`RenameFile`/`DeleteFile` 资源操作；应用前会预检 URI、目标文件、只读状态、范围合法性、重叠编辑和资源操作覆盖策略，单文件多编辑合并为一次撤销；Rename 现在先展示按文件汇总的可视化预览，资源目标冲突会在预览中显式标注，Enter 应用、Esc 取消；LSP 服务状态已区分启动中、已连接和失败，服务进程异常退出或请求失败会标记失败并从活动客户端移除，后续同步可重新启动服务，状态栏会显示对应状态。
+- 终端已具备 PTY 字节通道、跨读取边界的 UTF-8 解码、ANSI 样式（基础色、亮色、256 色、真彩色、粗体、faint、italic、strikethrough、conceal、blink，RGB 参数安全截断到 0–255）、光标可见性控制（`CSI ?25 h/l` 以反色渲染当前光标单元）、DECSCUSR `CSI Ps SP q` 光标样式状态（块/下划线/竖线）及 alternate-screen/soft-reset 快照语义、DEC bracketed paste 状态跟踪及标准粘贴包装、DEC focus reporting `CSI ?1004 h/l` 与宿主 FocusGained/FocusLost 的 `CSI I`/`CSI O` 通知、alternate screen 下字符/退格/回车/Tab 和 ASCII 控制组合直通 PTY、宽字符 continuation 元数据及按字符退格/覆盖/清除、`Alt-T` 可逆全屏终端布局、alternate screen（含主屏 links/样式/光标/滚动区域快照恢复）、独立 scrollback、基础鼠标协议转发（SGR/X10）、OSC 8 超链接点击打开（包括 scrollback 浏览中的可视行）、组合字符附着、保存/恢复光标、`CSI r` 局部滚动区域、`CSI L/M/S/T` 区域行编辑与滚动、IND/RI/NEL、CSI Tab/BackTab、DSR `CSI 5 n`/`CSI 6 n` 及私有 `CSI ?6 n` 光标报告、设备属性 `CSI c` 响应、DECRQM `CSI ?Ps $p` 已跟踪模式查询、窗口/屏幕尺寸 `CSI 18 t`/`CSI 19 t` 响应，以及 `CSI J/K/@/P/X/b` 清除、插入、删除和重复字符与元数据同步清理；链接仅允许 `http://`、`https://`，宽字符 continuation 单元清除时会同步清理样式、组合字符和链接元数据；组合字符在退格/光标回退后的附着语义已覆盖，完整终端交互状态仍待实现。
+- LSP manager、后台通知轮询、didChange/didSave/didClose 同步、5 秒请求超时与 `$/cancelRequest`、diagnostics 行号标记与当前行消息、completion 候选弹层、hover 信息弹层、signature help、document symbols/大纲导航、definition/implementation/type definition/references 位置跳转与多位置选择弹层、workspace-edit Rename、整文件/选区 range formatting 和 Code Action 选择弹层已接入；Code Action 同时支持带 `edit` 的工作区编辑和标准 `command`/`arguments` 命令动作，并通过 `workspace/executeCommand` 执行；Workspace Edit 的 `changes`/`documentChanges` 可写回其他文件，并支持 `CreateFile`/`RenameFile`/`DeleteFile` 资源操作；应用前会预检 URI、目标文件、只读状态、范围合法性、重叠编辑和资源操作覆盖策略，单文件多编辑合并为一次撤销；Rename 现在先展示按文件汇总的可视化预览，资源目标冲突会在预览中显式标注，Enter 应用、Esc 取消；LSP 服务状态已区分启动中、已连接和失败，服务进程异常退出或请求失败会标记失败并从活动客户端移除，后续同步可重新启动服务，状态栏会显示对应状态。
 - Git 目前读取 branch/status/unified diff、保留显式/省略数量的 hunk header、commit 历史和 blame，并支持 Branches 侧栏创建/切换/删除、整文件/单 hunk/批量 stage/unstage、Changes 面板提交及 fetch/pull/push；Changes 面板可用 `d` 打开可滚动的 Output diff 视图，`v` 在 unified/split 视图间切换，`t` 打开独立 Git diff tab，标签内支持 `v` 切换 unified/split、`[`/`]` 选择 hunk，Enter 进入对应文件的可编辑 `HEAD` 基线 diff 模式；Output split 视图也可用 Enter 进入当前变更文件编辑，编辑后行号区实时标记新增/变更行；冲突文件会高亮并支持 Changes 面板 Ours/Theirs 快速检出后暂存，编辑器行号区以 `O`/`B`/`T`/`!` 标识冲突区域，编辑器内还可按标准 diff3 冲突块使用 `Ctrl-Alt-Up/Down` 循环定位、`Ctrl-Alt-O`/`Ctrl-Alt-E`/`Ctrl-Alt-B`/`Ctrl-Alt-K` 选择 Ours/Theirs/Base/Keep Both，`Ctrl-Alt-P` 打开当前冲突块的 Ours/Base/Theirs 三方预览并可直接选择，结果纳入单次 undo；普通保存、Save As 和退出批量保存会检测未解决冲突标记并阻止覆盖文件；远程操作认证失败后提供内存凭据输入、重试和取消，凭据仅通过进程环境传给一次性 Git credential helper，不写入日志、配置或工作区。
-- Lua 插件目前能加载基础入口和安全系统 API，插件 keybinding 和 Ctrl-P 命令面板可实际触发已注册 command，`ttt.on` 可订阅 app/document/tick 以及 `tab.open`/`tab.activate`/`tab.close` 生命周期事件，sidebar/bottom panel 的 `render` 回调可通过 panel proxy 绘制常用文本/列表/表格，list/table 支持 selected/loading/empty、表格 cells 和右侧标记，以及 pager/tabs/scrollview/dialog/dropdown/password/checkbox/border 等常见 widget 的兼容降级内容；`require("ttt.editor")` 已按 `editor.read` 权限提供活动缓冲区全文、行数组、当前行、指定行、行数、光标、选区、选区文本、路径、文件名、语言和多光标快照，按 `editor.write` 权限提供插入、整行替换、范围替换、光标/选区和多光标操作，写入复用 Buffer undo checkpoint 并在插件回调后消费，Lua 坐标为 1-based rune 列；插件日志可进入 Output 面板，获得 `terminal.control`/`terminal.read` 权限的插件可通过 `ttt.terminal` 使用受管控的 portable-pty spawn/send/read/screen/resize/focus/close/list 终端 API，`screen` 返回 VT 解析后的可视文本，输出尾部限制为 1 MiB，file handler 已可实际打开为插件视图，tab proxy 提供 `id`/`title`/`focus`/`set_title`/`close`/`on_close` 入口且 `set_title` 会实际更新视图标题，`ttt.text.width/truncate` 已按终端列宽处理宽字符，`system.exec` 支持受权限保护的 stdin/env/timeout 选项，`exec_async` 已改为后台执行并在主循环回调；manifest 已支持 theme-only 插件、主题 descriptor 和包内路径校验，主题可在启动时加载，并可用 `Ctrl-Alt-T` 在内置/配置/插件主题间循环切换，应用到菜单、编辑器、侧栏、弹窗、Agent 面板、背景、面板、边框和状态栏；终端 ANSI/256 色仍按终端协议语义渲染。尚未覆盖 TTT 的完整交互 widget 状态和终端模块。
+- Lua 插件目前能加载基础入口和安全系统 API，插件 keybinding 和 Ctrl-P 命令面板可实际触发已注册 command，`ttt.on` 可订阅 app/document/tick 以及 `tab.open`/`tab.activate`/`tab.close` 生命周期事件，sidebar/bottom panel 的 `render` 回调可通过 panel proxy 绘制常用文本/列表/表格，list/table 支持 selected/loading/empty、表格 cells 和右侧标记，以及 pager/tabs/scrollview/dialog/dropdown/password/checkbox/border 等常见 widget 的兼容降级内容；`require("ttt.editor")` 已按 `editor.read` 权限提供活动缓冲区全文、行数组、当前行、指定行、行数、光标、选区、选区文本、路径、文件名、语言和多光标快照，`editor.diff()` 可读取活动可编辑 Diff 的变更块并按 `editor.write` 权限通过 `go_to_diff_hunk(index)` 跳转，按 `editor.write` 权限提供插入、整行替换、范围替换、光标/选区和多光标操作，写入复用 Buffer undo checkpoint 并在插件回调后消费，Lua 坐标为 1-based rune 列；插件日志可进入 Output 面板，获得 `terminal.control`/`terminal.read` 权限的插件可通过 `ttt.terminal` 使用受管控的 portable-pty spawn/send/read/screen/resize/focus/close/list 终端 API，`screen` 返回 VT 解析后的可视文本，输出尾部限制为 1 MiB，file handler 已可实际打开为插件视图，支持扩展名和最多 512 字节 `magic` 文件头匹配且 magic 优先，tab proxy 提供 `id`/`title`/`focus`/`set_title`/`close`/`on_close` 入口且 `set_title` 会实际更新视图标题，`ttt.text.width/truncate` 已按终端列宽处理宽字符，`system.exec` 支持受权限保护的 stdin/env/timeout 选项，`exec_async` 已改为后台执行并在主循环回调；manifest 已支持 theme-only 插件、主题 descriptor 和包内路径校验，主题可在启动时加载，并可用 `Ctrl-Alt-T` 在内置/配置/插件主题间循环切换，应用到菜单、编辑器、侧栏、弹窗、Agent 面板、背景、面板、边框和状态栏；终端 ANSI/256 色仍按终端协议语义渲染。尚未覆盖 TTT 的完整交互 widget 状态和终端模块。
 - AI Agent 已具备独立 PTY/VT 会话、独立输入路由、alternate screen 下字符/退格/回车/Tab/鼠标事件直通 PTY、bracketed paste 包装、兼容旧格式的 `agent.command`/`agent.cwd` 配置，以及 `agent.providers`/`agent.active` 多 provider 切换；新增 PATH 可用性检查、`install` 命令配置、显式确认后在普通 Terminal 中执行安装，以及安装完成后的后台可执行文件检测和 Agent PTY 自动重启；退出时会持久化 active provider、输入缓冲和屏幕文本快照，并在下次仍配置该 provider 时优先恢复 provider 与会话内容；Agent 及 provider 已支持显式 `tools` 权限清单，并默认拒绝未声明工具；新增受权限和 workspace 根目录限制的结构化 `read_file`/`list_files`/`write_file`/`search` 工具调用入口，写入使用临时文件替换且支持 workspace 内创建新文件，搜索不跟随符号链接并限制结果数量；Agent PTY 的 JSONL `tool_call` 消息现在由主循环异步执行并回写 `tool_result`，沿用同一权限和 workspace 校验。尚未提供真实 PTY 进程跨重启持久化。
 
 补充：dialog checkbox 已具备状态保存、含 dropdown/button 混合布局的 Tab/Shift-Tab 焦点切换、Enter/Space 激活、内容行鼠标命中和 `on_change` 回调；dialog password 已接入受控输入、掩码渲染和回调；终端已解析 OSC 0/1/2 窗口/图标标题并显示在 Terminal 面板标题中，支持受 64 KiB 限制的 OSC52 剪贴板接收，并兼容 `ESC Z`、CSI 13/14/16/18/19 t 设备和窗口尺寸查询、DECPAM/DECPNM 应用键盘模式；PTY 退出通知具备幂等语义，只报告一次，主动 close 也具备幂等语义。
 
 ## 验证基线
 
-插件兼容已覆盖 `ttt.editor` 读写与 undo group、`ttt.events` 多监听器和事件 payload（编辑器变更事件包含语言及选区状态/文本）、`ttt.diagnostics`、`ttt.bookmarks` 及对应权限；插件诊断与 LSP 诊断合并显示，书签图标显示在编辑器行号区。
+插件兼容已覆盖 `ttt.editor` 读写与 undo group、`ttt.events` 多监听器和事件 payload（编辑器变更事件包含语言及选区状态/文本，书签事件包含变更详情与行号点击位置）、`ttt.diagnostics`、`ttt.bookmarks` 及对应权限；插件诊断与 LSP 诊断合并显示，书签图标显示在编辑器行号区。
 
 插件 manifest 权限已兼容布尔值、字符串数组和路径数组；`ttt.system.env` 与 Host 主循环定时器 API 已接入并覆盖回调、清理和权限测试。
 
@@ -55,7 +101,7 @@ cargo clippy --offline --all-targets --all-features -- -D warnings
 cargo build --offline
 ```
 
-当前基线：`cargo test --offline` 为 278 passed、1 ignored；Clippy 无警告，离线构建通过，`git diff --check` 通过。
+当前基线：`cargo test --offline` 为 347 passed、1 ignored；Clippy 无警告，离线构建通过，`git diff --check` 通过。
 
 ## 下一阶段顺序
 
@@ -63,8 +109,60 @@ cargo build --offline
 2. 完善终端组合字符状态和剩余 VT 交互状态覆盖。
 3. 完善 Git 三方冲突编辑器和插件 diff 的更多编辑上下文。
 4. 完善 LSP rename 冲突标注、更多 workspace edit 交互。
-5. 完善 TTT widget 状态、插件 tab 生命周期和终端模块。
+5. 完善 TTT widget 状态、插件 tab 生命周期和终端模块（当前已补齐自定义 tab `on_event` 按键回调基础桥接）。
 # 最近完成
+
+- 插件面板 Mouse Event：Sidebar/Bottom 面板 `on_event` 现在可接收 0-based `x/y` 与 `left/right/middle/wheel_*` 按钮事件；返回 `true` 时消费鼠标，否则继续执行原有控件和面板焦点逻辑。
+
+- 插件 Tabs 状态兼容：支持 TTT 的字符串 `active=id` 与旧数字 `selected` 双向同步，重绘间保持选中标签并以 `on_change(tab_id)` 派发切换回调。
+
+- 插件 Pager 交互：兼容 TTT 的 `offset/limit/total` 分页模型，保存页状态并支持 Left/Right、上下、PageUp/PageDown、Home/End 翻页回调 `on_change(new_offset)`，同时兼容旧 `page/pages` 字段；Sidebar、Bottom、Drawer 和自定义 Tab 共用该实现。
+
+- LSP 窗口消息：标准 `window/showMessage` 与 `window/logMessage` 通知现在会显示在状态栏，保留服务器的重要提示并区分普通消息与日志。
+
+- Terminal/Agent alternate screen 输入闭环：Escape 直接发送至 PTY，F1–F12 映射为标准 VT 功能键序列，避免被宿主导航逻辑吞掉。
+
+- Agent alternate screen 按键路由：独立 Agent PTY 现在与 Terminal 一致支持 Home/End、Insert/Delete、PageUp/PageDown，并按 Agent 自身的 application cursor mode 编码方向键。
+
+- 终端 alternate screen 按键路由：Home/End、Insert/Delete、PageUp/PageDown 现在向 PTY 发送标准 VT 序列；普通终端仍保留 scrollback 翻页，方向键继续区分 application cursor mode。
+
+- LSP 服务端 Workspace Edit：Host 现在接收语言服务器主动发起的 `workspace/applyEdit` 请求，复用现有 Workspace Edit 预检/应用逻辑，并向服务端返回 `applied`、变更数量或 `failureReason`。
+
+- 插件事件容错：同一事件的多个 Lua 回调现在会在单个回调异常后继续派发，派发结束后报告首个错误；新增回归测试确认后续监听器仍执行。
+
+- 插件面板尺寸闭环：`panel:size()` 现在也会在 Drawer 与自定义编辑器 Tab 的实际内容区重绘前同步宽高；Raw Cell/自适应插件无需再依赖默认尺寸，Git diff Tab 仍保持原有渲染路径。
+
+- LSP 补全范围编辑：补全项支持 `textEdit.range`，按 UTF-16 协议列转换为编辑器 Unicode 列后替换指定范围；新增多字节文本替换回归测试。
+
+- LSP 补全插入文本：补全弹层继续显示 `label`，Enter 插入时优先使用协议提供的 `insertText` 或 `textEdit.newText`，避免泛化为展示标签。
+
+- 插件编辑器视口：`ttt.editor.viewport()` 新增 `height` 和准确的 `bottom_line`，Host 在 UI 绘制时同步编辑区内容高度，插件可据此进行可靠的可见范围计算。
+
+- 插件安装生命周期：新增 `ttt.on_install(callback)` 一次性安装钩子；普通加载不触发，Registry 安装成功后执行，异常会报告安装失败并删除本次安装目录，覆盖一次性执行回归测试。
+
+- 插件 Raw Cell 尺寸：新增 `panel:size()`，Sidebar/Bottom 渲染时传入当前 Ratatui 内容区宽高，Raw Cell 插件可以根据实际布局自适应绘制，并新增尺寸读取回归测试。
+
+- 插件 Diff 导航：`ttt.editor.diff()` 可读取活动可编辑 Diff 的变更块，`editor.go_to_diff_hunk(index)` 通过 Host 请求跳转并滚动到指定 hunk，新增 Lua API 与请求队列回归测试。
+
+- 插件 Raw Cell 坐标绘制：`panel:text(x, y, text)`、`panel:cell(x, y, char)` 现在保留坐标、支持多行文本和空白填充；`panel:clear(x, y, w, h)` 会清理对应二维区域，新增位置与清理回归测试。
+
+- 插件书签交互：`gutter.click(path, line)` 已在编辑器行号左侧书签列接入，按 `editor.bookmarks` 权限派发；无订阅时保留原有编辑器行为，并新增事件位置回归测试。
+
+- LSP Code Action 命令动作：Code Action 不再只接受工作区编辑；标准 `command`/`arguments` 动作会进入统一选择流程，并调用 `workspace/executeCommand`，新增命令变体规范化测试。
+
+- 普通面板控件回归隔离：新增测试确认 Sidebar/Bottom/Tab 面板中的 button/input/checkbox/dropdown 不会注册 Drawer 专属状态，也不会误消费 Drawer 输入、焦点或激活事件。
+
+- 插件控件状态隔离：Drawer 专属 button/input/checkbox/dropdown 状态仅在 `__drawer` 渲染上下文注册，普通 Sidebar/Bottom/Tab 面板不会误占用 Drawer 回调或输入状态。
+
+- 插件 Table 命令：支持 `key_commands` 快捷键映射，并将当前 1-based 行号与命令传递给 `on_command(command, row_index)`，覆盖键盘操作路径。
+
+- 插件 Raw Cell API：panel proxy 新增 `clear(x, y, width, height)` 兼容入口，允许上游插件安全清理自定义绘制区域。
+
+- 插件 Drawer 兼容补齐：panel proxy 新增 `keyvalue`、`divider`、容器 `render` 子内容和顶层坐标式 `text/cell`，Drawer button 的 `on_click`、input 的 `on_change`/`on_submit`、checkbox 状态切换与 dropdown 选择已接入鼠标/键盘交互，覆盖上游 `ttt-mcp` 的 `mcp.drawer` 渲染路径。
+
+- 插件事件派发稳定性：`ttt.events` 和 `key.press` 会在调用 Lua 前快照回调函数，回调中新增/修改订阅不会触发借用冲突；新增回归测试覆盖同一事件派发期间动态注册监听器。
+
+- 插件输入回调容错：Sidebar/Bottom/Drawer、自定义标签、文件视图和命令行的 `on_event`/`on_key` Lua 异常会记录到插件日志并按未消费处理，避免单个故障插件阻塞宿主输入。
 
 - 插件事件 payload：`editor.change`/`cursor.change` 现在附带当前行文本、文档行数和 dirty 状态，并保持旧版回调参数兼容。
 - 插件交互弹层：`ttt.confirm`、`ttt.show_info`，包含 overlay 焦点恢复、Enter/Esc 操作和确认回调。

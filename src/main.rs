@@ -21,8 +21,9 @@ use std::os::unix::net::{UnixListener, UnixStream};
 
 use crossterm::{
     event::{
-        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+        self, DisableBracketedPaste, DisableFocusChange, EnableBracketedPaste, EnableFocusChange,
+        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+        MouseEventKind,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -99,7 +100,8 @@ fn main() -> AppResult<()> {
         stdout,
         EnterAlternateScreen,
         crossterm::event::EnableMouseCapture,
-        EnableBracketedPaste
+        EnableBracketedPaste,
+        EnableFocusChange
     )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
@@ -116,6 +118,7 @@ fn main() -> AppResult<()> {
         terminal.backend_mut(),
         crossterm::event::DisableMouseCapture,
         DisableBracketedPaste,
+        DisableFocusChange,
         LeaveAlternateScreen
     )?;
     terminal.show_cursor()?;
@@ -216,6 +219,16 @@ fn run<B: ratatui::backend::Backend>(
                         mouse,
                         ratatui::layout::Rect::new(0, 0, size.width, size.height),
                     );
+                }
+                Event::FocusGained => {
+                    if let Err(error) = app.handle_focus_event(true) {
+                        app.set_status_message(format!("Focus reporting error: {error}"));
+                    }
+                }
+                Event::FocusLost => {
+                    if let Err(error) = app.handle_focus_event(false) {
+                        app.set_status_message(format!("Focus reporting error: {error}"));
+                    }
                 }
                 _ => {}
             }
@@ -829,7 +842,7 @@ mod tests {
     #[test]
     fn exec_action_runs_bounded_command_array() {
         let action = serde_json::json!({
-            "command": [std::env::current_exe().expect("exe"), "--list"],
+            "command": ["/bin/echo", "mtide"],
             "ms": 1000
         });
         execute_external_script_action(&action).expect("exec");

@@ -50,6 +50,7 @@ pub struct TerminalScreen {
     bracketed_paste: bool,
     mouse_tracking: MouseTracking,
     mouse_sgr: bool,
+    focus_reporting: bool,
     title: String,
     style: TerminalStyle,
     styles: Vec<Vec<TerminalStyle>>,
@@ -100,6 +101,7 @@ struct MainSnapshot {
     reverse_video: bool,
     auto_repeat: bool,
     cursor_shape: CursorShape,
+    focus_reporting: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -177,6 +179,7 @@ impl TerminalScreen {
             bracketed_paste: false,
             mouse_tracking: MouseTracking::None,
             mouse_sgr: false,
+            focus_reporting: false,
             title: String::new(),
             style: TerminalStyle::default(),
             styles: vec![vec![TerminalStyle::default(); columns as usize]; rows as usize],
@@ -411,6 +414,10 @@ impl TerminalScreen {
 
     pub const fn mouse_sgr(&self) -> bool {
         self.mouse_sgr
+    }
+
+    pub const fn focus_reporting(&self) -> bool {
+        self.focus_reporting
     }
 
     pub const fn bracketed_paste(&self) -> bool {
@@ -908,6 +915,8 @@ impl TerminalScreen {
             }
             'h' if private && values.first() == Some(&1006) => self.mouse_sgr = true,
             'l' if private && values.first() == Some(&1006) => self.mouse_sgr = false,
+            'h' if private && values.first() == Some(&1004) => self.focus_reporting = true,
+            'l' if private && values.first() == Some(&1004) => self.focus_reporting = false,
             'm' => self.apply_sgr(&values),
             'n' if private => {
                 if values.first().copied() == Some(6) {
@@ -930,9 +939,10 @@ impl TerminalScreen {
                     7 => self.autowrap,
                     25 => self.cursor_visible,
                     2004 => self.bracketed_paste,
+                    1004 => self.focus_reporting,
                     _ => false,
                 };
-                let status = if matches!(mode, 1 | 7 | 25 | 2004) {
+                let status = if matches!(mode, 1 | 7 | 25 | 2004 | 1004) {
                     if enabled {
                         1
                     } else {
@@ -1179,6 +1189,7 @@ impl TerminalScreen {
         self.bracketed_paste = false;
         self.mouse_tracking = MouseTracking::None;
         self.mouse_sgr = false;
+        self.focus_reporting = false;
         self.style = TerminalStyle::default();
         self.current_link = None;
         self.saved_cursor = None;
@@ -1313,6 +1324,7 @@ impl TerminalScreen {
             reverse_video: self.reverse_video,
             auto_repeat: self.auto_repeat,
             cursor_shape: self.cursor_shape,
+            focus_reporting: self.focus_reporting,
         });
         self.cells = vec![vec![' '; self.columns as usize]; self.rows as usize];
         self.wide = vec![vec![false; self.columns as usize]; self.rows as usize];
@@ -1368,6 +1380,7 @@ impl TerminalScreen {
         self.reverse_video = snapshot.reverse_video;
         self.auto_repeat = snapshot.auto_repeat;
         self.cursor_shape = snapshot.cursor_shape;
+        self.focus_reporting = snapshot.focus_reporting;
         self.scroll_offset = 0;
         self.alternate = false;
     }
@@ -1552,6 +1565,14 @@ impl TerminalState {
             return Ok(false);
         };
         self.write_bytes(&bytes)?;
+        Ok(true)
+    }
+
+    pub fn handle_focus(&mut self, focused: bool) -> AppResult<bool> {
+        if !self.screen.focus_reporting() || self.session.is_none() {
+            return Ok(false);
+        }
+        self.write_bytes(if focused { b"\x1b[I" } else { b"\x1b[O" })?;
         Ok(true)
     }
 
@@ -1994,6 +2015,20 @@ mod tests {
             screen.take_device_responses(),
             b"\x1b[?25;2$y\x1b[?2004;1$y"
         );
+    }
+
+    #[test]
+    fn terminal_screen_tracks_focus_reporting_mode() {
+        let mut screen = TerminalScreen::new(8, 2);
+        assert!(!screen.focus_reporting());
+        screen.feed(b"\x1b[?1004h\x1b[?1004$p");
+        assert!(screen.focus_reporting());
+        assert_eq!(screen.take_device_responses(), b"\x1b[?1004;1$y");
+        screen.feed(b"\x1b[?1049h\x1b[?1004l\x1b[?1049l");
+        assert!(screen.focus_reporting());
+        screen.feed(b"\x1b[?1004l\x1b[?1004$p");
+        assert!(!screen.focus_reporting());
+        assert_eq!(screen.take_device_responses(), b"\x1b[?1004;2$y");
     }
 
     #[test]

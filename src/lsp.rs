@@ -200,7 +200,7 @@ impl LspManager {
         true
     }
 
-    pub fn poll(&mut self) {
+    pub fn poll(&mut self) -> Vec<(String, Value)> {
         let exited: Vec<_> = self
             .clients
             .iter_mut()
@@ -212,12 +212,32 @@ impl LspManager {
         }
         let messages: Vec<_> = self
             .clients
-            .values_mut()
-            .flat_map(LspClient::poll_notifications)
+            .iter_mut()
+            .flat_map(|(language, client)| {
+                let language = language.clone();
+                client
+                    .poll_notifications()
+                    .map(move |message| (language.clone(), message))
+            })
             .collect();
-        for message in messages {
-            self.apply_notification(&message);
+        messages
+    }
+
+    pub fn respond(&mut self, language: &str, id: &Value, result: Value) -> AppResult<bool> {
+        let Some(client) = self.clients.get_mut(language) else {
+            return Ok(false);
+        };
+        client.respond(id, result)?;
+        Ok(true)
+    }
+
+    pub fn shutdown(&mut self) {
+        for client in self.clients.values_mut() {
+            let _ = client.shutdown();
         }
+        self.clients.clear();
+        self.states.clear();
+        self.document_versions.clear();
     }
 }
 
@@ -349,6 +369,13 @@ impl LspClient {
         self.notifications.drain(..)
     }
 
+    fn respond(&mut self, id: &Value, result: Value) -> AppResult<()> {
+        write_message(
+            &mut self.stdin,
+            &json!({"jsonrpc":"2.0","id":id,"result":result}),
+        )
+    }
+
     pub fn initialize(&mut self, root_uri: Option<&str>) -> AppResult<Value> {
         let result = self.request(
             "initialize",
@@ -359,8 +386,10 @@ impl LspClient {
                     "textDocument": {
                         "synchronization": {"didSave": true, "dynamicRegistration": false},
                         "completion": {"completionItem": {"snippetSupport": false}},
-                        "hover": {"contentFormat": ["markdown", "plaintext"]}
-                    }
+                        "hover": {"contentFormat": ["markdown", "plaintext"]},
+                        "documentSymbol": {"hierarchicalDocumentSymbolSupport": true}
+                    },
+                    "workspaceSymbol": {}
                 }
             }),
         )?;
@@ -419,6 +448,18 @@ impl LspClient {
         write_message(&mut self.stdin, &json!({"jsonrpc":"2.0","method":"exit"}))?;
         let _ = self.child.kill();
         Ok(())
+    }
+}
+
+impl Drop for LspClient {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+    }
+}
+
+impl Drop for LspManager {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 

@@ -12,6 +12,48 @@ pub struct Position {
     pub column: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct IndentInfo {
+    pub use_tabs: bool,
+    pub has_tabs: bool,
+    pub size: Option<usize>,
+}
+
+pub fn detect_indent(lines: &[String]) -> IndentInfo {
+    let mut tabs = 0usize;
+    let mut spaces = 0usize;
+    let mut diffs = [0usize; 9];
+    let mut previous = 0usize;
+    for line in lines.iter().take(200) {
+        let prefix: String = line
+            .chars()
+            .take_while(|character| *character == ' ' || *character == '\t')
+            .collect();
+        if prefix.is_empty() {
+            previous = 0;
+            continue;
+        }
+        if prefix.contains('\t') {
+            tabs += 1;
+        } else {
+            spaces += 1;
+        }
+        let diff = prefix.chars().count().abs_diff(previous);
+        if (1..=8).contains(&diff) {
+            diffs[diff] += 1;
+        }
+        previous = prefix.chars().count();
+    }
+    let size = (1..=8)
+        .filter(|&candidate| diffs[candidate] > 0)
+        .max_by_key(|&candidate| (diffs[candidate], std::cmp::Reverse(candidate)));
+    IndentInfo {
+        use_tabs: tabs > spaces,
+        has_tabs: tabs > 0,
+        size,
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Snapshot {
     lines: Vec<String>,
@@ -32,6 +74,7 @@ pub struct Buffer {
     readonly: bool,
     undo_group_depth: usize,
     undo_group_checkpointed: bool,
+    indent_info: IndentInfo,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,6 +120,7 @@ impl Buffer {
             .as_deref()
             .and_then(|path| fs::metadata(path).ok())
             .and_then(|metadata| metadata.modified().ok());
+        let indent_info = detect_indent(&lines);
         Self {
             saved_lines: lines.clone(),
             lines,
@@ -90,6 +134,7 @@ impl Buffer {
             readonly: false,
             undo_group_depth: 0,
             undo_group_checkpointed: false,
+            indent_info,
         }
     }
 
@@ -107,6 +152,9 @@ impl Buffer {
     }
     pub fn path(&self) -> Option<&Path> {
         self.path.as_deref()
+    }
+    pub const fn indent_info(&self) -> IndentInfo {
+        self.indent_info
     }
     pub fn set_readonly(&mut self, readonly: bool) {
         self.readonly = readonly;
@@ -135,6 +183,7 @@ impl Buffer {
         }
         let text = fs::read_to_string(path)?;
         self.lines = split_lines(&text);
+        self.indent_info = detect_indent(&self.lines);
         self.saved_lines = self.lines.clone();
         self.undo.clear();
         self.redo.clear();
@@ -152,6 +201,7 @@ impl Buffer {
         };
         let text = fs::read_to_string(&path)?;
         self.lines = split_lines(&text);
+        self.indent_info = detect_indent(&self.lines);
         self.saved_lines = self.lines.clone();
         self.undo.clear();
         self.redo.clear();
@@ -629,6 +679,41 @@ impl Buffer {
         let column = (self.cursor.column as isize + column_delta).clamp(0, max as isize) as usize;
         self.cursor = Position { line, column };
     }
+
+    pub fn move_word_left(&mut self) {
+        if self.cursor.column > 0 {
+            let characters: Vec<char> = self.lines[self.cursor.line].chars().collect();
+            let mut column = self.cursor.column.min(characters.len());
+            while column > 0 && characters[column - 1].is_whitespace() {
+                column -= 1;
+            }
+            while column > 0 && !characters[column - 1].is_whitespace() {
+                column -= 1;
+            }
+            self.cursor.column = column;
+        } else if self.cursor.line > 0 {
+            self.cursor.line -= 1;
+            self.cursor.column = self.lines[self.cursor.line].chars().count();
+        }
+    }
+
+    pub fn move_word_right(&mut self) {
+        let characters: Vec<char> = self.lines[self.cursor.line].chars().collect();
+        if self.cursor.column < characters.len() {
+            let mut column = self.cursor.column;
+            while column < characters.len() && characters[column].is_whitespace() {
+                column += 1;
+            }
+            while column < characters.len() && !characters[column].is_whitespace() {
+                column += 1;
+            }
+            self.cursor.column = column;
+        } else if self.cursor.line + 1 < self.lines.len() {
+            self.cursor.line += 1;
+            self.cursor.column = 0;
+        }
+    }
+
     pub fn move_home(&mut self) {
         self.cursor.column = 0;
     }
@@ -639,6 +724,16 @@ impl Buffer {
     }
     pub fn move_end(&mut self) {
         self.cursor.column = self.lines[self.cursor.line].chars().count();
+    }
+    pub fn move_file_start(&mut self) {
+        self.cursor = Position { line: 0, column: 0 };
+    }
+    pub fn move_file_end(&mut self) {
+        let line = self.lines.len().saturating_sub(1);
+        self.cursor = Position {
+            line,
+            column: self.lines[line].chars().count(),
+        };
     }
 
     pub fn undo(&mut self) {
@@ -942,6 +1037,57 @@ impl Buffer {
             }
         }
     }
+
+    pub fn indent_lines(&mut self, start: usize, end: usize, prefix: &str) {
+        if self.readonly || prefix.is_empty() {
+            return;
+        }
+        let start = start.min(self.lines.len().saturating_sub(1));
+        let end = end.min(self.lines.len().saturating_sub(1)).max(start);
+        self.checkpoint();
+        for line in &mut self.lines[start..=end] {
+            line.insert_str(0, prefix);
+        }
+        if (start..=end).contains(&self.cursor.line) {
+            self.cursor.column += prefix.chars().count();
+        }
+    }
+
+    pub fn outdent_lines(&mut self, start: usize, end: usize, width: usize) {
+        if self.readonly || width == 0 {
+            return;
+        }
+        let start = start.min(self.lines.len().saturating_sub(1));
+        let end = end.min(self.lines.len().saturating_sub(1)).max(start);
+        let removals: Vec<usize> = self.lines[start..=end]
+            .iter()
+            .map(|line| {
+                if line.starts_with('\t') {
+                    1
+                } else {
+                    line.chars()
+                        .take(width)
+                        .take_while(|character| *character == ' ')
+                        .count()
+                }
+            })
+            .collect();
+        if removals.iter().all(|removed| *removed == 0) {
+            return;
+        }
+        self.checkpoint();
+        for (line, removed) in self.lines[start..=end].iter_mut().zip(removals.iter()) {
+            if line.starts_with('\t') {
+                line.remove(0);
+            } else {
+                *line = line.chars().skip(*removed).collect();
+            }
+        }
+        if (start..=end).contains(&self.cursor.line) {
+            let removed = removals[self.cursor.line - start];
+            self.cursor.column = self.cursor.column.saturating_sub(removed);
+        }
+    }
     fn snapshot(&self) -> Snapshot {
         Snapshot {
             lines: self.lines.clone(),
@@ -1026,6 +1172,31 @@ mod tests {
         assert!(b.dirty());
         b.undo();
         assert!(!b.dirty());
+    }
+
+    #[test]
+    fn detect_indent_uses_smallest_size_on_frequency_tie() {
+        let lines = vec![
+            "root".into(),
+            "  two".into(),
+            "    four".into(),
+            "      six".into(),
+            "    four".into(),
+            "  two".into(),
+        ];
+        let info = detect_indent(&lines);
+        assert_eq!(info.size, Some(2));
+        assert!(!info.use_tabs);
+    }
+
+    #[test]
+    fn detect_indent_identifies_tabs_and_limits_sample() {
+        let mut lines = vec!["root".to_owned()];
+        lines.extend((0..120).map(|_| "\tchild".to_owned()));
+        lines.extend((0..130).map(|_| "  spaces".to_owned()));
+        let info = detect_indent(&lines);
+        assert!(info.has_tabs);
+        assert!(info.use_tabs);
     }
 
     #[test]
@@ -1148,6 +1319,22 @@ mod tests {
     }
 
     #[test]
+    fn indent_and_outdent_lines_are_single_undoable_operations() {
+        let mut b = Buffer::new(vec!["one".into(), "two".into()], None);
+        b.set_cursor(1, 1);
+        b.indent_lines(0, 1, "  ");
+        assert_eq!(b.lines(), &["  one", "  two"]);
+        assert_eq!(b.cursor(), Position { line: 1, column: 3 });
+        b.outdent_lines(0, 1, 2);
+        assert_eq!(b.lines(), &["one", "two"]);
+        assert_eq!(b.cursor(), Position { line: 1, column: 1 });
+        b.undo();
+        assert_eq!(b.lines(), &["  one", "  two"]);
+        b.undo();
+        assert_eq!(b.lines(), &["one", "two"]);
+    }
+
+    #[test]
     fn word_deletion_is_unicode_safe_and_single_undoable_operation() {
         let mut backward = Buffer::new(vec!["你好  world".into(), "next line".into()], None);
         backward.set_cursor(0, 9);
@@ -1174,6 +1361,32 @@ mod tests {
         forward.set_cursor(0, 3);
         forward.delete_word_forward();
         assert_eq!(forward.lines(), &["你好 next".to_owned()]);
+    }
+
+    #[test]
+    fn word_navigation_uses_rune_columns_and_crosses_lines() {
+        let mut buffer = Buffer::new(vec!["你好  world".into(), "next".into()], None);
+        buffer.set_cursor(0, 9);
+        buffer.move_word_left();
+        assert_eq!(buffer.cursor(), Position { line: 0, column: 4 });
+        buffer.move_word_left();
+        assert_eq!(buffer.cursor(), Position { line: 0, column: 0 });
+        buffer.move_word_right();
+        assert_eq!(buffer.cursor(), Position { line: 0, column: 2 });
+        buffer.move_word_right();
+        assert_eq!(buffer.cursor(), Position { line: 0, column: 9 });
+        buffer.move_word_right();
+        assert_eq!(buffer.cursor(), Position { line: 1, column: 0 });
+    }
+
+    #[test]
+    fn file_navigation_jumps_to_document_boundaries() {
+        let mut buffer = Buffer::new(vec!["first".into(), "中间".into(), "last".into()], None);
+        buffer.set_cursor(1, 1);
+        buffer.move_file_end();
+        assert_eq!(buffer.cursor(), Position { line: 2, column: 4 });
+        buffer.move_file_start();
+        assert_eq!(buffer.cursor(), Position { line: 0, column: 0 });
     }
 
     #[test]
