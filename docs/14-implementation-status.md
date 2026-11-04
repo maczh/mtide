@@ -98,6 +98,7 @@ cargo build --offline
 - 插件表格水平滚动：`table` 支持 `scroll_x`/`horizontal_scroll` 和可选 `width`，按 Unicode 字符窗口裁剪行内容并覆盖回归测试。
 - 插件弹层鼠标交互：自定义 dialog 会按内容行定位 input、dropdown 和 button，鼠标点击可切换焦点并触发对应控件动作；键盘导航和关闭焦点恢复保持不变。
 - 插件 Tab 生命周期清理：自定义 tab/file view 的 `on_close` 回调执行后删除 registry key，避免重复打开关闭累积 Lua 资源。
+- 插件只读/差异标签资源上下文：`ttt.open_readonly` 与 `ttt.open_diff` 的可选 `file_path` 已随 Host 的 `OpenTab` 请求保留，供标签生命周期关联资源。
 - 默认工作区启动：无显式 target 时聚合全部 `defaultFolders`/`startupFolders` 为多根 workspace，并支持 `~/` 展开与目录校验。
 - 默认工作区清除：新增 `--clear-default-folders`，清空并持久化当前配置的默认启动目录。
 - GitHub PR target：已增加 GitHub Pull Request URL 的安全解析与仓库/编号校验；远程 fetch、review diff、评论加载/提交和按评论定位已接入。

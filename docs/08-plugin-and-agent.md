@@ -56,9 +56,9 @@ Lua 模块通过 `require("ttt")` 注入，不假设全局变量。插件加载�
 
 `ttt.open_tab(config)` / `ttt.focus_tab(id)` / `ttt.close_tab(id)` 已支持自定义编辑器标签：`config` 需要 `title` 与 `render(panel)`，可选 `id`/`focus`，并要求 `panel.editor` 权限；Host 会保留自定义标签的 ID 和标题、在每次主循环刷新其渲染内容，并支持按 ID 聚焦或关闭。重复打开同一 ID 会复用该标签标识并更新其内容；未知 ID 的 `focus_tab`/`close_tab` 返回 `false`。
 
-`ttt.open_readonly(title, lines, file_path)` 可直接创建只读内容标签，自动将字符串数组渲染为面板行；该接口不要求额外权限，返回标签 ID，`file_path` 保留用于后续语法高亮扩展。
+`ttt.open_readonly(title, lines, file_path)` 可直接创建只读内容标签，自动将字符串数组渲染为面板行；该接口不要求额外权限，返回标签 ID，Host 会保留可选 `file_path` 作为标签资源上下文。
 
-`ttt.open_diff(title, old_lines, new_lines, file_path)` 可创建只读差异标签，按行级 LCS 生成上下文（`  `）、删除（`- `）和新增（`+ `）行，并复用自定义编辑器标签生命周期；超大输入采用有界的删除/新增回退策略；`file_path` 保留用于后续按语言高亮和统一 diff 模型扩展。
+`ttt.open_diff(title, old_lines, new_lines, file_path)` 可创建只读差异标签，按行级 LCS 生成上下文（`  `）、删除（`- `）和新增（`+ `）行，并复用自定义编辑器标签生命周期；超大输入采用有界的删除/新增回退策略；Host 会保留可选 `file_path` 作为差异资源上下文。
 
 `ttt.open_file(path, line, readonly)` 会向 Host 请求打开工作区文件，支持 1-based 行号定位和只读打开；相对路径按当前工作区根解析，读取失败会转为 Host 状态栏错误。只读缓冲区拒绝编辑、撤销/重做和保存操作。
 

@@ -214,6 +214,7 @@ pub struct App {
     workspace_roots: Vec<PathBuf>,
     explorer_roots: Vec<PathBuf>,
     explorer_paths: Vec<PathBuf>,
+    explorer_expanded: BTreeSet<PathBuf>,
     explorer_index: usize,
     explorer_mode: Option<ExplorerMode>,
     explorer_input: String,
@@ -260,6 +261,7 @@ pub struct App {
     plugin_tab_split: bool,
     plugin_tab_collapsed_hunks: BTreeSet<usize>,
     plugin_file_view: Option<(String, String)>,
+    plugin_file_view_path: Option<PathBuf>,
     git_diff_tab_text: Option<String>,
     plugin_diff_file_path: Option<PathBuf>,
     plugin_file_close: Option<(usize, u64)>,
@@ -581,6 +583,7 @@ impl App {
             workspace_roots,
             explorer_roots,
             explorer_paths,
+            explorer_expanded: BTreeSet::new(),
             explorer_index: 0,
             explorer_mode: None,
             explorer_input: String::new(),
@@ -627,6 +630,7 @@ impl App {
             plugin_tab_split: false,
             plugin_tab_collapsed_hunks: BTreeSet::new(),
             plugin_file_view: None,
+            plugin_file_view_path: None,
             git_diff_tab_text: None,
             plugin_diff_file_path: None,
             plugin_file_close: None,
@@ -677,6 +681,9 @@ impl App {
     }
     pub const fn focus(&self) -> Focus {
         self.focus
+    }
+    pub fn set_focus(&mut self, focus: Focus) {
+        self.focus = focus;
     }
     pub fn automation_panel(&mut self, panel: &str) -> AppResult<()> {
         self.focus = match panel.to_ascii_lowercase().as_str() {
@@ -1092,6 +1099,23 @@ impl App {
             .unwrap_or("?")
             .to_owned()
     }
+    pub fn explorer_depth(&self, path: &Path) -> usize {
+        let roots = if self.explorer_roots.len() > 1 {
+            &self.explorer_roots
+        } else {
+            return path
+                .strip_prefix(self.explorer_roots.first().unwrap_or(&self.search_root))
+                .map(|relative| relative.components().count())
+                .unwrap_or(0);
+        };
+        roots
+            .iter()
+            .find_map(|root| path.strip_prefix(root).ok().map(|p| p.components().count()))
+            .unwrap_or(0)
+    }
+    pub fn explorer_expanded(&self, path: &Path) -> bool {
+        self.explorer_expanded.contains(path)
+    }
     pub const fn explorer_index(&self) -> usize {
         self.explorer_index
     }
@@ -1100,6 +1124,36 @@ impl App {
     }
     pub fn explorer_input(&self) -> &str {
         &self.explorer_input
+    }
+    pub fn explorer_click(&mut self, index: usize) -> AppResult<()> {
+        if index >= self.explorer_paths.len() {
+            return Ok(());
+        }
+        self.focus = Focus::Explorer;
+        self.explorer_index = index;
+        self.handle_explorer_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+    }
+    pub fn explorer_hover(&mut self, index: usize) {
+        if index < self.explorer_paths.len() {
+            self.explorer_index = index;
+        }
+    }
+    pub fn select_sidebar_tab_by_index(&mut self, index: usize) {
+        let tab = match index {
+            0 => SidebarTab::Explorer,
+            1 => SidebarTab::Search,
+            2 => SidebarTab::Changes,
+            3 => SidebarTab::Branches,
+            _ => return,
+        };
+        self.select_sidebar(tab);
+    }
+    pub fn menu_click(&mut self, index: usize) {
+        let label = ["File", "Edit", "View", "Options", "Help"]
+            .get(index)
+            .copied()
+            .unwrap_or("Menu");
+        self.status_message = format!("{label} menu · use Ctrl-P for commands");
     }
     pub fn terminal_input(&self) -> &str {
         self.terminals[self.active_terminal].input()
@@ -1636,12 +1690,18 @@ impl App {
                         self.plugin_drawer = None;
                     }
                 }
-                PluginPanelRequest::OpenTab { id, title, focus } => {
+                PluginPanelRequest::OpenTab {
+                    id,
+                    title,
+                    file_path,
+                    focus,
+                } => {
                     if let Some(runtime) = self.plugin_runtimes.get(runtime_index) {
                         if let Ok(Some(text)) = runtime.render_panel(&format!("__tab:{id}")) {
                             self.git_diff_tab_text = None;
                             self.plugin_diff_file_path = None;
                             self.plugin_file_view = Some((title, text));
+                            self.plugin_file_view_path = file_path.map(PathBuf::from);
                             self.plugin_custom_tab = Some((runtime_index, id));
                             self.plugin_tab_scroll = 0;
                             self.plugin_tab_hunk = 0;
@@ -1666,6 +1726,7 @@ impl App {
                             self.git_diff_tab_text = None;
                             self.plugin_diff_file_path = file_path.map(PathBuf::from);
                             self.plugin_file_view = Some((title, text));
+                            self.plugin_file_view_path = None;
                             self.plugin_custom_tab = Some((runtime_index, id));
                             self.plugin_tab_scroll = 0;
                             self.plugin_tab_hunk = 0;
@@ -1692,6 +1753,7 @@ impl App {
                         }
                         self.plugin_custom_tab = None;
                         self.plugin_file_view = None;
+                        self.plugin_file_view_path = None;
                         self.plugin_tab_scroll = 0;
                         self.plugin_tab_hunk = 0;
                         self.plugin_tab_split = false;
@@ -1956,6 +2018,7 @@ impl App {
         self.plugin_custom_tab = None;
         self.git_diff_tab_text = Some(text);
         self.plugin_file_view = Some(("Git diff".to_owned(), String::new()));
+        self.plugin_file_view_path = None;
         self.plugin_tab_scroll = 0;
         self.plugin_tab_hunk = 0;
         self.plugin_tab_split = true;
@@ -2474,6 +2537,7 @@ impl App {
                     .to_owned()
             });
             self.plugin_file_view = Some((title, text));
+            self.plugin_file_view_path = None;
             self.git_diff_tab_text = None;
             self.plugin_diff_file_path = None;
             self.plugin_file_close = close_id.map(|id| (runtime_index, id));
@@ -2494,6 +2558,7 @@ impl App {
                 }
             }
             self.plugin_file_view = None;
+            self.plugin_file_view_path = None;
             self.git_diff_tab_text = None;
             self.plugin_diff_file_path = None;
             self.plugin_tab_scroll = 0;
@@ -2505,6 +2570,7 @@ impl App {
         }
         let Some((runtime_index, close_id)) = self.plugin_file_close.take() else {
             self.plugin_file_view = None;
+            self.plugin_file_view_path = None;
             self.git_diff_tab_text = None;
             self.plugin_diff_file_path = None;
             return;
@@ -2516,6 +2582,7 @@ impl App {
         }
         self.emit_plugin_event("tab.close");
         self.plugin_file_view = None;
+        self.plugin_file_view_path = None;
         self.git_diff_tab_text = None;
         self.plugin_diff_file_path = None;
         self.plugin_tab_scroll = 0;
@@ -4170,11 +4237,7 @@ impl App {
             (KeyModifiers::NONE, KeyCode::Enter) => {
                 if let Some(path) = self.explorer_paths.get(self.explorer_index).cloned() {
                     if path.is_dir() {
-                        self.search_root = path;
-                        self.explorer_paths = list_directory(&self.search_root);
-                        self.explorer_index = 0;
-                        self.status_message =
-                            format!("Opened folder · {}", self.search_root.display());
+                        self.toggle_explorer_directory(&path);
                     } else {
                         if !self.open_plugin_file(&path)? {
                             self.open_buffer(Buffer::open(&path)?);
@@ -4342,14 +4405,31 @@ impl App {
     }
 
     fn explorer_entries(&self) -> Vec<PathBuf> {
-        if self.explorer_roots.len() > 1 {
-            self.explorer_roots
-                .iter()
-                .flat_map(|root| list_directory(root))
-                .collect()
+        let roots = if self.explorer_roots.len() > 1 {
+            self.explorer_roots.clone()
         } else {
-            list_directory(self.explorer_roots.first().unwrap_or(&self.search_root))
+            vec![self
+                .explorer_roots
+                .first()
+                .cloned()
+                .unwrap_or_else(|| self.search_root.clone())]
+        };
+        roots
+            .iter()
+            .flat_map(|root| visible_explorer_entries(root, &self.explorer_expanded))
+            .collect()
+    }
+
+    fn toggle_explorer_directory(&mut self, path: &Path) {
+        if !self.explorer_expanded.remove(path) {
+            self.explorer_expanded.insert(path.to_path_buf());
         }
+        self.refresh_explorer();
+        self.status_message = if self.explorer_expanded.contains(path) {
+            format!("Expanded {}", path.display())
+        } else {
+            format!("Collapsed {}", path.display())
+        };
     }
 
     fn refresh_explorer(&mut self) {
@@ -6896,6 +6976,20 @@ fn list_directory(root: &Path) -> Vec<PathBuf> {
     paths.into_iter().map(|(_, _, path)| path).collect()
 }
 
+fn visible_explorer_entries(root: &Path, expanded: &BTreeSet<PathBuf>) -> Vec<PathBuf> {
+    let mut output = Vec::new();
+    fn visit(path: &Path, expanded: &BTreeSet<PathBuf>, output: &mut Vec<PathBuf>) {
+        for child in list_directory(path) {
+            output.push(child.clone());
+            if child.is_dir() && expanded.contains(&child) {
+                visit(&child, expanded, output);
+            }
+        }
+    }
+    visit(root, expanded, &mut output);
+    output
+}
+
 fn indentation_width(line: &str) -> usize {
     line.chars()
         .take_while(|character| *character == '\t' || *character == ' ')
@@ -8616,6 +8710,9 @@ mod tests {
                 sha256: None,
             })
             .collect();
+        app.change_diff.clear();
+        app.history.clear();
+        app.blame_lines.clear();
         app.focus = Focus::Output;
         app.handle_key(key(KeyCode::End, KeyModifiers::NONE))
             .expect("output end");

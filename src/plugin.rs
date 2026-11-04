@@ -440,6 +440,7 @@ pub enum PluginPanelRequest {
     OpenTab {
         id: String,
         title: String,
+        file_path: Option<String>,
         focus: bool,
     },
     OpenChangesTab {
@@ -1782,7 +1783,12 @@ impl PluginRuntime {
                     open_tabs_sink.borrow_mut().insert(id.clone(), on_close);
                     tab_request_sink
                         .borrow_mut()
-                        .push(PluginPanelRequest::OpenTab { id, title, focus });
+                        .push(PluginPanelRequest::OpenTab {
+                            id,
+                            title,
+                            file_path: None,
+                            focus,
+                        });
                     Ok(tab_id)
                 })
                 .map_err(lua_error)?,
@@ -1850,7 +1856,7 @@ impl PluginRuntime {
             .set(
                 "open_readonly",
                 lua.create_function(
-                    move |lua, (title, lines, _file_path): (String, Table, Option<String>)| {
+                    move |lua, (title, lines, file_path): (String, Table, Option<String>)| {
                         if title.is_empty() {
                             return Err(mlua::Error::external("readonly tab title is required"));
                         }
@@ -1877,6 +1883,7 @@ impl PluginRuntime {
                             .push(PluginPanelRequest::OpenTab {
                                 id: id.clone(),
                                 title,
+                                file_path,
                                 focus: true,
                             });
                         Ok(id)
@@ -1894,7 +1901,7 @@ impl PluginRuntime {
                 "open_diff",
                 lua.create_function(
                     move |lua,
-                          (title, old_lines, new_lines, _file_path): (
+                          (title, old_lines, new_lines, file_path): (
                         String,
                         Table,
                         Table,
@@ -1930,6 +1937,7 @@ impl PluginRuntime {
                             .push(PluginPanelRequest::OpenTab {
                                 id: id.clone(),
                                 title,
+                                file_path: file_path.clone(),
                                 focus: true,
                             });
                         Ok(id)
@@ -8046,11 +8054,13 @@ ttt.register({sidebar = {title = "Demo", render = function(panel) panel:label("p
                 PluginPanelRequest::OpenTab {
                     id: "Read-only".to_owned(),
                     title: "Read-only".to_owned(),
+                    file_path: Some("note.txt".to_owned()),
                     focus: true,
                 },
                 PluginPanelRequest::OpenTab {
                     id: "Diff".to_owned(),
                     title: "Diff".to_owned(),
+                    file_path: Some("note.txt".to_owned()),
                     focus: true,
                 },
                 PluginPanelRequest::OpenFile {
@@ -8077,6 +8087,7 @@ ttt.register({sidebar = {title = "Demo", render = function(panel) panel:label("p
                 PluginPanelRequest::OpenTab {
                     id: "demo-tab".to_owned(),
                     title: "Demo Tab".to_owned(),
+                    file_path: None,
                     focus: true,
                 },
                 PluginPanelRequest::FocusTab {

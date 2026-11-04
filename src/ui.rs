@@ -258,6 +258,77 @@ pub fn handle_mouse(app: &mut App, event: MouseEvent, area: Rect) {
         }
         return;
     }
+    if let Some(index) = menu_hit(area, event.column, event.row) {
+        if matches!(event.kind, MouseEventKind::Down(MouseButton::Left)) {
+            app.menu_click(index);
+        }
+        return;
+    }
+    if let Some(sidebar) = sidebar_area(app, area) {
+        if event.column >= sidebar.x
+            && event.column < sidebar.right()
+            && event.row >= sidebar.y
+            && event.row < sidebar.bottom()
+        {
+            let bottom_height = if app.sidebar_tab() == SidebarTab::Explorer {
+                Constraint::Length(0)
+            } else {
+                Constraint::Length(3)
+            };
+            let parts = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(2), Constraint::Min(3), bottom_height])
+                .split(sidebar);
+            let body = parts[1];
+            if event.row < body.y {
+                if !matches!(event.kind, MouseEventKind::Down(MouseButton::Left)) {
+                    return;
+                }
+                let tab_width = usize::from(sidebar.width.max(1)) / 4;
+                let index = usize::from(event.column.saturating_sub(sidebar.x)) / tab_width.max(1);
+                app.select_sidebar_tab_by_index(index.min(3));
+            } else if app.sidebar_tab() == SidebarTab::Explorer
+                && event.row >= body.y.saturating_add(1)
+            {
+                let index = usize::from(event.row.saturating_sub(body.y).saturating_sub(1));
+                match event.kind {
+                    MouseEventKind::Moved => app.explorer_hover(index),
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        if let Err(error) = app.explorer_click(index) {
+                            app.set_status_message(format!("Explorer click failed: {error}"));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        return;
+    }
+    if let Some(agent) = agent_area(app, area) {
+        if event.column >= agent.x
+            && event.column < agent.right()
+            && event.row >= agent.y
+            && event.row < agent.bottom()
+        {
+            app.set_focus(Focus::Agent);
+        }
+    } else if let Some(bottom) = terminal_area(app, area) {
+        if event.column >= bottom.x
+            && event.column < bottom.right()
+            && event.row >= bottom.y
+            && event.row < bottom.bottom()
+        {
+            app.set_focus(if app.bottom_tab() == crate::app::BottomTab::Output {
+                Focus::Output
+            } else {
+                Focus::Terminal
+            });
+        }
+    } else if matches!(event.kind, MouseEventKind::Down(MouseButton::Left)) {
+        // Any click in the center (including editor tabs) returns keyboard focus
+        // to the editor before the region-specific mouse handler runs.
+        app.set_focus(Focus::Editor);
+    }
     if app.focus() == Focus::Agent {
         let Some(agent) = agent_area(app, area) else {
             return;
@@ -358,6 +429,43 @@ pub fn handle_mouse(app: &mut App, event: MouseEvent, area: Rect) {
         MouseEventKind::Up(MouseButton::Left) => app.mouse_up(),
         _ => {}
     }
+}
+
+fn menu_hit(area: Rect, column: u16, row: u16) -> Option<usize> {
+    if area.width < 50 || area.height < 10 || row != area.y {
+        return None;
+    }
+    let offset = column.checked_sub(area.x.saturating_add(6))?;
+    if offset >= 31 {
+        return None;
+    }
+    Some(match offset {
+        0..=6 => 0,
+        7..=12 => 1,
+        13..=18 => 2,
+        19..=27 => 3,
+        _ => 4,
+    })
+}
+
+fn sidebar_area(app: &App, area: Rect) -> Option<Rect> {
+    if !app.sidebar_visible() || area.width < 50 || area.height < 10 {
+        return None;
+    }
+    let main = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(5),
+            Constraint::Length(1),
+        ])
+        .split(area)[1];
+    Some(
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(app.sidebar_width()), Constraint::Min(28)])
+            .split(main)[0],
+    )
 }
 
 fn terminal_area(app: &App, area: Rect) -> Option<Rect> {
@@ -563,13 +671,14 @@ fn draw_main(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
 fn draw_sidebar(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let theme = active_theme();
+    let bottom_height = if app.sidebar_tab() == SidebarTab::Explorer {
+        Constraint::Length(0)
+    } else {
+        Constraint::Length(3)
+    };
     let vertical = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(2),
-            Constraint::Min(3),
-            Constraint::Length(3),
-        ])
+        .constraints([Constraint::Length(2), Constraint::Min(3), bottom_height])
         .split(area);
     let tabs = Tabs::new([
         SidebarTab::Explorer.label(),
@@ -657,14 +766,23 @@ fn draw_sidebar(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Style::default().fg(theme.foreground),
         )));
         for (index, path) in app.explorer_paths().iter().enumerate().take(14) {
-            let marker = if path.is_dir() { "▸" } else { " " };
+            let marker = if path.is_dir() {
+                if app.explorer_expanded(path) {
+                    "▾"
+                } else {
+                    "▸"
+                }
+            } else {
+                " "
+            };
+            let indent = "  ".repeat(app.explorer_depth(path));
             let style = if index == app.explorer_index() {
                 Style::default().fg(theme.background).bg(theme.accent)
             } else {
                 Style::default().fg(theme.foreground)
             };
             sidebar_text.lines.push(Line::from(Span::styled(
-                format!("{marker} {}", app.explorer_label(path)),
+                format!("{indent}{marker} {}", app.explorer_label(path)),
                 style,
             )));
         }
