@@ -1,3 +1,4 @@
+mod ai;
 mod app;
 mod config;
 mod core;
@@ -94,6 +95,11 @@ fn main() -> AppResult<()> {
     } else {
         None
     };
+    if args.iter().any(|arg| arg == "--exec")
+        && (!io::stdin().is_terminal() || !io::stdout().is_terminal())
+    {
+        return run_headless_exec(&args, stdin_text.as_deref());
+    }
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(
@@ -123,6 +129,42 @@ fn main() -> AppResult<()> {
     )?;
     terminal.show_cursor()?;
     result
+}
+
+fn run_headless_exec(args: &[String], stdin_text: Option<&str>) -> AppResult<()> {
+    let mut app = match stdin_text {
+        Some(text) => App::new_with_stdin(args, Some(text))?,
+        None => App::new(args)?,
+    };
+    let (columns, rows) = option_values(args, "--size")
+        .into_iter()
+        .next()
+        .map_or(Ok((80, 24)), |value| parse_size(&value))?;
+    app.resize_terminal(columns, rows)?;
+    let area = ratatui::layout::Rect::new(0, 0, columns, rows);
+    let separator = option_values(args, "--exec-split-on")
+        .into_iter()
+        .next()
+        .filter(|value| !value.is_empty());
+    for script in option_values(args, "--exec") {
+        let scripts = separator.as_deref().map_or_else(
+            || vec![script.clone()],
+            |separator| script.split(separator).map(str::to_owned).collect(),
+        );
+        for script in scripts {
+            execute_script_with_debug(
+                &mut app,
+                &script,
+                area,
+                args.iter().any(|arg| arg == "--debug"),
+            )?;
+            app.poll_background();
+            if app.should_quit() {
+                return Ok(());
+            }
+        }
+    }
+    Ok(())
 }
 
 fn run<B: ratatui::backend::Backend>(
@@ -451,7 +493,12 @@ fn execute_script_with_debug(
                     .get("key")
                     .and_then(serde_json::Value::as_str)
                     .ok_or_else(|| error::AppError::Workspace("--exec key is required".into()))?;
-                app.handle_key(parse_script_key(key)?)?;
+                let key = parse_script_key(key)?;
+                if key.code == KeyCode::Char('q') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                    app.quit();
+                } else {
+                    app.handle_key(key)?;
+                }
             }
             "type" | "paste" => {
                 let text = action
@@ -862,6 +909,18 @@ mod tests {
             .expect("snapshot")
             .contains("# mtide"));
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn exec_ctrl_q_quits_before_entering_the_event_loop() {
+        let mut app = App::new(&["--welcome".to_owned()]).expect("app");
+        execute_script(
+            &mut app,
+            r#"[{"action":"key","key":"ctrl+q"}]"#,
+            ratatui::layout::Rect::new(0, 0, 80, 24),
+        )
+        .expect("ctrl-q");
+        assert!(app.should_quit());
     }
 
     #[test]

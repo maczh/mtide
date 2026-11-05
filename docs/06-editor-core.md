@@ -38,7 +38,7 @@ Settings overlay 的 Indent size 行可用 Left/Right 或 Enter 在 2、4、8 �
 
 当前搜索侧栏按 `Ctrl-R` 切换 Replace 输入，Enter 对当前文档执行 Replace All，整个替换作为一个 undo batch；`Ctrl-Shift-Enter` 对当前搜索结果涉及的整个工作区执行替换，替换与搜索使用相同的 smart-case 规则，当前打开文档保留 undo/dirty 状态，其他文件直接落盘。
 
-搜索焦点下 `Ctrl-N`/`Ctrl-P` 循环选择下一条/上一条工作区结果，结果跨多根 workspace 统一编号并在状态栏显示路径、行列；搜索结果列使用 UTF-8 字符列而非 byte offset，Unicode 文本跳转保持与编辑器光标一致。
+搜索焦点下 `Ctrl-N`/`Ctrl-P` 循环选择下一条/上一条工作区结果，结果跨多根 workspace 统一编号并在状态栏显示路径、行列；搜索结果列使用 UTF-8 字符列而非 byte offset，Unicode 文本跳转保持与编辑器光标一致。Replace 模式下 `Ctrl-Enter` 执行当前结果的单次替换，并在应用前重新扫描活动 Buffer。
 
 ## 4. 多标签
 
@@ -54,13 +54,13 @@ Settings overlay 的 Indent size 行可用 Left/Right 或 Enter 在 2、4、8 �
 
 ## 7. 高亮与性能
 
-完整 TextMate grammar 规划为增量 document/token cache；当前渲染层提供轻量、无阻塞的扩展名语法着色，覆盖常见关键字、字符串、数字和注释。远处行延迟处理，主线程每次事件间执行有限 step。大文件可关闭 word-wrap、自动 reload 或 syntax highlight。打开文件会后台轮询磁盘 mtime：干净标签自动重载并重置旧 undo 基线，脏标签不覆盖内存内容而显示外部变更提示。
+完整 TextMate grammar 规划为增量 document/token cache；当前渲染层提供轻量、无阻塞的扩展名语法着色，覆盖常见关键字、字符串、数字和注释，并对 Markdown 标题/列表/fenced code、JSON/TOML 键和单行块注释提供结构化颜色及跨行状态保持。远处行延迟处理，主线程每次事件间执行有限 step。大文件可关闭 word-wrap、自动 reload 或 syntax highlight。打开文件会后台轮询磁盘 mtime：干净标签自动重载并重置旧 undo 基线，脏标签不覆盖内存内容而显示外部变更提示。
 
 语言选择优先级为手动 override > 用户 grammar setting > 文件名/扩展名探测。Toggle Comment 从当前语言 grammar 取 comment token；没有 comment 规则时应提示不可用。
 
 soft wrap 只改变 viewport 映射，不改变 buffer 行。Up/Down 在 wrap 开启时保持目标 visual row；wrap 关闭时支持 horizontal viewport、键盘滚动和鼠标滚轮。
 
-当前编辑器会依据光标行自动调整垂直 viewport，保证光标在可见区域内；关闭 soft-wrap 时支持按 `Ctrl-Alt-Left/Right` 以 4 个字符为步长水平滚动，并在渲染时自动把光标保持在可见列内；启用 soft-wrap 时按配置列宽计算视觉行并同步光标/垂直滚动映射。启动时读取工作区 `.editorconfig` 的常用 `indent_style`、`indent_size`、`tab_width`、`insert_final_newline` 和 `trim_trailing_whitespace` 规则。
+当前编辑器会依据光标行自动调整垂直 viewport，保证光标在可见区域内；关闭 soft-wrap 时支持按 `Ctrl-Alt-Left/Right` 以 4 个字符为步长水平滚动，并在渲染时自动把光标保持在可见列内；启用 soft-wrap 时按配置列宽计算视觉行并同步光标/垂直滚动映射。启动时按父级到子级合并工作区 `.editorconfig`，支持 `root=true` 截断继承，并读取常用 `indent_style`、`indent_size`、`tab_width`、`insert_final_newline` 和 `trim_trailing_whitespace` 规则。
 
 auto-closing 必须处理成对符号、跳过已有 closing rune、选区包裹和 undo 合并，并提供 opt-in 配置。
 
@@ -77,17 +77,25 @@ auto-closing 必须处理成对符号、跳过已有 closing rune、选区包裹
 
 ## 7. 格式化与保存
 
-保存流程：检查 dirty → 可选 format-on-save/code actions → trim trailing whitespace → final newline → 原子写入 → 更新 mtime/version → 清除 dirty。格式化失败不得覆盖原文。`Ctrl-Shift-F` 无选区时请求 `textDocument/formatting`，存在选区时请求 `textDocument/rangeFormatting`，两者均使用 UTF-16 LSP 列。
+保存流程：检查 dirty → 可选外部 formatter 或 LSP format-on-save/code actions → trim trailing whitespace → final newline → 原子写入 → 更新 mtime/version → 清除 dirty。外部 formatter 从 stdin 接收完整文档并从 stdout 返回完整文档；失败、非 UTF-8 或无文件路径时不得覆盖原文。`Ctrl-Shift-F` 无选区时请求 `textDocument/formatting`，存在选区时请求 `textDocument/rangeFormatting`，两者均使用 UTF-16 LSP 列；命令面板 `editor.formatExternal` 执行配置的外部 formatter。
+
+启用 `editor.autoSave` 时，Host 按 `editor.autoSaveDelayMs` 周期保存所有可安全写入的 dirty Buffer；冲突标记、外部磁盘变更和保存失败的 Buffer 会跳过，不覆盖用户数据，并在保存后同步 LSP 与 Git 状态。
 
 终端程序启用 DEC bracketed paste（`CSI ?2004h`）后，编辑器通过系统粘贴或终端 `Ctrl-V` 发送标准 `ESC[200~`/`ESC[201~` 包装；未启用时保持普通输入行为。
 
 终端处于 alternate screen 时，字符、退格、回车和 Tab 直接写入 PTY，保证 Vim、Ratatui、全屏 shell 等交互程序不会被编辑器的普通命令输入缓冲拦截。
 同一模式下 Ctrl-A…Ctrl-Z 及 Ctrl-@、Ctrl-[、Ctrl-\\、Ctrl-]、Ctrl-^、Ctrl-_ 按 ASCII 控制字节直通 PTY。
 
+终端和 Agent 焦点下的修饰键也保持 VT 语义：Alt+字符发送 ESC 前缀，Shift+Tab 发送 BackTab，带 Shift/Alt/Ctrl/Super 的方向键、Home/End、分页、Insert/Delete 和 F1–F12 使用标准 xterm CSI modifier 参数；普通字符和 Enter 仍由终端输入缓冲统一提交。
+
 多光标 clipboard：无选区时按 cursor 取整行；复制按文档顺序以换行连接；粘贴内容行数等于 cursor 数时按 cursor spread，否则每个 cursor 插入完整内容；多选区粘贴遵循同样的逐区段分发规则。Copy/Cut/Paste 每次都是一个 undo batch。
+
+Markdown 文档按 `Ctrl-V` 粘贴时会在后台优先探测 Linux `wl-paste`/`xclip` 的 `image/png` 内容，不阻塞 UI；结果按活动文档路径校验后，图片写入当前文档目录下受控的 `editor.markdownImageDir`（默认 `.mtide/assets`），再插入相对 Markdown 图片链接。资源目录必须是相对路径且不能穿越文档目录；没有图片剪贴板时保持普通文本粘贴路径。
 
 Find overlay 打开时保存原 focus；编辑器按 `Ctrl-F` 打开 Find 时，单行 selection 会初始化 query；Find 与 Replace 可以在同一 overlay 内切换；Ctrl+V、Copy、Cut 必须发送给当前 input 而不是 editor。
 # LSP 快捷操作
+
+标签管理：编辑器焦点下 `Ctrl-Shift-T` 重新打开最近关闭的已保存标签，并恢复其光标、选区、折叠和水平滚动状态；脏标签关闭时仍会被保护。
 
 编辑器焦点下：
 
@@ -101,4 +109,6 @@ Find overlay 打开时保存原 focus；编辑器按 `Ctrl-F` 打开 Find 时，
 completion 弹层使用 Up/Down 选择、Enter 插入、Esc 关闭。
 
 completion、hover 和 code action 均通过可交互弹层呈现；completion/code action 支持 Up/Down 选择、Enter 应用和 Esc 取消。
+
+当当前语言没有可用 LSP 且 `ai.enabled` 开启时，completion 请求回退到 OpenAI-compatible Chat Completions。请求在后台执行，携带受 `ai.maxContextLines` 限制的局部文档上下文；标签切换、光标变化或文档修改后，旧响应会被 generation 和路径/光标校验丢弃。AI 返回内容复用普通 completion 插入和 undo 路径，Markdown fenced response 会在进入弹层前清理。
 

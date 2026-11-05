@@ -403,6 +403,61 @@ pub fn handle_mouse(app: &mut App, event: MouseEvent, area: Rect) {
         }
         return;
     }
+    if app.bottom_visible() && !app.terminal_fullscreen() {
+        if app.bottom_resizing() {
+            match event.kind {
+                MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Moved => {
+                    app.set_bottom_height(
+                        area.bottom().saturating_sub(event.row.saturating_add(1)),
+                    );
+                }
+                MouseEventKind::Up(MouseButton::Left) => app.end_bottom_resize(),
+                _ => {}
+            }
+            return;
+        }
+        if let Some(bottom) = terminal_area(app, area) {
+            let near_divider = event.row.abs_diff(bottom.y) <= 1;
+            let inside_center = event.column >= bottom.x && event.column < bottom.right();
+            if near_divider
+                && inside_center
+                && matches!(event.kind, MouseEventKind::Down(MouseButton::Left))
+            {
+                app.begin_bottom_resize(area.bottom().saturating_sub(event.row.saturating_add(1)));
+                return;
+            }
+        }
+    }
+    if app.sidebar_visible() && !app.terminal_fullscreen() {
+        if app.sidebar_resizing() {
+            match event.kind {
+                MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Moved => {
+                    app.resize_sidebar_to(
+                        event.column.saturating_sub(area.x),
+                        area.width.saturating_sub(28),
+                    );
+                }
+                MouseEventKind::Up(MouseButton::Left) => app.end_sidebar_resize(),
+                _ => {}
+            }
+            return;
+        }
+        if let Some(sidebar) = sidebar_area(app, area) {
+            let divider = sidebar.right();
+            let near_divider = event.column.abs_diff(divider) <= 1;
+            if near_divider
+                && event.row >= sidebar.y
+                && event.row < sidebar.bottom()
+                && matches!(event.kind, MouseEventKind::Down(MouseButton::Left))
+            {
+                app.begin_sidebar_resize(
+                    event.column.saturating_sub(sidebar.x),
+                    area.width.saturating_sub(28),
+                );
+                return;
+            }
+        }
+    }
     if let Some(sidebar) = sidebar_area(app, area) {
         if event.column >= sidebar.x
             && event.column < sidebar.right()
@@ -467,7 +522,7 @@ pub fn handle_mouse(app: &mut App, event: MouseEvent, area: Rect) {
                 }
                 let tab_width = usize::from(sidebar.width.max(1)) / 4;
                 let index = usize::from(event.column.saturating_sub(sidebar.x)) / tab_width.max(1);
-                app.select_sidebar_tab_by_index(index.min(3));
+                app.select_sidebar_tab_by_index(index.min(4));
             } else if app.sidebar_tab() == SidebarTab::Explorer
                 && event.row >= body.y.saturating_add(1)
             {
@@ -481,6 +536,20 @@ pub fn handle_mouse(app: &mut App, event: MouseEvent, area: Rect) {
                     }
                     _ => {}
                 }
+            } else if app.sidebar_tab() == SidebarTab::Problems
+                && event.row >= body.y.saturating_add(2)
+            {
+                let index = usize::from(event.row.saturating_sub(body.y).saturating_sub(2));
+                app.set_problem_index(index);
+                if matches!(event.kind, MouseEventKind::Down(MouseButton::Left)) {
+                    app.activate_problem(index);
+                }
+            } else if app.sidebar_tab() == SidebarTab::Search
+                && event.row >= body.y.saturating_add(1)
+                && event.row < body.y.saturating_add(4)
+                && matches!(event.kind, MouseEventKind::Down(MouseButton::Left))
+            {
+                app.set_search_field(event.row.saturating_sub(body.y).saturating_sub(1) as u8);
             }
             return;
         }
@@ -825,7 +894,7 @@ fn terminal_area(app: &App, area: Rect) -> Option<Rect> {
             .constraints([
                 Constraint::Length(2),
                 Constraint::Min(3),
-                Constraint::Length(5),
+                Constraint::Length(app.bottom_height()),
             ])
             .split(center)[2],
     )
@@ -918,7 +987,7 @@ fn editor_content_area(app: &App, area: Rect) -> Option<Rect> {
         vec![
             Constraint::Length(2),
             Constraint::Min(3),
-            Constraint::Length(5),
+            Constraint::Length(app.bottom_height()),
         ]
     } else {
         vec![Constraint::Length(2), Constraint::Min(3)]
@@ -959,6 +1028,12 @@ fn draw_menu(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Span::styled(
             "  File  Edit  View  Options  Help ",
             Style::default().fg(theme.muted),
+        ),
+        Span::styled(
+            format!("  {}  ", app.project_name()),
+            Style::default()
+                .fg(theme.foreground)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             format!(
@@ -1033,12 +1108,14 @@ fn draw_sidebar(frame: &mut Frame<'_>, area: Rect, app: &App) {
         SidebarTab::Search.label(),
         SidebarTab::Changes.label(),
         SidebarTab::Branches.label(),
+        SidebarTab::Problems.label(),
     ])
     .select(match app.sidebar_tab() {
         SidebarTab::Explorer => 0,
         SidebarTab::Search => 1,
         SidebarTab::Changes => 2,
         SidebarTab::Branches => 3,
+        SidebarTab::Problems => 4,
     })
     .block(
         Block::default()
@@ -1058,6 +1135,7 @@ fn draw_sidebar(frame: &mut Frame<'_>, area: Rect, app: &App) {
         SidebarTab::Search => Vec::new(),
         SidebarTab::Changes => Vec::new(),
         SidebarTab::Branches => Vec::new(),
+        SidebarTab::Problems => Vec::new(),
     };
     let lines = body.into_iter().map(|line| {
         Line::from(Span::styled(
@@ -1071,15 +1149,30 @@ fn draw_sidebar(frame: &mut Frame<'_>, area: Rect, app: &App) {
     });
     let mut sidebar_text = Text::from_iter(lines);
     if app.sidebar_tab() == SidebarTab::Search {
+        let field_marker = |field: u8| {
+            if app.search_field() == field {
+                "▶"
+            } else {
+                " "
+            }
+        };
         sidebar_text.lines.push(Line::from(Span::styled(
-            format!("Search: {}", app.search_query()),
+            format!("{} Search: {}", field_marker(0), app.search_query()),
             Style::default().fg(theme.foreground),
         )));
         sidebar_text.lines.push(Line::from(Span::styled(
+            format!("{} Include: {}", field_marker(1), app.search_include()),
+            Style::default().fg(theme.muted),
+        )));
+        sidebar_text.lines.push(Line::from(Span::styled(
+            format!("{} Exclude: {}", field_marker(2), app.search_exclude()),
+            Style::default().fg(theme.muted),
+        )));
+        sidebar_text.lines.push(Line::from(Span::styled(
             if app.search_regex() {
-                "Mode: Regex · Ctrl-Alt-R to switch"
+                "Tab/Shift-Tab fields · Regex"
             } else {
-                "Mode: Smart-case · Ctrl-Alt-R for regex"
+                "Tab/Shift-Tab fields · Smart-case"
             },
             Style::default().fg(theme.muted),
         )));
@@ -1089,7 +1182,7 @@ fn draw_sidebar(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 Style::default().fg(theme.warning),
             )));
             sidebar_text.lines.push(Line::from(Span::styled(
-                "Enter: current file · Ctrl-Shift-Enter: workspace",
+                "Ctrl-Enter: one · Enter: current file · Ctrl-Shift-Enter: workspace",
                 Style::default().fg(theme.muted),
             )));
         }
@@ -1179,7 +1272,12 @@ fn draw_sidebar(frame: &mut Frame<'_>, area: Rect, app: &App) {
                     Style::default().fg(theme.foreground)
                 };
                 sidebar_text.lines.push(Line::from(Span::styled(
-                    format!("{}{} {}", change.index, change.worktree, change.path),
+                    format!(
+                        "{}{} {}",
+                        change.index,
+                        change.worktree,
+                        app.change_label(index)
+                    ),
                     if change.is_conflict() {
                         style.fg(theme.error)
                     } else {
@@ -1193,7 +1291,7 @@ fn draw_sidebar(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 format!("Commit: {}", app.commit_message())
             } else {
                 format!(
-                    "c commit · b blame · l log · d diff · s/u file · h/H hunk · [/ ] hunk {}/{} · o/t ours/theirs · f/p/P sync",
+                    "Space/s/u stage · c commit · b blame · l log · d diff · h/H hunk · [/ ] hunk {}/{} · o/t ours/theirs · f/p/P sync",
                     app.change_hunk_index() + 1,
                     app.change_hunk_count().max(1)
                 )
@@ -1241,6 +1339,49 @@ fn draw_sidebar(frame: &mut Frame<'_>, area: Rect, app: &App) {
             "n new · d delete · Enter switch",
             Style::default().fg(theme.muted),
         )));
+    } else if app.sidebar_tab() == SidebarTab::Problems {
+        sidebar_text.lines.push(Line::from(Span::styled(
+            "Problems · current file",
+            Style::default().fg(theme.foreground),
+        )));
+        let problems = app.problems();
+        if problems.is_empty() {
+            sidebar_text.lines.push(Line::from(Span::styled(
+                "No problems",
+                Style::default().fg(theme.positive),
+            )));
+        } else {
+            for (index, problem) in problems.iter().take(12).enumerate() {
+                let style = if index == app.problem_index() {
+                    Style::default().fg(theme.background).bg(theme.accent)
+                } else {
+                    Style::default().fg(match problem.severity {
+                        1 => theme.error,
+                        2 => theme.warning,
+                        _ => theme.muted,
+                    })
+                };
+                let marker = match problem.severity {
+                    1 => "E",
+                    2 => "W",
+                    3 => "I",
+                    _ => "H",
+                };
+                sidebar_text.lines.push(Line::from(Span::styled(
+                    format!(
+                        "{marker} {}:{} {}",
+                        problem.line + 1,
+                        problem.column + 1,
+                        problem.message
+                    ),
+                    style,
+                )));
+            }
+        }
+        sidebar_text.lines.push(Line::from(Span::styled(
+            "↑/↓ select · Enter jump",
+            Style::default().fg(theme.muted),
+        )));
     }
     let sidebar_panel_area = vertical[1];
     if let Some(panel_text) = app.plugin_panel_text_sized(
@@ -1267,7 +1408,7 @@ fn draw_sidebar(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     frame.render_widget(
         Paragraph::new(
-            "1 Explore 2 Find\n3 Changes 4 Branches\n5 Terminal 6 Output\nCtrl-Alt-T theme",
+            "1 Explore 2 Find\n3 Changes 4 Branches\nCtrl-K D Problems\n5 Terminal 6 Output",
         )
         .style(Style::default().fg(theme.muted))
         .block(
@@ -1290,7 +1431,7 @@ fn draw_center(frame: &mut Frame<'_>, area: Rect, app: &App) {
         vec![
             Constraint::Length(2),
             Constraint::Min(3),
-            Constraint::Length(5),
+            Constraint::Length(app.bottom_height()),
         ]
     } else {
         vec![Constraint::Length(2), Constraint::Min(3)]
@@ -1329,20 +1470,39 @@ fn draw_center(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let mut cursor_visual_column = 0usize;
     let mut visual_row = 0usize;
     let mut editor_lines = Vec::new();
+    let mut highlight_mode = HighlightMode::Normal;
     let diff_markers = app.diff_line_markers();
     let conflict_blocks = crate::git::conflict_blocks(app.file_lines());
     let cursor_positions = app.cursor_positions();
+    let matching_bracket = app.matching_bracket_position();
     for (index, line) in app.file_lines().iter().enumerate() {
         if app.is_line_hidden(index) {
+            let _ = highlight_line_with_state(
+                line,
+                app.language(),
+                theme.foreground,
+                theme.background,
+                &mut highlight_mode,
+            );
             continue;
         }
         let selected = app.is_line_selected(index);
         let diff_marker = diff_markers.get(index).copied().flatten();
         let bookmark_marker = app.bookmark_marker(index);
-        let marker = match app.diagnostic_severity(index) {
+        let diagnostic = app.diagnostic_severity(index);
+        let decoration = app.decoration_style(index);
+        let marker = match diagnostic {
             Some(1) => "E",
             Some(2) => "W",
             Some(_) => "I",
+            None if decoration.is_some() => match decoration.as_deref() {
+                Some("error") => "E",
+                Some("warning") => "W",
+                Some("info") => "I",
+                Some("added") => "+",
+                Some("removed") => "-",
+                _ => "·",
+            },
             None if bookmark_marker.is_some() => bookmark_marker.as_deref().unwrap_or("◆"),
             None if diff_marker == Some('+') => "+",
             None if app.is_line_folded(index) => "▶",
@@ -1365,6 +1525,11 @@ fn draw_center(frame: &mut Frame<'_>, area: Rect, app: &App) {
             cursor_visual_column = local_cursor_column;
         }
         let chunks = visual_chunks(line, wrap_width, horizontal_scroll, content_width);
+        let mut chunk_start_column = if wrap_width.is_some() {
+            0
+        } else {
+            horizontal_visible_start(line, horizontal_scroll)
+        };
         for (chunk_index, chunk) in chunks.into_iter().enumerate() {
             let line_number = if chunk_index == 0 {
                 format!("{marker}{:>4} ", index + 1)
@@ -1402,7 +1567,13 @@ fn draw_center(frame: &mut Frame<'_>, area: Rect, app: &App) {
                     })
                     .add_modifier(selection_modifier),
             )];
-            let mut highlighted = highlight_line(&chunk, app.language(), foreground, background);
+            let mut highlighted = highlight_line_with_state(
+                &chunk,
+                app.language(),
+                foreground,
+                background,
+                &mut highlight_mode,
+            );
             apply_search_highlights(
                 &mut highlighted,
                 &chunk,
@@ -1410,12 +1581,31 @@ fn draw_center(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 app.search_regex(),
             );
             apply_link_highlight(&mut highlighted, &chunk, app.editor_hover_link(index));
+            if let Some(matching) = matching_bracket {
+                let mut bracket_columns = Vec::new();
+                if index == cursor.line {
+                    bracket_columns.push(cursor.column);
+                }
+                if index == matching.line {
+                    bracket_columns.push(matching.column);
+                }
+                let local_columns = bracket_columns
+                    .into_iter()
+                    .filter_map(|column| column.checked_sub(chunk_start_column))
+                    .filter(|column| *column < chunk.chars().count())
+                    .collect::<Vec<_>>();
+                apply_bracket_highlights(&mut highlighted, &local_columns);
+            }
             for span in &mut highlighted {
                 span.style = span.style.add_modifier(selection_modifier);
+                if diagnostic.is_some() || decoration.is_some() {
+                    span.style = span.style.add_modifier(Modifier::UNDERLINED);
+                }
             }
             spans.extend(highlighted);
             editor_lines.push(Line::from(spans));
             visual_row += 1;
+            chunk_start_column += chunk.chars().count();
         }
     }
     let plugin_title = app
@@ -1618,7 +1808,8 @@ fn draw_center(frame: &mut Frame<'_>, area: Rect, app: &App) {
                     .collect::<Vec<_>>()
                     .join("\n")
             } else if !app.history().is_empty() {
-                app.history()
+                let mut history_lines: Vec<String> = app
+                    .history()
                     .iter()
                     .skip(app.output_scroll())
                     .take(10)
@@ -1631,8 +1822,17 @@ fn draw_center(frame: &mut Frame<'_>, area: Rect, app: &App) {
                             commit.subject
                         )
                     })
-                    .collect::<Vec<_>>()
-                    .join("\n")
+                    .collect();
+                if app.history_has_more()
+                    && app.output_scroll() + history_lines.len() >= app.history().len()
+                {
+                    history_lines.push(if app.history_pending() {
+                        "… loading older commits".to_owned()
+                    } else {
+                        "▶ Load older commits · press ]".to_owned()
+                    });
+                }
+                history_lines.join("\n")
             } else if !app.plugin_registry_entries().is_empty() {
                 app.plugin_registry_entries()
                     .iter()
@@ -1675,7 +1875,7 @@ fn draw_center(frame: &mut Frame<'_>, area: Rect, app: &App) {
                     .collect::<Vec<_>>()
                     .join("\n")
             } else {
-                app.change_diff()
+                app.rendered_change_diff()
                     .iter()
                     .skip(app.output_scroll())
                     .take(8)
@@ -1746,8 +1946,16 @@ fn draw_center(frame: &mut Frame<'_>, area: Rect, app: &App) {
         format!("{terminal_name} · Ctrl-Shift-T new · Ctrl-Alt-Left/Right switch")
     } else if app.pull_request_comment_mode() {
         "PR comment · Enter submit · Esc cancel".to_owned()
-    } else if app.diff_split() && !app.change_diff().is_empty() {
-        "Output · Git diff split · v unified".to_owned()
+    } else if !app.change_diff().is_empty() {
+        format!(
+            "Output · Git diff {} · c {} context · Enter/e expand",
+            if app.diff_split() { "split" } else { "unified" },
+            if app.diff_full_context() {
+                "changes"
+            } else {
+                "full"
+            }
+        )
     } else {
         app.bottom_tab().label().to_owned()
     };
@@ -1867,17 +2075,170 @@ fn visual_chunks(
     chunks
 }
 
+fn horizontal_visible_start(line: &str, horizontal_scroll: usize) -> usize {
+    let mut display = 0usize;
+    for (index, character) in line.chars().enumerate() {
+        let width = char_width(character);
+        if display.saturating_add(width) > horizontal_scroll {
+            return index;
+        }
+        display = display.saturating_add(width);
+    }
+    line.chars().count()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HighlightMode {
+    Normal,
+    BlockComment,
+    String(char),
+    MarkdownFence(char, usize),
+}
+
+#[cfg(test)]
 fn highlight_line(
     text: &str,
     language: &str,
     foreground: Color,
     background: Color,
 ) -> Vec<Span<'static>> {
+    let mut mode = HighlightMode::Normal;
+    highlight_line_with_state(text, language, foreground, background, &mut mode)
+}
+
+fn highlight_line_with_state(
+    text: &str,
+    language: &str,
+    foreground: Color,
+    background: Color,
+    mode: &mut HighlightMode,
+) -> Vec<Span<'static>> {
     let theme = active_theme();
     let chars: Vec<char> = text.chars().collect();
     let mut spans = Vec::new();
     let mut index = 0;
+    if let HighlightMode::MarkdownFence(marker, length) = *mode {
+        let first = chars
+            .iter()
+            .position(|character| !character.is_whitespace())
+            .unwrap_or(chars.len());
+        let close = first + length <= chars.len()
+            && chars[first..]
+                .iter()
+                .take(length)
+                .all(|character| *character == marker);
+        if close {
+            *mode = HighlightMode::Normal;
+            spans.push(Span::styled(
+                text.to_owned(),
+                Style::default()
+                    .fg(theme.accent)
+                    .bg(background)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        } else {
+            spans.push(Span::styled(
+                text.to_owned(),
+                Style::default().fg(foreground).bg(background),
+            ));
+        }
+        return spans;
+    }
+    if matches!(language, "md" | "markdown") {
+        let first = chars
+            .iter()
+            .position(|character| !character.is_whitespace())
+            .unwrap_or(chars.len());
+        if let Some(marker) = chars
+            .get(first)
+            .copied()
+            .filter(|marker| *marker == '`' || *marker == '~')
+        {
+            let length = chars[first..]
+                .iter()
+                .take_while(|character| **character == marker)
+                .count();
+            if length >= 3 {
+                *mode = HighlightMode::MarkdownFence(marker, length);
+                spans.push(Span::styled(
+                    text.to_owned(),
+                    Style::default()
+                        .fg(theme.accent)
+                        .bg(background)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                return spans;
+            }
+        }
+    }
+    if *mode == HighlightMode::Normal && matches!(language, "md" | "markdown") {
+        let first = chars
+            .iter()
+            .position(|character| !character.is_whitespace())
+            .unwrap_or(chars.len());
+        let marker = chars.get(first).copied();
+        let marker_end = if marker == Some('#') {
+            let mut end = first;
+            while chars.get(end) == Some(&'#') {
+                end += 1;
+            }
+            (chars.get(end).is_none() || chars[end].is_whitespace()).then_some(end)
+        } else if matches!(marker, Some('-' | '*' | '>'))
+            && chars
+                .get(first + 1)
+                .is_some_and(|character| character.is_whitespace())
+        {
+            Some(first + 1)
+        } else {
+            None
+        };
+        if let Some(end) = marker_end {
+            if first > 0 {
+                spans.push(Span::styled(
+                    chars[..first].iter().collect::<String>(),
+                    Style::default().fg(foreground).bg(background),
+                ));
+            }
+            spans.push(Span::styled(
+                chars[first..end].iter().collect::<String>(),
+                Style::default()
+                    .fg(theme.accent)
+                    .bg(background)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            index = end;
+        }
+    }
     while index < chars.len() {
+        if *mode != HighlightMode::Normal {
+            let start = index;
+            let terminator = match *mode {
+                HighlightMode::BlockComment => (chars[index..]
+                    .windows(2)
+                    .position(|pair| pair == ['*', '/']))
+                .map(|offset| index + offset + 2),
+                HighlightMode::String(quote) => chars[index..]
+                    .iter()
+                    .enumerate()
+                    .find(|(offset, character)| {
+                        **character == quote
+                            && (index + *offset == 0 || chars[index + *offset - 1] != '\\')
+                    })
+                    .map(|(offset, _)| index + offset + 1),
+                HighlightMode::MarkdownFence(_, _) => None,
+                HighlightMode::Normal => None,
+            };
+            index = terminator.unwrap_or(chars.len());
+            spans.push(Span::styled(
+                chars[start..index].iter().collect::<String>(),
+                Style::default().fg(theme.muted).bg(background),
+            ));
+            if terminator.is_none() {
+                break;
+            }
+            *mode = HighlightMode::Normal;
+            continue;
+        }
         if let Some(prefix) = comment_prefix(language) {
             let marker: Vec<char> = prefix.chars().collect();
             if chars[index..].starts_with(&marker) {
@@ -1889,7 +2250,22 @@ fn highlight_line(
             }
         }
         let character = chars[index];
-        if matches!(character, '"' | '\'' | '`') {
+        if character == '/' && chars.get(index + 1) == Some(&'*') {
+            let start = index;
+            index += 2;
+            while index + 1 < chars.len() && !(chars[index] == '*' && chars[index + 1] == '/') {
+                index += 1;
+            }
+            if index + 1 < chars.len() {
+                index += 2;
+            } else {
+                *mode = HighlightMode::BlockComment;
+            }
+            spans.push(Span::styled(
+                chars[start..index].iter().collect::<String>(),
+                Style::default().fg(theme.muted).bg(background),
+            ));
+        } else if matches!(character, '"' | '\'' | '`') {
             let quote = character;
             let start = index;
             index += 1;
@@ -1900,9 +2276,23 @@ fn highlight_line(
                 }
                 index += 1;
             }
+            if index >= chars.len() && chars.last() != Some(&quote) {
+                *mode = HighlightMode::String(quote);
+            }
+            let mut after = index;
+            while chars
+                .get(after)
+                .is_some_and(|character| character.is_whitespace())
+            {
+                after += 1;
+            }
+            let is_key = matches!(language, "json" | "jsonc" | "json5" | "toml")
+                && chars.get(after) == Some(&':');
             spans.push(Span::styled(
                 chars[start..index].iter().collect::<String>(),
-                Style::default().fg(theme.warning).bg(background),
+                Style::default()
+                    .fg(if is_key { theme.accent } else { theme.warning })
+                    .bg(background),
             ));
         } else if character.is_ascii_digit() {
             let start = index;
@@ -2022,6 +2412,39 @@ fn apply_link_highlight(spans: &mut [Span<'static>], text: &str, link: Option<&s
         }
         offset = span_end;
     }
+}
+
+fn apply_bracket_highlights(spans: &mut Vec<Span<'static>>, columns: &[usize]) {
+    if columns.is_empty() {
+        return;
+    }
+    let columns = columns
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut offset = 0;
+    let mut rebuilt = Vec::with_capacity(spans.len() + columns.len());
+    for span in spans.drain(..) {
+        let content = span.content.to_string();
+        let char_count = content.chars().count();
+        if !columns
+            .iter()
+            .any(|column| (*column >= offset) && (*column < offset + char_count))
+        {
+            offset += char_count;
+            rebuilt.push(span);
+            continue;
+        }
+        for (index, character) in content.chars().enumerate() {
+            let mut style = span.style;
+            if columns.contains(&(offset + index)) {
+                style = style.add_modifier(Modifier::BOLD | Modifier::REVERSED);
+            }
+            rebuilt.push(Span::styled(character.to_string(), style));
+        }
+        offset += char_count;
+    }
+    *spans = rebuilt;
 }
 
 fn comment_prefix(language: &str) -> Option<&'static str> {
@@ -2159,39 +2582,14 @@ fn terminal_style(style: TerminalStyle) -> Style {
 }
 
 fn ansi_color(color: AnsiColor) -> Color {
+    let terminal_colors = active_theme().terminal_colors;
     match color {
-        AnsiColor::Basic(index) => basic_color(index, false),
-        AnsiColor::Bright(index) => basic_color(index, true),
+        AnsiColor::Basic(index) => terminal_colors[usize::from(index.min(7))],
+        AnsiColor::Bright(index) => terminal_colors[usize::from(index.min(7)) + 8],
+        AnsiColor::Indexed(index) if index < 16 => terminal_colors[usize::from(index)],
         AnsiColor::Indexed(index) => Color::Indexed(index),
         AnsiColor::Rgb(red, green, blue) => Color::Rgb(red, green, blue),
     }
-}
-
-fn basic_color(index: u8, bright: bool) -> Color {
-    let colors = if bright {
-        [
-            Color::Gray,
-            Color::LightRed,
-            Color::LightGreen,
-            Color::LightYellow,
-            Color::LightBlue,
-            Color::LightMagenta,
-            Color::LightCyan,
-            Color::White,
-        ]
-    } else {
-        [
-            Color::Black,
-            Color::Red,
-            Color::Green,
-            Color::Yellow,
-            Color::Blue,
-            Color::Magenta,
-            Color::Cyan,
-            Color::Gray,
-        ]
-    };
-    colors[index.min(7) as usize]
 }
 
 fn draw_agent(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -2324,7 +2722,10 @@ fn draw_quick_open(frame: &mut Frame<'_>, area: Rect, app: &App) {
     } else {
         results.len()
     };
-    let height = if app.quick_open_title() == "Save As" {
+    let height = if matches!(
+        app.quick_open_title(),
+        "Save As" | "Save Workspace" | "Add Workspace Folder"
+    ) {
         3
     } else {
         (3 + row_count.min(8) as u16).min(area.height.saturating_sub(2))
@@ -2455,6 +2856,18 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .diagnostic_message(cursor.line)
         .map(|message| format!(" · {message}"))
         .unwrap_or_default();
+    let blame = app
+        .blame_lines()
+        .get(cursor.line)
+        .map(|line| {
+            format!(
+                " · {} {} {}",
+                &line.commit[..line.commit.len().min(8)],
+                line.author,
+                line.line
+            )
+        })
+        .unwrap_or_default();
     let (plugin_left_items, plugin_right_items) = app.plugin_status_items_detailed();
     let plugin_left = plugin_left_items
         .iter()
@@ -2477,10 +2890,12 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         format!(" · {plugin_right}")
     };
     let text = format!(
-        " {}{}{}   Ln {}, Col {}   UTF-8   {}   {}   {}   {}{}   Tab: focus · Ctrl+Q: quit",
+        " {}{}{}{}   {}   Ln {}, Col {}   UTF-8   {}   {}   {}   {}{}   Tab: focus · Ctrl+Q: quit",
         status_message,
         diagnostic,
+        blame,
         plugin_left_suffix,
+        app.file_path_label(),
         cursor.line + 1,
         cursor.column + 1,
         app.language(),
@@ -2496,7 +2911,7 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
             .fold(0, u16::saturating_add)
     };
     let mut hits = Vec::new();
-    let left_prefix = format!(" {}{}", status_message, diagnostic);
+    let left_prefix = format!(" {}{}{}", status_message, diagnostic, blame);
     let mut position = width(&left_prefix);
     for (index, (runtime_index, id, item)) in plugin_left_items.iter().enumerate() {
         position = position.saturating_add(width(" · "));
@@ -2603,6 +3018,107 @@ mod tests {
     }
 
     #[test]
+    fn structured_languages_receive_contextual_highlighting() {
+        let theme = active_theme();
+        let markdown = highlight_line("  ## Title", "markdown", theme.foreground, theme.background);
+        assert_eq!(markdown[1].content, "##");
+        assert_eq!(markdown[1].style.fg, Some(theme.accent));
+        assert_eq!(
+            markdown[1].style.add_modifier(Modifier::BOLD),
+            markdown[1].style
+        );
+
+        let json = highlight_line(
+            r#"{"name": true}"#,
+            "json",
+            theme.foreground,
+            theme.background,
+        );
+        assert!(json.iter().any(|span| {
+            span.content.as_ref() == r#""name""# && span.style.fg == Some(theme.accent)
+        }));
+
+        let block_comment =
+            highlight_line("/* note */ value", "rs", theme.foreground, theme.background);
+        assert_eq!(block_comment[0].style.fg, Some(theme.muted));
+    }
+
+    #[test]
+    fn multiline_highlighting_preserves_comment_and_string_state() {
+        let theme = active_theme();
+        let mut mode = HighlightMode::Normal;
+        let first = highlight_line_with_state(
+            "/* begin",
+            "rs",
+            theme.foreground,
+            theme.background,
+            &mut mode,
+        );
+        assert_eq!(mode, HighlightMode::BlockComment);
+        assert_eq!(first[0].style.fg, Some(theme.muted));
+        let second = highlight_line_with_state(
+            "end */ value",
+            "rs",
+            theme.foreground,
+            theme.background,
+            &mut mode,
+        );
+        assert_eq!(mode, HighlightMode::Normal);
+        assert!(second.iter().any(|span| span.content.as_ref() == "value"));
+
+        let mut mode = HighlightMode::Normal;
+        let _ = highlight_line_with_state(
+            "let value = \"first",
+            "rs",
+            theme.foreground,
+            theme.background,
+            &mut mode,
+        );
+        assert_eq!(mode, HighlightMode::String('"'));
+        let _ = highlight_line_with_state(
+            "second\";",
+            "rs",
+            theme.foreground,
+            theme.background,
+            &mut mode,
+        );
+        assert_eq!(mode, HighlightMode::Normal);
+    }
+
+    #[test]
+    fn markdown_fenced_code_preserves_code_block_state() {
+        let theme = active_theme();
+        let mut mode = HighlightMode::Normal;
+        let opening = highlight_line_with_state(
+            "```rust",
+            "markdown",
+            theme.foreground,
+            theme.background,
+            &mut mode,
+        );
+        assert_eq!(mode, HighlightMode::MarkdownFence('`', 3));
+        assert_eq!(opening[0].style.fg, Some(theme.accent));
+        let content = highlight_line_with_state(
+            "# not a markdown heading",
+            "markdown",
+            theme.foreground,
+            theme.background,
+            &mut mode,
+        );
+        assert_eq!(mode, HighlightMode::MarkdownFence('`', 3));
+        assert_eq!(content[0].style.fg, Some(theme.foreground));
+        let closing = highlight_line_with_state(
+            "```",
+            "markdown",
+            theme.foreground,
+            theme.background,
+            &mut mode,
+        );
+        assert_eq!(mode, HighlightMode::Normal);
+        assert_eq!(closing[0].style.fg, Some(theme.accent));
+    }
+
+    #[test]
     fn ctrl_hover_link_highlight_marks_only_the_visible_link() {
         let mut spans = vec![
             Span::raw("see "),
@@ -2647,6 +3163,86 @@ mod tests {
             area,
         );
         assert_eq!(app.horizontal_scroll(), 0);
+    }
+
+    #[test]
+    fn dragging_sidebar_divider_resizes_and_releases() {
+        let mut app = App::new(&[]).expect("app");
+        let area = Rect::new(0, 0, 120, 40);
+        let sidebar = sidebar_area(&app, area).expect("sidebar area");
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: sidebar.right(),
+                row: sidebar.y + 4,
+                modifiers: KeyModifiers::NONE,
+            },
+            area,
+        );
+        assert!(app.sidebar_resizing());
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Drag(MouseButton::Left),
+                column: 36,
+                row: sidebar.y + 4,
+                modifiers: KeyModifiers::NONE,
+            },
+            area,
+        );
+        assert_eq!(app.sidebar_width(), 36);
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column: 36,
+                row: sidebar.y + 4,
+                modifiers: KeyModifiers::NONE,
+            },
+            area,
+        );
+        assert!(!app.sidebar_resizing());
+    }
+
+    #[test]
+    fn dragging_bottom_divider_resizes_and_releases() {
+        let mut app = App::new(&[]).expect("app");
+        let area = Rect::new(0, 0, 120, 40);
+        let bottom = terminal_area(&app, area).expect("bottom area");
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: bottom.x + 4,
+                row: bottom.y,
+                modifiers: KeyModifiers::NONE,
+            },
+            area,
+        );
+        assert!(app.bottom_resizing());
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Drag(MouseButton::Left),
+                column: bottom.x + 4,
+                row: 25,
+                modifiers: KeyModifiers::NONE,
+            },
+            area,
+        );
+        assert_eq!(app.bottom_height(), 14);
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column: bottom.x + 4,
+                row: 25,
+                modifiers: KeyModifiers::NONE,
+            },
+            area,
+        );
+        assert!(!app.bottom_resizing());
     }
 
     #[test]

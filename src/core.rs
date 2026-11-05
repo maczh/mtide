@@ -89,6 +89,20 @@ pub(crate) enum ExternalChange {
 }
 
 impl Buffer {
+    pub fn replace_document_text(&mut self, text: &str) {
+        if self.readonly {
+            return;
+        }
+        self.checkpoint();
+        self.lines = split_lines(text);
+        self.cursor.line = self.cursor.line.min(self.lines.len().saturating_sub(1));
+        self.cursor.column = self.cursor.column.min(
+            self.lines
+                .get(self.cursor.line)
+                .map_or(0, |line| line.chars().count()),
+        );
+    }
+
     pub fn welcome() -> Self {
         Self::new(
             vec![
@@ -161,6 +175,9 @@ impl Buffer {
     pub fn path(&self) -> Option<&Path> {
         self.path.as_deref()
     }
+    pub const fn has_external_change(&self) -> bool {
+        self.external_change
+    }
 
     pub(crate) fn relocate(&mut self, path: impl AsRef<Path>) {
         let path = path.as_ref().to_path_buf();
@@ -175,6 +192,9 @@ impl Buffer {
     }
     pub fn set_readonly(&mut self, readonly: bool) {
         self.readonly = readonly;
+    }
+    pub const fn is_readonly(&self) -> bool {
+        self.readonly
     }
     pub fn language_override(&self) -> Option<&str> {
         self.language_override.as_deref()
@@ -337,7 +357,7 @@ impl Buffer {
     }
 
     pub(crate) fn apply_text_edits(&mut self, edits: &[(Position, Position, String)]) -> usize {
-        if edits.is_empty() {
+        if self.readonly || edits.is_empty() {
             return 0;
         }
         let mut edits = edits.to_vec();
@@ -1629,6 +1649,14 @@ mod tests {
         buffer.set_readonly(true);
         buffer.insert(" after");
         buffer.delete();
+        assert_eq!(
+            buffer.apply_text_edits(&[(
+                Position { line: 0, column: 0 },
+                Position { line: 0, column: 0 },
+                "prefix".into(),
+            )]),
+            0
+        );
         let readonly_positions = buffer.backspace_at_positions(&[Position { line: 0, column: 3 }]);
         assert_eq!(readonly_positions, vec![Position { line: 0, column: 3 }]);
         assert_eq!(buffer.lines(), &["before"]);

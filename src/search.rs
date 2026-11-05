@@ -2,6 +2,7 @@ use regex::Regex;
 use std::{
     fs,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicUsize, Ordering},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,6 +43,17 @@ pub fn search_workspace_roots_with_options(
     exclude: &[String],
     use_regex: bool,
 ) -> Vec<SearchResult> {
+    search_workspace_roots_with_options_cancelled(roots, query, include, exclude, use_regex, None)
+}
+
+pub fn search_workspace_roots_with_options_cancelled(
+    roots: &[PathBuf],
+    query: &str,
+    include: &[String],
+    exclude: &[String],
+    use_regex: bool,
+    cancellation: Option<(&AtomicUsize, usize)>,
+) -> Vec<SearchResult> {
     if query.is_empty() {
         return Vec::new();
     }
@@ -63,8 +75,9 @@ pub fn search_workspace_roots_with_options(
             use_regex,
             &mut results,
             &mut budget,
+            cancellation,
         );
-        if budget.remaining == 0 {
+        if budget.remaining == 0 || is_cancelled(cancellation) {
             break;
         }
     }
@@ -112,6 +125,65 @@ pub fn replace_with_options(
     (regex.replace_all(content, replacement).into_owned(), count)
 }
 
+/// Replaces the first line-local match at or after `preferred_column`.
+///
+/// The caller supplies a freshly scanned line position rather than reusing a
+/// previously cached byte range. This keeps single replacement safe after the
+/// editor buffer changed while the search panel remained open.
+pub fn replace_first_with_options(
+    line: &str,
+    query: &str,
+    replacement: &str,
+    use_regex: bool,
+    preferred_column: usize,
+) -> (String, bool) {
+    if query.is_empty() {
+        return (line.to_owned(), false);
+    }
+    if use_regex {
+        let Ok(regex) = Regex::new(query) else {
+            return (line.to_owned(), false);
+        };
+        if let Some(found) = regex
+            .find_iter(line)
+            .find(|matched| line[..matched.start()].chars().count() >= preferred_column)
+        {
+            let mut output = String::with_capacity(line.len());
+            output.push_str(&line[..found.start()]);
+            output.push_str(&regex.replace(&line[found.start()..found.end()], replacement));
+            output.push_str(&line[found.end()..]);
+            return (output, true);
+        }
+        return (line.to_owned(), false);
+    }
+    let case_sensitive = query.chars().any(char::is_uppercase);
+    let query_len = query.chars().count();
+    let mut candidate: Option<(usize, usize)> = None;
+    for (column, _) in line.char_indices() {
+        let text = &line[column..];
+        let matches = text.chars().take(query_len).collect::<String>();
+        if matches.chars().count() == query_len
+            && (case_sensitive && matches == query
+                || !case_sensitive && matches.eq_ignore_ascii_case(query))
+            && line[..column].chars().count() >= preferred_column
+        {
+            candidate = Some((
+                column,
+                text.chars().take(query_len).map(char::len_utf8).sum(),
+            ));
+            break;
+        }
+    }
+    let Some((start, length)) = candidate else {
+        return (line.to_owned(), false);
+    };
+    let mut output = String::with_capacity(line.len());
+    output.push_str(&line[..start]);
+    output.push_str(replacement);
+    output.push_str(&line[start + length..]);
+    (output, true)
+}
+
 fn replace_line_case_insensitive(line: &str, query: &str, replacement: &str) -> (String, usize) {
     let mut output = String::with_capacity(line.len());
     let mut cursor = 0;
@@ -144,8 +216,9 @@ fn visit(
     use_regex: bool,
     results: &mut Vec<SearchResult>,
     budget: &mut SearchBudget,
+    cancellation: Option<(&AtomicUsize, usize)>,
 ) {
-    if budget.remaining == 0 {
+    if budget.remaining == 0 || is_cancelled(cancellation) {
         return;
     }
     let Ok(metadata) = fs::metadata(path) else {
@@ -156,6 +229,9 @@ fn visit(
             return;
         };
         for entry in entries.flatten() {
+            if is_cancelled(cancellation) {
+                return;
+            }
             budget.remaining = budget.remaining.saturating_sub(1);
             if budget.remaining == 0 {
                 return;
@@ -183,7 +259,15 @@ fn visit(
                 continue;
             }
             visit(
-                &child, root, query, include, exclude, use_regex, results, budget,
+                &child,
+                root,
+                query,
+                include,
+                exclude,
+                use_regex,
+                results,
+                budget,
+                cancellation,
             );
         }
     } else if metadata.len() <= 4 * 1024 * 1024
@@ -198,6 +282,11 @@ fn visit(
         };
         results.extend(search_text_with_options(path, &text, query, use_regex));
     }
+}
+
+fn is_cancelled(cancellation: Option<(&AtomicUsize, usize)>) -> bool {
+    cancellation
+        .is_some_and(|(generation, expected)| generation.load(Ordering::Acquire) != expected)
 }
 
 fn matches_glob(path: &Path, patterns: &[String], directory: bool) -> bool {
@@ -379,6 +468,24 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_workspace_search_stops_before_traversal() {
+        let root = std::env::temp_dir().join(format!("mtide-search-cancel-{}", std::process::id()));
+        fs::create_dir_all(&root).expect("directory");
+        fs::write(root.join("main.rs"), "needle").expect("file");
+        let generation = AtomicUsize::new(1);
+        let found = search_workspace_roots_with_options_cancelled(
+            std::slice::from_ref(&root),
+            "needle",
+            &[],
+            &[],
+            false,
+            Some((&generation, 2)),
+        );
+        assert!(found.is_empty());
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
     fn smart_case_replacement_matches_search_semantics() {
         let (replaced, count) = replace_smart_case("Alpha alpha ALPHA", "alpha", "done");
         assert_eq!(replaced, "done done done");
@@ -427,5 +534,25 @@ mod tests {
         assert_eq!(replaced, "value1 value22");
         assert_eq!(count, 2);
         assert!(search_text_with_options(&path, "text", "[", true).is_empty());
+    }
+
+    #[test]
+    fn replace_first_rescans_from_a_character_column() {
+        let (replaced, changed) =
+            replace_first_with_options("alpha ALPHA", "alpha", "done", false, 0);
+        assert!(changed);
+        assert_eq!(replaced, "done ALPHA");
+        let (replaced, changed) =
+            replace_first_with_options("alpha ALPHA", "alpha", "done", false, 1);
+        assert!(changed);
+        assert_eq!(replaced, "alpha done");
+    }
+
+    #[test]
+    fn replace_first_supports_regex_capture_replacement() {
+        let (replaced, changed) =
+            replace_first_with_options("item1 item22", r"item(\d+)", "value$1", true, 0);
+        assert!(changed);
+        assert_eq!(replaced, "value1 item22");
     }
 }

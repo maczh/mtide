@@ -21,11 +21,13 @@ Lua 模块通过 `require("ttt")` 注入，不假设全局变量。插件加载�
 
 `tabs` 支持原版 `active=id`，并兼容数字 `selected`；状态在重绘间保持，切换时调用 `on_change(tab_id)`。`radio({options, selected, on_change})` 提供单选列表，`selected` 兼容 1-based 数字或选项字符串/id/value/label，方向键切换并将选中选项传给回调。`scrollview` 已按集合控件渲染 `selected`、`loading`、`empty` 状态；`pager` 支持原版 `offset/limit/total` 并兼容 `page/pages`，保存当前页状态，Left/Right、上下、PageUp/PageDown、Home/End 移动会调用 `on_change(new_offset)`，文本显示当前范围与总数。
 
-`require("ttt.editor")` 已提供受 `editor.read` 权限保护的活动缓冲区只读接口：`buffer_text()`、`buffer_lines()`、`current_line()`、`get_line(n)`、`line_count()`、`cursor()`、`selection()`、`selection_text()`、`file_path()`、`file_name()`、`language()` 和 `get_cursors()`。`viewport()` 返回 1-based 的 `top_line`/`bottom_line`、当前可见行数 `height` 和水平 `left_col`；UI 绘制后会同步真实编辑区高度。Lua 行列统一采用 1-based，列按 Unicode rune 计数；没有活动选区时 `selection().active` 为 `false`。
+`require("ttt.editor")` 已提供受 `editor.read` 权限保护的活动缓冲区只读接口：`buffer_text()`、`buffer_lines()`、`current_line()`、`current_word()`、`get_line(n)`、`line_count()`、`cursor()`、`selection()`、`selection_text()`、`file_path()`、`file_name()`、`language()` 和 `get_cursors()`。`current_word()` 与 Host 编辑事件使用同一 Unicode 单词边界规则；`viewport()` 返回 1-based 的 `top_line`/`bottom_line`、当前可见行数 `height` 和水平 `left_col`；UI 绘制后会同步真实编辑区高度。Lua 行列统一采用 1-based，列按 Unicode rune 计数；没有活动选区时 `selection().active` 为 `false`。
 
 声明 `editor.write` 后，插件可调用 `insert(line, col, text)`、`set_line(line, text)`、`replace(start_line, start_col, end_line, end_col, text)`、`set_cursor(line, col)`、`set_selection(...)`、`clear_selection()`、`add_cursor(line, col)`、`clear_cursors()` 和 `go_to_diff_hunk(index)`；`editor.diff()` 在活动可编辑 Diff 中返回 `hunks`（`file_path`、`kind`、1-based `line`）及 `current_hunk`，普通文件中返回 `nil`。`begin_undo_group()` / `end_undo_group()` 可将连续写入合并成一次撤销操作，并支持嵌套。写入调用进入 Host 编辑请求队列，在插件回调结束后应用，并复用 Buffer 的 undo checkpoint；非法或越界坐标会被安全限制到当前缓冲区范围。
 
-`require("ttt.events")` 提供与 `ttt.on(event, callback)` 等价的 `events.on(event, callback)` 注册入口。同一事件允许多个插件回调同时订阅，Host 按注册顺序依次触发；单个回调失败会被记录，但不会阻断同一事件的后续回调，派发结束后仍向宿主报告首个插件错误。文件/编辑器事件会附带活动路径及必要的 1-based 行列参数：打开/重载/保存事件传入 `path`，`editor.change`/`cursor.change` 传入 `path, line, col, language, selection_active, selection_text, current_line_text, line_count, dirty`；旧版忽略额外参数的无参回调保持兼容。
+`require("ttt.events")` 提供与 `ttt.on(event, callback)` 等价的 `events.on(event, callback)` 注册入口。同一事件允许多个插件回调同时订阅，Host 按注册顺序依次触发；单个回调失败会被记录，但不会阻断同一事件的后续回调，派发结束后仍向宿主报告首个插件错误。文件/编辑器事件会附带活动路径及必要的 1-based 行列参数：打开/重载/保存事件传入 `path`，`editor.change`/`cursor.change` 传入 `path, line, col, language, selection_active, selection_text, current_line_text, line_count, dirty, selection_start_line, selection_start_col, selection_end_line, selection_end_col, current_word`；新增选区坐标与当前单词字段追加在原有参数之后，旧插件忽略额外参数即可保持兼容；无选区时四个选区坐标为 `0`。
+
+鼠标点击、拖拽选区、矩形选区和 Alt 多光标造成的光标/选区变化同样派发 `cursor.change`，因此插件不会因输入来源不同而漏掉编辑上下文更新。
 
 `require("ttt.diagnostics")` 提供 `publish(path, items)` 和 `clear([path])`，需要 `editor.diagnostics` 权限。每个 item 使用 1-based `line/col`，可选 `end_line/end_col`、`severity`（`error`/`warning`/`info`/`hint`）、`message` 和 `source`；重复发布会替换该插件在该文件上的诊断。Host 将插件诊断与 LSP 诊断合并显示，插件禁用或重载时其运行时状态自然清空。
 
@@ -51,7 +53,7 @@ Lua 模块通过 `require("ttt")` 注入，不假设全局变量。插件加载�
 
 可注册 Sidebar/Bottom/Drawer/Editor panel、command、keybinding、file handler、status item、tab 和 Widget。Widget 包括 tree/table/list/input/button/checkbox/dialog/dropdown/radio/tabs/scrollview/markdown/image；普通面板中的 input 支持鼠标聚焦、输入、退格、Enter 提交和 `on_change`/`on_submit`，checkbox 支持鼠标/Enter/空格切换与 `on_change(checked)`，button `on_click` 可通过鼠标激活并在聚焦后用 Enter/空格重复触发，dropdown/radio/tabs 支持鼠标聚焦、Tab/Shift-Tab、方向键和 Enter 选择，List/Table 行内 `actions` 可点击并复用 `on_command`，并支持命名 style 和必要的 raw cell API。
 
-`panel:image({src, alt})` 在当前无 Kitty/iTerm 图形协议时使用文本降级（优先显示 `alt`，同时保留 `src`），因此图像型插件仍可正常加载和表达内容；`ttt.graphics()` 会报告当前协议能力。
+`panel:image({data, alt, fit, height})` 兼容 TTT 的嵌入 PNG/JPEG/GIF 字节输入；当前无 Kitty/iTerm 图形协议时使用文本降级（优先显示 `alt`，并保留 `src` 或 data 字节长度），因此图像型插件仍可正常加载和表达内容；`ttt.graphics()` 会报告当前协议能力。
 
 兼容的近期插件 API 还包括 pager、border/title/password input、checkbox（`checked` 与 `label/text`）、table 的 `columns` 标题/自动与固定宽度/`min_width`/left-center-right 对齐、数组行与 `{cells=...}` 行、列 actions 文本与鼠标命令命中、row actions/selected/loading/empty/inset、tree/list right badge（`badge`/`badge_right`）与 `inset`、hstack/vstack/box/scrollview 容器 render、keyvalue、divider、`panel:size()` 当前 Sidebar/Bottom/Drawer/自定义 Tab 内容区尺寸、带坐标的顶层 raw text/cell/clear（支持多行文本、空白填充和区域清理）、hstack align、表格水平滚动（`scroll_x`/`horizontal_scroll` 与可选 `width`，按 Unicode 字符裁剪）、双击选择复制、插件 selectionStyle、插件 tab id/on_close/focus、读取/导航 diff tabs、bundled theme manifest、`ttt.text` terminal-column width、`ttt.terminal` 的 spawn/send/read/screen/focus/close/list 进程终端 API、`sys.spawn` 交互 stdio、`sys.exec` 的 env/timeout/cancel 和 `sys.exec_async` 限长流式输出。普通 Sidebar/Bottom 面板的 `password` 已具备受控状态、鼠标聚焦、字符输入、退格、实时 `on_change` 和等长度掩码渲染；input/password/checkbox/button 之间支持 Tab/Shift-Tab 焦点循环。
 
@@ -134,7 +136,7 @@ Lua 沙箱仅保留 TTT 约定的安全运行时：`os` 只暴露 `time`、`cloc
 
 所有 panel proxy（包括 Sidebar、Bottom、Drawer 和自定义标签）都提供 `panel:redraw()`；插件在异步任务更新自身状态后调用它，会向 Host 请求下一轮该面板重绘。面板、标签页和文件视图的 `on_event` 回调发生 Lua 错误时，Host 会记录错误并按未消费处理，保证故障插件不会卡住宿主输入。
 
-`require("ttt.events")` 可在声明 `keybindings` 权限后订阅 `key.press`。该事件只在编辑器获得焦点且没有 overlay、终端或 Agent 等更高优先级输入模式时触发；事件字段为 `type="key"`、`key`、可选 `rune`/`mod`，回调返回 `true` 会消费按键，返回其他值则继续执行编辑器默认行为。插件命令键绑定和宿主强制快捷键优先于该事件；回调发生 Lua 错误时 Host 记录错误并按未消费处理，确保输入不会被故障插件卡住。
+`require("ttt.events")` 可在声明 `keybindings` 权限后订阅 `key.press`。该事件只在编辑器获得焦点且没有 overlay、终端或 Agent 等更高优先级输入模式时触发；事件字段为 `type="key"`、`key`、可选 `rune`/`mod`，其中 `mod` 使用 `ctrl`、`alt`、`shift`、`super` 组合并保留用户原始修饰键，不受 Host 的 `keyboard.modifierKey` 兼容映射影响。回调返回 `true` 会消费按键，返回其他值则继续执行编辑器默认行为。插件命令键绑定和宿主强制快捷键优先于该事件；回调发生 Lua 错误时 Host 记录错误并按未消费处理，确保输入不会被故障插件卡住。
 
 面板中的 tree/list/table/tabs/dropdown 也支持宿主键盘选择：Up/Down/PageUp/PageDown/Home/End 更新选中项并调用 `on_select`/`on_change`，Enter 对 table 优先调用 `on_activate`，没有时调用 `on_select`；树节点存在 `children` 时 Enter 会展开（已展开时不重复触发展开回调）并调用 `on_select(node)`，Left/Right 分别折叠/展开当前节点，叶节点仍调用 `on_select(node)`；tree/list 的 `key_commands` 会将命令和当前节点传递给 `on_command(command, node)`，`node_menu` 右键菜单也传递同样的节点对象，table 保持 `on_command(command, row_index)`；普通面板 dropdown 的方向键会改变选项，Enter 调用 `on_change(value)` 或 `on_menu(command)`；宿主会在重绘时保留选中行。
 
@@ -146,7 +148,7 @@ Lua 沙箱仅保留 TTT 约定的安全运行时：`os` 只暴露 `time`、`cloc
 
 `ttt.markdown(text)` 返回 1-based 行数组，每行由 `{text, style}` span 组成；当前解析支持普通文本、`#`/`##`/`###` 标题、`**粗体**`、`*斜体*`/`_斜体_` 和 `` `行内代码` ``，便于插件将 Markdown 转成 panel 内容。
 
-`panel:markdown` 同时接受 Markdown 字符串和 `{text = "..."}` 配置表；面板会按行渲染标题、基础 inline 样式，并把 `[label](url)` 显示为可读标签。配置表的 `wrap_width` 会按 Unicode 终端列宽对文本换行。
+`panel:markdown` 同时接受 Markdown 字符串和 `{text = "..."}` 配置表；面板会按行渲染标题、基础 inline 样式，并把 `[label](url)` 显示为可读标签。配置表的 `wrap_width` 会按 Unicode 终端列宽对文本换行；fenced code（反引号或波浪号围栏）会保留围栏及代码原文，不会误处理代码内部的 Markdown 标记。
 
 `panel:label` 同时接受普通字符串和 `{text = "...", badge = "..."}` 配置表；配置表会显示主文本及右侧 badge，兼容插件作者指南中的两种写法。
 

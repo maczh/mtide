@@ -57,6 +57,7 @@ pub struct TerminalScreen {
     bell_pending: bool,
     title: String,
     working_directory: Option<String>,
+    prompt_marker: Option<(u16, u16)>,
     style: TerminalStyle,
     styles: Vec<Vec<TerminalStyle>>,
     scroll_offset: usize,
@@ -116,6 +117,7 @@ struct MainSnapshot {
     mouse_sgr: bool,
     mouse_utf8: bool,
     mouse_urxvt: bool,
+    prompt_marker: Option<(u16, u16)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -200,6 +202,7 @@ impl TerminalScreen {
             bell_pending: false,
             title: String::new(),
             working_directory: None,
+            prompt_marker: None,
             style: TerminalStyle::default(),
             styles: vec![vec![TerminalStyle::default(); columns as usize]; rows as usize],
             scroll_offset: 0,
@@ -354,6 +357,10 @@ impl TerminalScreen {
     pub fn resize(&mut self, columns: u16, rows: u16) {
         let columns = columns.max(1);
         let rows = rows.max(1);
+        self.clear_prompt_for_resize();
+        if columns < self.columns && !self.alternate {
+            self.reflow_scrollback(columns as usize);
+        }
         let mut cells = vec![vec![' '; columns as usize]; rows as usize];
         let mut wide = vec![vec![false; columns as usize]; rows as usize];
         let mut combining = vec![vec![String::new(); columns as usize]; rows as usize];
@@ -386,6 +393,9 @@ impl TerminalScreen {
         }
         self.columns = columns;
         self.rows = rows;
+        self.prompt_marker = self
+            .prompt_marker
+            .map(|(row, column)| (row.min(rows - 1), column.min(columns - 1)));
         self.cells = cells;
         self.wide = wide;
         self.combining = combining;
@@ -410,6 +420,27 @@ impl TerminalScreen {
             self.scroll_top = 0;
             self.scroll_bottom = rows - 1;
         }
+    }
+
+    fn reflow_scrollback(&mut self, columns: usize) {
+        if columns == 0 || self.scrollback.is_empty() {
+            return;
+        }
+        self.scrollback = reflow_rows(&self.scrollback, columns, ' ');
+        self.scrollback_wide = reflow_rows(&self.scrollback_wide, columns, false);
+        self.scrollback_combining = reflow_rows(&self.scrollback_combining, columns, String::new());
+        self.scrollback_styles =
+            reflow_rows(&self.scrollback_styles, columns, TerminalStyle::default());
+        self.scrollback_links = reflow_rows(&self.scrollback_links, columns, None);
+        if self.scrollback.len() > self.scrollback_limit {
+            let drain = self.scrollback.len() - self.scrollback_limit;
+            self.scrollback.drain(..drain);
+            self.scrollback_wide.drain(..drain);
+            self.scrollback_combining.drain(..drain);
+            self.scrollback_styles.drain(..drain);
+            self.scrollback_links.drain(..drain);
+        }
+        self.scroll_offset = 0;
     }
 
     pub fn set_scrollback(&mut self, limit: usize) {
@@ -479,6 +510,32 @@ impl TerminalScreen {
 
     pub fn working_directory(&self) -> Option<&str> {
         self.working_directory.as_deref()
+    }
+
+    fn clear_prompt_for_resize(&mut self) {
+        let Some((prompt_row, prompt_column)) = self.prompt_marker.take() else {
+            return;
+        };
+        if self.alternate || prompt_row > self.cursor_y {
+            return;
+        }
+        if self.cursor_y.saturating_sub(prompt_row) >= self.rows {
+            return;
+        }
+        for row in prompt_row..=self.cursor_y {
+            let start = if row == prompt_row {
+                usize::from(prompt_column).min(self.columns as usize)
+            } else {
+                0
+            };
+            for column in start..self.columns as usize {
+                self.cells[row as usize][column] = ' ';
+                self.wide[row as usize][column] = false;
+                self.combining[row as usize][column].clear();
+                self.styles[row as usize][column] = TerminalStyle::default();
+                self.links[row as usize][column] = None;
+            }
+        }
     }
 
     pub fn working_directory_path(&self) -> Option<PathBuf> {
@@ -906,11 +963,20 @@ impl TerminalScreen {
             self.bracketed_paste = false;
             self.mouse_tracking = MouseTracking::None;
             self.mouse_sgr = false;
+            self.mouse_utf8 = false;
+            self.mouse_urxvt = false;
+            self.focus_reporting = false;
             self.insert_mode = false;
             self.autowrap = true;
             self.origin_mode = false;
             self.style = TerminalStyle::default();
             self.current_link = None;
+            self.saved_cursor = None;
+            self.scroll_top = 0;
+            self.scroll_bottom = self.rows - 1;
+            self.tab_stops = (0..self.columns as usize)
+                .map(|column| column % 8 == 0)
+                .collect();
             return;
         }
         self.wrap_pending = false;
@@ -930,6 +996,13 @@ impl TerminalScreen {
         };
         let first = values.first().copied().unwrap_or(1).max(1);
         let erase = values.first().copied().unwrap_or(0);
+        if private && matches!(command, 'h' | 'l') && values.len() > 1 {
+            let enabled = command == 'h';
+            for mode in values {
+                self.apply_private_mode(mode, enabled);
+            }
+            return;
+        }
         match command {
             'q' if !private => {
                 self.cursor_shape = match values.first().copied().unwrap_or(0) {
@@ -1026,36 +1099,48 @@ impl TerminalScreen {
                 ),
                 _ => {}
             },
-            'p' if private && mode_query => {
-                let mode = values.first().copied().unwrap_or(0);
-                let enabled = match mode {
-                    1 => self.application_cursor_keys,
-                    7 => self.autowrap,
-                    25 => self.cursor_visible,
-                    2004 => self.bracketed_paste,
-                    1004 => self.focus_reporting,
-                    1005 => self.mouse_utf8,
-                    1006 => self.mouse_sgr,
-                    1015 => self.mouse_urxvt,
-                    1000 => matches!(self.mouse_tracking, MouseTracking::Normal),
-                    1002 => matches!(self.mouse_tracking, MouseTracking::Button),
-                    1003 => matches!(self.mouse_tracking, MouseTracking::Any),
-                    _ => false,
-                };
-                let status = if matches!(
-                    mode,
-                    1 | 7 | 25 | 2004 | 1004 | 1005 | 1006 | 1015 | 1000 | 1002 | 1003
-                ) {
-                    if enabled {
-                        1
+            'p' if mode_query => {
+                let query_modes = if values.is_empty() { vec![0] } else { values };
+                for mode in query_modes {
+                    let (known, enabled) = if private {
+                        match mode {
+                            1 => (true, self.application_cursor_keys),
+                            3 => (true, self.columns == 132),
+                            5 => (true, self.reverse_video),
+                            6 => (true, self.origin_mode),
+                            7 => (true, self.autowrap),
+                            8 => (true, self.auto_repeat),
+                            25 => (true, self.cursor_visible),
+                            47 | 1047 | 1049 => (true, self.alternate),
+                            2004 => (true, self.bracketed_paste),
+                            1004 => (true, self.focus_reporting),
+                            1005 => (true, self.mouse_utf8),
+                            1006 => (true, self.mouse_sgr),
+                            1015 => (true, self.mouse_urxvt),
+                            1000 => (true, matches!(self.mouse_tracking, MouseTracking::Normal)),
+                            1002 => (true, matches!(self.mouse_tracking, MouseTracking::Button)),
+                            1003 => (true, matches!(self.mouse_tracking, MouseTracking::Any)),
+                            _ => (false, false),
+                        }
                     } else {
-                        2
-                    }
-                } else {
-                    0
-                };
-                self.device_responses
-                    .extend_from_slice(format!("\x1b[?{mode};{status}$y").as_bytes());
+                        match mode {
+                            4 => (true, self.insert_mode),
+                            _ => (false, false),
+                        }
+                    };
+                    let status = if known {
+                        if enabled {
+                            1
+                        } else {
+                            2
+                        }
+                    } else {
+                        0
+                    };
+                    let prefix = if private { "?" } else { "" };
+                    self.device_responses
+                        .extend_from_slice(format!("\x1b[{prefix}{mode};{status}$y").as_bytes());
+                }
             }
             'c' => self.device_responses.extend_from_slice(b"\x1b[?1;2c"),
             't' if values.first().copied() == Some(18) => {
@@ -1112,6 +1197,17 @@ impl TerminalScreen {
                     .unwrap_or(1)
                     .saturating_sub(1)
                     .min(self.columns - 1);
+            }
+            'a' => {
+                self.cursor_x = (self.cursor_x + first).min(self.columns - 1);
+            }
+            'e' => {
+                let bottom = if self.origin_mode {
+                    self.scroll_bottom
+                } else {
+                    self.rows - 1
+                };
+                self.cursor_y = (self.cursor_y + first).min(bottom);
             }
             'I' => {
                 for _ in 0..first {
@@ -1265,6 +1361,72 @@ impl TerminalScreen {
         self.normalize_cursor_cell();
     }
 
+    fn apply_private_mode(&mut self, mode: u16, enabled: bool) {
+        match mode {
+            1 => self.application_cursor_keys = enabled,
+            3 => {
+                self.resize(if enabled { 132 } else { 80 }, self.rows);
+                self.clear();
+            }
+            5 => self.reverse_video = enabled,
+            6 => {
+                self.origin_mode = enabled;
+                if enabled {
+                    self.cursor_x = 0;
+                    self.cursor_y = self.scroll_top;
+                } else {
+                    self.cursor_x = 0;
+                    self.cursor_y = 0;
+                }
+            }
+            7 => self.autowrap = enabled,
+            8 => self.auto_repeat = enabled,
+            25 => self.cursor_visible = enabled,
+            47 | 1047 | 1049 => {
+                if enabled {
+                    self.enter_alternate();
+                } else {
+                    self.leave_alternate();
+                }
+            }
+            1048 => {
+                if enabled {
+                    self.saved_cursor = Some((self.cursor_x, self.cursor_y));
+                } else if let Some((column, row)) = self.saved_cursor {
+                    self.cursor_x = column.min(self.columns - 1);
+                    self.cursor_y = row.min(self.rows - 1);
+                }
+            }
+            1000 => {
+                self.mouse_tracking = if enabled {
+                    MouseTracking::Normal
+                } else {
+                    MouseTracking::None
+                };
+            }
+            1002 => {
+                self.mouse_tracking = if enabled {
+                    MouseTracking::Button
+                } else {
+                    MouseTracking::None
+                };
+            }
+            1003 => {
+                self.mouse_tracking = if enabled {
+                    MouseTracking::Any
+                } else {
+                    MouseTracking::None
+                };
+            }
+            1004 => self.focus_reporting = enabled,
+            1005 => self.mouse_utf8 = enabled,
+            1006 => self.mouse_sgr = enabled,
+            1015 => self.mouse_urxvt = enabled,
+            2004 => self.bracketed_paste = enabled,
+            _ => {}
+        }
+    }
+
     fn normalize_cursor_cell(&mut self) {
         let row = self.cursor_y as usize;
         let column = self.cursor_x as usize;
@@ -1283,6 +1445,9 @@ impl TerminalScreen {
 
     fn reset_terminal(&mut self) {
         self.clear();
+        self.bell_pending = false;
+        self.osc52_clipboard = None;
+        self.escape = EscapeState::Normal;
         self.application_cursor_keys = false;
         self.application_keypad = false;
         self.cursor_visible = true;
@@ -1376,6 +1541,20 @@ impl TerminalScreen {
     }
 
     fn apply_osc(&mut self, payload: &str) {
+        if let Some((kind, options)) = payload.strip_prefix("133;").and_then(|value| {
+            value
+                .split_once(';')
+                .map_or(Some((value, "")), |(kind, options)| Some((kind, options)))
+        }) {
+            match kind {
+                "A" if !self.alternate && !options.split(';').any(|item| item == "redraw=0") => {
+                    self.prompt_marker = Some((self.cursor_y, self.cursor_x));
+                }
+                "C" | "D" => self.prompt_marker = None,
+                _ => {}
+            }
+            return;
+        }
         if let Some(encoded) = payload
             .strip_prefix("52;")
             .and_then(|value| value.split_once(';').map(|(_, data)| data))
@@ -1446,6 +1625,7 @@ impl TerminalScreen {
             mouse_sgr: self.mouse_sgr,
             mouse_utf8: self.mouse_utf8,
             mouse_urxvt: self.mouse_urxvt,
+            prompt_marker: self.prompt_marker,
         });
         self.cells = vec![vec![' '; self.columns as usize]; self.rows as usize];
         self.wide = vec![vec![false; self.columns as usize]; self.rows as usize];
@@ -1479,6 +1659,7 @@ impl TerminalScreen {
         self.mouse_sgr = false;
         self.mouse_utf8 = false;
         self.mouse_urxvt = false;
+        self.prompt_marker = None;
     }
 
     fn leave_alternate(&mut self) {
@@ -1520,6 +1701,7 @@ impl TerminalScreen {
         self.mouse_sgr = snapshot.mouse_sgr;
         self.mouse_utf8 = snapshot.mouse_utf8;
         self.mouse_urxvt = snapshot.mouse_urxvt;
+        self.prompt_marker = snapshot.prompt_marker;
         self.scroll_offset = 0;
         self.alternate = false;
     }
@@ -1562,6 +1744,24 @@ fn decode_osc52(encoded: &str) -> Option<String> {
         }
     }
     String::from_utf8(bytes).ok()
+}
+
+fn reflow_rows<T: Clone>(rows: &[Vec<T>], columns: usize, blank: T) -> Vec<Vec<T>> {
+    rows.iter()
+        .flat_map(|row| {
+            if row.is_empty() {
+                return vec![vec![blank.clone(); columns]].into_iter();
+            }
+            row.chunks(columns)
+                .map(|chunk| {
+                    let mut result = chunk.to_vec();
+                    result.resize(columns, blank.clone());
+                    result
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+        })
+        .collect()
 }
 
 fn percent_decode_path(value: &str) -> Option<Vec<u8>> {
@@ -2127,6 +2327,19 @@ mod tests {
     }
 
     #[test]
+    fn terminal_screen_applies_multiple_private_modes_in_one_sequence() {
+        let mut screen = TerminalScreen::new(8, 2);
+        screen.feed(b"\x1b[?25;1004;2004h");
+        assert!(screen.cursor_visible);
+        assert!(screen.focus_reporting);
+        assert!(screen.bracketed_paste);
+        screen.feed(b"\x1b[?25;1004;2004l");
+        assert!(!screen.cursor_visible);
+        assert!(!screen.focus_reporting);
+        assert!(!screen.bracketed_paste);
+    }
+
+    #[test]
     fn terminal_screen_tracks_custom_tab_stops_and_clearing() {
         let mut screen = TerminalScreen::new(12, 1);
         screen.feed(b"\x1b[1;4H\x1bH\x1b[1;1H\t");
@@ -2154,6 +2367,16 @@ mod tests {
         screen.feed(b"\x1b[?25l\x1b[4 q\x1bc");
         assert!(screen.cursor_visible);
         assert_eq!(screen.cursor_shape, CursorShape::Block);
+    }
+
+    #[test]
+    fn terminal_screen_supports_relative_horizontal_and_vertical_cursor_motion() {
+        let mut screen = TerminalScreen::new(8, 4);
+        screen.feed(b"\x1b[2;3H\x1b[3a\x1b[1eX");
+        assert_eq!((screen.cursor_x, screen.cursor_y), (6, 2));
+        assert_eq!(screen.lines()[2].chars().nth(5), Some('X'));
+        screen.feed(b"\x1b[99a\x1b[99e");
+        assert_eq!((screen.cursor_x, screen.cursor_y), (7, 3));
     }
 
     #[test]
@@ -2216,6 +2439,16 @@ mod tests {
     }
 
     #[test]
+    fn terminal_screen_reports_each_mode_in_a_batch_query() {
+        let mut screen = TerminalScreen::new(8, 2);
+        screen.feed(b"\x1b[?25;1004;2004$p");
+        assert_eq!(
+            screen.take_device_responses(),
+            b"\x1b[?25;1$y\x1b[?1004;2$y\x1b[?2004;2$y"
+        );
+    }
+
+    #[test]
     fn terminal_screen_tracks_focus_reporting_mode() {
         let mut screen = TerminalScreen::new(8, 2);
         assert!(!screen.focus_reporting());
@@ -2248,15 +2481,35 @@ mod tests {
 
     #[test]
     fn terminal_screen_soft_reset_preserves_screen_and_resets_modes() {
-        let mut screen = TerminalScreen::new(8, 1);
-        screen.feed(b"abc\x1b[?1h\x1b[?2004h\x1b[4h\x1b[?7l\x1b[31m\x1b[!p");
+        let mut screen = TerminalScreen::new(8, 3);
+        screen.feed(
+            b"abc\x1b[?1h\x1b[?1004;1005;1015h\x1b[?2004h\x1b[4h\x1b[?7l\x1b[2;3r\x1b[1;4H\x1bH\x1b[31m\x1b[!p",
+        );
         assert_eq!(screen.lines()[0], "abc     ");
         assert!(!screen.application_cursor_keys);
         assert!(!screen.bracketed_paste);
+        assert!(!screen.focus_reporting);
+        assert!(!screen.mouse_utf8);
+        assert!(!screen.mouse_urxvt);
+        assert_eq!(screen.mouse_tracking, MouseTracking::None);
         assert!(!screen.insert_mode);
         assert!(screen.autowrap);
+        assert_eq!(screen.scroll_top, 0);
+        assert_eq!(screen.scroll_bottom, 2);
         screen.feed(b"X");
         assert_eq!(screen.lines()[0], "abcX    ");
+        screen.feed(b"\x1b[1;1H\t");
+        assert_eq!(screen.cursor_x, 7);
+    }
+
+    #[test]
+    fn terminal_screen_ris_clears_pending_bell_and_clipboard_events() {
+        let mut screen = TerminalScreen::new(8, 1);
+        screen.feed(b"text\x07\x1b]52;c;aGVsbG8=\x07\x1bc");
+
+        assert_eq!(screen.lines()[0], "        ");
+        assert!(!screen.take_bell());
+        assert!(screen.take_osc52_clipboard().is_none());
     }
 
     #[test]
@@ -2462,6 +2715,17 @@ mod tests {
         assert!(!screen.auto_repeat);
         screen.feed(b"\x1b[!p");
         assert!(screen.auto_repeat);
+    }
+
+    #[test]
+    fn terminal_screen_reports_common_decrqm_modes() {
+        let mut screen = TerminalScreen::new(4, 2);
+        screen.feed(b"\x1b[4h\x1b[?1049h\x1b[?5h\x1b[?6h");
+        screen.feed(b"\x1b[4$p\x1b[?5$p\x1b[?6$p\x1b[?8$p\x1b[?1049$p\x1b[?999$p");
+        assert_eq!(
+            screen.take_device_responses(),
+            b"\x1b[4;1$y\x1b[?5;1$y\x1b[?6;1$y\x1b[?8;1$y\x1b[?1049;1$y\x1b[?999;0$y"
+        );
     }
 
     #[test]
@@ -2749,6 +3013,42 @@ mod tests {
         );
         screen.feed(b"\x1b]7;file://remote/tmp/project\x07");
         assert!(screen.working_directory_path().is_none());
+    }
+
+    #[test]
+    fn terminal_screen_tracks_osc133_prompt_marks() {
+        let mut screen = TerminalScreen::new(20, 3);
+        screen.feed(b"\x1b[2;4H\x1b]133;A;click_events=1\x1b\\prompt");
+        assert_eq!(screen.prompt_marker, Some((1, 3)));
+        screen.feed(b"\x1b]133;C\x07");
+        assert_eq!(screen.prompt_marker, None);
+        screen.feed(b"\x1b]133;A;redraw=0\x07");
+        assert_eq!(screen.prompt_marker, None);
+    }
+
+    #[test]
+    fn terminal_screen_clears_osc133_prompt_before_resize() {
+        let mut screen = TerminalScreen::new(12, 2);
+        screen.feed(b"\x1b[2;2H\x1b]133;A\x07old prompt");
+        assert_eq!(screen.prompt_marker, Some((1, 1)));
+        screen.resize(16, 2);
+        assert_eq!(screen.prompt_marker, None);
+        assert_eq!(screen.lines()[1], "                ");
+    }
+
+    #[test]
+    fn terminal_screen_reflows_scrollback_when_narrowing() {
+        let mut screen = TerminalScreen::new(8, 2);
+        screen.feed(b"12345678\r\nabcdefgh\r\n");
+        assert_eq!(screen.scrollback.len(), 1);
+        screen.resize(4, 2);
+        assert!(screen.scrollback.len() >= 2);
+        assert_eq!(screen.scrollback[0], vec!['1', '2', '3', '4']);
+        assert_eq!(screen.scrollback[1], vec!['5', '6', '7', '8']);
+        assert_eq!(screen.scrollback_wide.len(), screen.scrollback.len());
+        assert_eq!(screen.scrollback_combining.len(), screen.scrollback.len());
+        assert_eq!(screen.scrollback_styles.len(), screen.scrollback.len());
+        assert_eq!(screen.scrollback_links.len(), screen.scrollback.len());
     }
 
     #[test]

@@ -28,6 +28,40 @@ pub struct DiffLine {
     pub text: String,
 }
 
+/// Backend boundary used by the UI so Git-specific commands do not leak into
+/// workspace state handling. Future VCS implementations can provide the same
+/// status/diff surface without changing panel code.
+pub trait VcsBackend {
+    fn root(&self) -> &Path;
+    fn status(&self) -> Vec<GitChange>;
+    fn diff(&self, change: &GitChange) -> Vec<DiffLine>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitBackend {
+    root: PathBuf,
+}
+
+impl GitBackend {
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+}
+
+impl VcsBackend for GitBackend {
+    fn root(&self) -> &Path {
+        &self.root
+    }
+
+    fn status(&self) -> Vec<GitChange> {
+        status(&self.root)
+    }
+
+    fn diff(&self, change: &GitChange) -> Vec<DiffLine> {
+        diff(&self.root, change)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct PullRequestComment {
     pub id: u64,
@@ -214,19 +248,39 @@ pub fn conflict_blocks(lines: &[String]) -> Vec<ConflictBlock> {
             index += 1;
             continue;
         }
-        let Some(separator) = lines[index + 1..]
-            .iter()
-            .position(|line| line.starts_with("======="))
-            .map(|offset| index + 1 + offset)
-        else {
-            break;
+        // Do not pair markers across another conflict start. A partially
+        // written or hand-edited conflict must not hide later valid blocks.
+        let mut separator = None;
+        let mut cursor = index + 1;
+        while cursor < lines.len() {
+            if lines[cursor].starts_with("<<<<<<<") {
+                break;
+            }
+            if lines[cursor].starts_with("=======") {
+                separator = Some(cursor);
+                break;
+            }
+            cursor += 1;
+        }
+        let Some(separator) = separator else {
+            index += 1;
+            continue;
         };
-        let Some(end) = lines[separator + 1..]
-            .iter()
-            .position(|line| line.starts_with(">>>>>>>"))
-            .map(|offset| separator + 1 + offset)
-        else {
-            break;
+        let mut end = None;
+        cursor = separator + 1;
+        while cursor < lines.len() {
+            if lines[cursor].starts_with("<<<<<<<") {
+                break;
+            }
+            if lines[cursor].starts_with(">>>>>>>") {
+                end = Some(cursor);
+                break;
+            }
+            cursor += 1;
+        }
+        let Some(end) = end else {
+            index += 1;
+            continue;
         };
         let base_marker = lines[index + 1..separator]
             .iter()
@@ -526,27 +580,32 @@ pub fn blame(root: &Path, path: &str) -> Vec<BlameLine> {
     parse_blame(&String::from_utf8_lossy(&output.stdout))
 }
 
-pub fn history(root: &Path, limit: usize) -> Vec<GitCommit> {
+pub fn history_page(root: &Path, skip: usize, limit: usize) -> (Vec<GitCommit>, bool) {
     let limit = limit.clamp(1, 200);
+    let fetch_limit = limit.saturating_add(1);
     let output = Command::new("git")
         .args([
             "log",
-            &format!("-{limit}"),
+            &format!("-{fetch_limit}"),
+            &format!("--skip={skip}"),
             "--date=short",
             "--pretty=format:%H%x1f%an%x1f%ad%x1f%s",
         ])
         .current_dir(root)
         .output();
     let Ok(output) = output else {
-        return Vec::new();
+        return (Vec::new(), false);
     };
     if !output.status.success() {
-        return Vec::new();
+        return (Vec::new(), false);
     }
-    String::from_utf8_lossy(&output.stdout)
+    let mut commits: Vec<_> = String::from_utf8_lossy(&output.stdout)
         .lines()
         .filter_map(parse_history_line)
-        .collect()
+        .collect();
+    let has_more = commits.len() > limit;
+    commits.truncate(limit);
+    (commits, has_more)
 }
 
 pub fn fetch(root: &Path) -> AppResult<()> {
@@ -582,12 +641,21 @@ pub fn push(root: &Path) -> AppResult<()> {
     remote_action(root, ["push"])
 }
 
+pub fn sync(root: &Path) -> AppResult<()> {
+    pull(root)?;
+    push(root)
+}
+
 pub fn remote_with_credentials(
     root: &Path,
     operation: &str,
     username: &str,
     password: &str,
 ) -> AppResult<()> {
+    if operation == "sync" {
+        run_git_with_credentials(root, &["pull", "--ff-only"], username, password)?;
+        return run_git_with_credentials(root, &["push"], username, password);
+    }
     let args: &[&str] = match operation {
         "fetch" => &["fetch", "--all", "--prune"],
         "pull" => &["pull", "--ff-only"],
@@ -598,6 +666,15 @@ pub fn remote_with_credentials(
             )))
         }
     };
+    run_git_with_credentials(root, args, username, password)
+}
+
+fn run_git_with_credentials(
+    root: &Path,
+    args: &[&str],
+    username: &str,
+    password: &str,
+) -> AppResult<()> {
     let helper = "!f() { printf 'username=%s\\npassword=%s\\n' \"$MTIDE_GIT_USERNAME\" \"$MTIDE_GIT_PASSWORD\"; }; f";
     let output = Command::new("git")
         .arg("-c")
@@ -882,16 +959,54 @@ mod tests {
             }]
         );
     }
+
+    #[test]
+    fn skips_malformed_conflict_without_hiding_later_valid_block() {
+        let lines = vec![
+            "<<<<<<< broken".into(),
+            "content without a separator".into(),
+            "<<<<<<< ours".into(),
+            "ours".into(),
+            "=======".into(),
+            "theirs".into(),
+            ">>>>>>> theirs".into(),
+        ];
+
+        let blocks = conflict_blocks(&lines);
+
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].start_line, 2);
+        assert_eq!(blocks[0].ours_start, 3);
+        assert_eq!(blocks[0].theirs_start, 5);
+    }
+
+    #[test]
+    fn does_not_pair_nested_conflict_markers_across_blocks() {
+        let lines = vec![
+            "<<<<<<< outer".into(),
+            "<<<<<<< inner".into(),
+            "inner ours".into(),
+            "=======".into(),
+            "inner theirs".into(),
+            ">>>>>>> inner".into(),
+        ];
+
+        let blocks = conflict_blocks(&lines);
+
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].start_line, 1);
+    }
+
     #[test]
     fn ignores_short_lines() {
         assert!(parse_status_line("M").is_none());
     }
 
     #[test]
-    fn rejects_unknown_credential_operation_before_spawning_git() {
+    fn accepts_sync_as_a_credential_operation() {
         let error = remote_with_credentials(Path::new("/missing"), "sync", "user", "secret")
-            .expect_err("unknown operation");
-        assert!(error.to_string().contains("unsupported remote operation"));
+            .expect_err("missing repository");
+        assert!(!error.to_string().contains("unsupported remote operation"));
     }
 
     #[test]
@@ -991,6 +1106,14 @@ mod tests {
     #[test]
     fn branch_reader_is_safe_outside_git() {
         assert_eq!(current_branch(Path::new("/tmp")), None);
+    }
+
+    #[test]
+    fn git_backend_exposes_vcs_neutral_status_boundary() {
+        let root = std::env::temp_dir().join(format!("mtide-vcs-backend-{}", std::process::id()));
+        let backend = GitBackend::new(root.clone());
+        assert_eq!(backend.root(), root.as_path());
+        assert!(backend.status().is_empty());
     }
 
     #[test]

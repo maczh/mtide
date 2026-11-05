@@ -40,6 +40,7 @@ pub struct LspDiagnostic {
 pub struct LspManager {
     configs: HashMap<String, LspServerConfig>,
     clients: HashMap<String, LspClient>,
+    client_roots: HashMap<String, Option<String>>,
     states: HashMap<String, LspServerState>,
     diagnostics: HashMap<String, Vec<LspDiagnostic>>,
     document_versions: HashMap<(String, String), i32>,
@@ -48,7 +49,10 @@ pub struct LspManager {
 #[allow(dead_code)]
 impl LspManager {
     fn mark_failed(&mut self, language: &str) {
-        self.clients.remove(language);
+        if let Some(mut client) = self.clients.remove(language) {
+            let _ = client.shutdown();
+        }
+        self.client_roots.remove(language);
         self.states
             .insert(language.to_owned(), LspServerState::Failed);
         self.document_versions
@@ -69,6 +73,7 @@ impl LspManager {
                 })
                 .collect(),
             clients: HashMap::new(),
+            client_roots: HashMap::new(),
             states: HashMap::new(),
             diagnostics: HashMap::new(),
             document_versions: HashMap::new(),
@@ -88,11 +93,18 @@ impl LspManager {
     }
 
     pub fn start(&mut self, language: &str, root_uri: Option<&str>) -> AppResult<bool> {
-        if self.clients.contains_key(language) {
+        let requested_root = root_uri.map(str::to_owned);
+        if self.clients.contains_key(language)
+            && self.client_roots.get(language) == Some(&requested_root)
+        {
             self.states
                 .insert(language.to_owned(), LspServerState::Connected);
             return Ok(true);
         }
+        if let Some(mut client) = self.clients.remove(language) {
+            let _ = client.shutdown();
+        }
+        self.client_roots.remove(language);
         let Some(config) = self.configs.get(language) else {
             return Ok(false);
         };
@@ -119,6 +131,8 @@ impl LspManager {
             return Err(error);
         }
         self.clients.insert(language.to_owned(), client);
+        self.client_roots
+            .insert(language.to_owned(), requested_root);
         self.states
             .insert(language.to_owned(), LspServerState::Connected);
         Ok(true)
@@ -132,6 +146,7 @@ impl LspManager {
         if let Some(mut client) = self.clients.remove(language) {
             let _ = client.shutdown();
         }
+        self.client_roots.remove(language);
         self.states.remove(language);
         self.document_versions
             .retain(|(document_language, _), _| document_language != language);
@@ -159,6 +174,43 @@ impl LspManager {
                 Err(error)
             }
         }
+    }
+
+    pub fn request_async(
+        &mut self,
+        language: &str,
+        method: &str,
+        params: Value,
+    ) -> AppResult<Option<u64>> {
+        let Some(client) = self.clients.get_mut(language) else {
+            return Ok(None);
+        };
+        match client.request_async(method, params) {
+            Ok(id) => Ok(Some(id)),
+            Err(error) => {
+                self.mark_failed(language);
+                Err(error)
+            }
+        }
+    }
+
+    pub fn poll_responses(&mut self) -> Vec<(String, u64, Result<Value, String>)> {
+        self.clients
+            .iter_mut()
+            .flat_map(|(language, client)| {
+                client
+                    .poll_responses()
+                    .map(move |(id, result)| (language.clone(), id, result))
+            })
+            .collect()
+    }
+
+    pub fn cancel_request(&mut self, language: &str, id: u64) -> AppResult<bool> {
+        let Some(client) = self.clients.get_mut(language) else {
+            return Ok(false);
+        };
+        client.cancel_request(id)?;
+        Ok(true)
     }
 
     pub fn sync_document(
@@ -269,6 +321,7 @@ impl LspManager {
             let _ = client.shutdown();
         }
         self.clients.clear();
+        self.client_roots.clear();
         self.states.clear();
         self.document_versions.clear();
     }
@@ -316,6 +369,7 @@ pub struct LspClient {
     stdin: ChildStdin,
     messages: Receiver<Value>,
     notifications: Vec<Value>,
+    responses: Vec<(u64, Result<Value, String>)>,
     next_id: u64,
 }
 
@@ -353,8 +407,19 @@ impl LspClient {
             stdin,
             messages,
             notifications: Vec::new(),
+            responses: Vec::new(),
             next_id: 1,
         })
+    }
+
+    pub fn request_async(&mut self, method: &str, params: Value) -> AppResult<u64> {
+        let id = self.next_id;
+        self.next_id += 1;
+        write_message(
+            &mut self.stdin,
+            &json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}),
+        )?;
+        Ok(id)
     }
 
     pub fn request(&mut self, method: &str, params: Value) -> AppResult<Value> {
@@ -393,13 +458,52 @@ impl LspClient {
             }
             if message.get("method").is_some() {
                 self.notifications.push(message);
+            } else if let Some(other_id) = message.get("id").and_then(Value::as_u64) {
+                let result = if let Some(error) = message.get("error") {
+                    Err(error.to_string())
+                } else {
+                    Ok(message.get("result").cloned().unwrap_or(Value::Null))
+                };
+                self.responses.push((other_id, result));
             }
         }
     }
 
     pub fn poll_notifications(&mut self) -> impl Iterator<Item = Value> + '_ {
-        self.notifications.extend(self.messages.try_iter());
+        self.collect_incoming();
         self.notifications.drain(..)
+    }
+
+    pub fn poll_responses(&mut self) -> impl Iterator<Item = (u64, Result<Value, String>)> + '_ {
+        self.collect_incoming();
+        self.responses.drain(..)
+    }
+
+    pub fn cancel_request(&mut self, id: u64) -> AppResult<()> {
+        write_message(
+            &mut self.stdin,
+            &json!({
+                "jsonrpc":"2.0",
+                "method":"$/cancelRequest",
+                "params":{"id":id}
+            }),
+        )
+    }
+
+    fn collect_incoming(&mut self) {
+        let messages: Vec<_> = self.messages.try_iter().collect();
+        for message in messages {
+            if message.get("method").is_some() {
+                self.notifications.push(message);
+            } else if let Some(id) = message.get("id").and_then(Value::as_u64) {
+                let result = if let Some(error) = message.get("error") {
+                    Err(error.to_string())
+                } else {
+                    Ok(message.get("result").cloned().unwrap_or(Value::Null))
+                };
+                self.responses.push((id, result));
+            }
+        }
     }
 
     fn respond(&mut self, id: &Value, result: Value) -> AppResult<()> {
@@ -671,5 +775,48 @@ mod tests {
         assert!(manager.start("rust", None).is_err());
         assert!(manager.document_versions.is_empty());
         assert_eq!(manager.state("rust"), Some(LspServerState::Failed));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rebinds_same_language_server_when_workspace_root_changes() {
+        let script = r#"
+body1='{"jsonrpc":"2.0","id":1,"result":{"capabilities":{}}}'
+body2='{"jsonrpc":"2.0","id":2,"result":null}'
+printf 'Content-Length: %s\r\n\r\n%s' "${#body1}" "$body1"
+printf 'Content-Length: %s\r\n\r\n%s' "${#body2}" "$body2"
+sleep 30
+"#;
+        let settings = LspSettings {
+            extra: BTreeMap::new(),
+            enabled: true,
+            servers: BTreeMap::from([(
+                "rust".to_owned(),
+                LspServerConfig {
+                    command: vec!["/bin/sh".to_owned(), "-c".to_owned(), script.to_owned()],
+                    languages: Vec::new(),
+                },
+            )]),
+        };
+        let mut manager = LspManager::from_settings(&settings);
+
+        assert!(manager
+            .start("rust", Some("file:///workspace/one"))
+            .expect("start LSP server"));
+        assert_eq!(
+            manager.client_roots.get("rust"),
+            Some(&Some("file:///workspace/one".to_owned()))
+        );
+        assert!(manager
+            .start("rust", Some("file:///workspace/one"))
+            .expect("reuse LSP server"));
+        assert!(manager
+            .start("rust", Some("file:///workspace/two"))
+            .expect("rebind LSP server"));
+        assert_eq!(
+            manager.client_roots.get("rust"),
+            Some(&Some("file:///workspace/two".to_owned()))
+        );
+        manager.shutdown();
     }
 }

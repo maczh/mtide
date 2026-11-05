@@ -40,6 +40,7 @@
 - [#1019](https://github.com/eugenioenko/ttt/pull/1019)：编辑器内联解决 merge conflict，纳入 P2 设计。
 - [#1007](https://github.com/eugenioenko/ttt/pull/1007)：Toggle Line Comment 使用语言 comment syntax，而不是固定 `//`。
 - [#948](https://github.com/eugenioenko/ttt/pull/948)：多光标复制/剪切/粘贴按文档顺序、整行 fallback、匹配行数 spread，并作为单次 undo；该 PR 说明了重叠范围必须先归并，避免误删。
+- [#1318](https://github.com/eugenioenko/ttt/pull/1318)：Control/Super 快捷键兼容；mtide 以 `keyboard.modifierKey` 提供 `control`、`control+super` 和 `super` 模式，并仅在 Host 快捷键匹配层将 Super/Cmd 归一化到现有 Control 快捷键；终端、Agent 与插件事件保留原始修饰键。
 
 ## 4. 纳入规则
 

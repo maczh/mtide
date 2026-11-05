@@ -849,6 +849,7 @@ pub struct PluginRuntime {
     net_callbacks: Rc<RefCell<BTreeMap<u64, RegistryKey>>>,
     spawn_rx: Receiver<SpawnEvent>,
     spawn_callbacks: Rc<RefCell<BTreeMap<u64, SpawnRegistration>>>,
+    spawn_handles: Rc<RefCell<BTreeMap<u64, Arc<Mutex<SpawnHandle>>>>>,
     panel_requests: Rc<RefCell<Vec<PluginPanelRequest>>>,
     clipboard_text: Rc<RefCell<String>>,
     editor_snapshot: Rc<RefCell<PluginEditorSnapshot>>,
@@ -859,6 +860,7 @@ pub struct PluginRuntime {
     #[allow(dead_code)]
     uninstall_callback: Rc<RefCell<Option<RegistryKey>>>,
     diagnostics: Rc<RefCell<BTreeMap<String, Vec<PluginDiagnostic>>>>,
+    decorations: Rc<RefCell<BTreeMap<String, Vec<PluginDiagnostic>>>>,
     bookmarks: Rc<RefCell<PluginBookmarks>>,
     bookmark_events: Rc<RefCell<Vec<PluginBookmarkEvent>>>,
     timers: Rc<RefCell<BTreeMap<u64, PluginTimer>>>,
@@ -888,6 +890,7 @@ pub struct PluginRuntime {
     panel_scrollview_lines: Rc<RefCell<BTreeMap<String, usize>>>,
     panel_focused_scrollview: Rc<RefCell<BTreeMap<String, usize>>>,
     drawer_checkbox: Rc<RefCell<Option<PluginDrawerCheckboxState>>>,
+    drawer_password: Rc<RefCell<Option<PluginDrawerInputState>>>,
     drawer_dropdown: Rc<RefCell<Option<PluginDrawerDropdownState>>>,
     rpc_rx: Receiver<RpcEvent>,
     rpc_connections: Rc<RefCell<BTreeMap<u64, RpcRegistration>>>,
@@ -905,6 +908,11 @@ pub struct PluginRuntime {
     status_callbacks: Rc<RefCell<BTreeMap<String, RegistryKey>>>,
     editor_context_callback: Rc<RefCell<Option<RegistryKey>>>,
     editor_context_items: Rc<RefCell<Vec<PluginContextMenuItem>>>,
+    fs_read_roots: Rc<RefCell<Vec<PathBuf>>>,
+    fs_write_roots: Rc<RefCell<Vec<PathBuf>>>,
+    snapshot_write_roots: Rc<RefCell<Vec<PathBuf>>>,
+    workspace_read_scope_enabled: bool,
+    workspace_write_scope_enabled: bool,
 }
 
 #[derive(Debug)]
@@ -1001,6 +1009,7 @@ struct PluginCustomDialogCallbacks {
 #[derive(Debug, Default)]
 struct PluginDialogWidgetState {
     input_text: String,
+    input_cursor: usize,
     input_prefix: String,
     input_multiline: bool,
     input_wrap: bool,
@@ -1033,6 +1042,7 @@ struct PluginDialogButtonState {
 struct PluginDrawerInputState {
     line: usize,
     text: String,
+    cursor: usize,
     prefix: String,
     multiline: bool,
     wrap: bool,
@@ -1044,6 +1054,76 @@ struct PluginDrawerInputState {
     on_submit: Option<RegistryKey>,
     clear_on_submit: bool,
     autofocus: bool,
+}
+
+/// Apply one terminal-style edit to a plugin input. The cursor is a Unicode
+/// scalar index, matching the rest of the TTT compatibility layer's text
+/// editing semantics. The return value distinguishes an unhandled key from a
+/// handled key that did not change the value (for example Left/Right).
+fn edit_plugin_input(
+    text: &mut String,
+    cursor: &mut usize,
+    key_name: &str,
+    rune: Option<char>,
+    multiline: bool,
+) -> Option<bool> {
+    let mut chars: Vec<char> = text.chars().collect();
+    *cursor = (*cursor).min(chars.len());
+    match key_name {
+        "Left" => {
+            *cursor = cursor.saturating_sub(1);
+            Some(false)
+        }
+        "Right" => {
+            *cursor = (*cursor + 1).min(chars.len());
+            Some(false)
+        }
+        "Home" => {
+            *cursor = chars[..*cursor]
+                .iter()
+                .rposition(|character| *character == '\n')
+                .map_or(0, |index| index + 1);
+            Some(false)
+        }
+        "End" => {
+            *cursor = chars[*cursor..]
+                .iter()
+                .position(|character| *character == '\n')
+                .map_or(chars.len(), |index| *cursor + index);
+            Some(false)
+        }
+        "Backspace" => {
+            if *cursor == 0 {
+                return Some(false);
+            }
+            chars.remove(*cursor - 1);
+            *cursor -= 1;
+            *text = chars.into_iter().collect();
+            Some(true)
+        }
+        "Delete" => {
+            if *cursor >= chars.len() {
+                return Some(false);
+            }
+            chars.remove(*cursor);
+            *text = chars.into_iter().collect();
+            Some(true)
+        }
+        "Enter" if multiline => {
+            chars.insert(*cursor, '\n');
+            *cursor += 1;
+            *text = chars.into_iter().collect();
+            Some(true)
+        }
+        "Enter" => None,
+        _ => {
+            let rune = rune?;
+            chars.insert(*cursor, rune);
+            *cursor += 1;
+            *text = chars.into_iter().collect();
+            Some(true)
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1799,6 +1879,7 @@ impl PluginRuntime {
         let next_net_id = Rc::new(RefCell::new(0_u64));
         let (spawn_tx, spawn_rx) = mpsc::channel();
         let spawn_callbacks = Rc::new(RefCell::new(BTreeMap::new()));
+        let spawn_handles = Rc::new(RefCell::new(BTreeMap::new()));
         let next_spawn_id = Rc::new(RefCell::new(0_u64));
         let panel_requests = Rc::new(RefCell::new(Vec::new()));
         let clipboard_text = Rc::new(RefCell::new(String::new()));
@@ -1811,6 +1892,7 @@ impl PluginRuntime {
         let install_callback = Rc::new(RefCell::new(None));
         let uninstall_callback = Rc::new(RefCell::new(None));
         let diagnostics = Rc::new(RefCell::new(BTreeMap::new()));
+        let decorations = Rc::new(RefCell::new(BTreeMap::new()));
         let bookmarks = Rc::new(RefCell::new(PluginBookmarks::new()));
         let bookmark_events = Rc::new(RefCell::new(Vec::new()));
         let timers = Rc::new(RefCell::new(BTreeMap::new()));
@@ -1843,6 +1925,7 @@ impl PluginRuntime {
         let panel_scrollview_lines = Rc::new(RefCell::new(BTreeMap::new()));
         let panel_focused_scrollview = Rc::new(RefCell::new(BTreeMap::new()));
         let drawer_checkbox = Rc::new(RefCell::new(None));
+        let drawer_password = Rc::new(RefCell::new(None));
         let drawer_dropdown = Rc::new(RefCell::new(None));
         let next_custom_dialog_id = Rc::new(RefCell::new(0_u64));
         let (rpc_tx, rpc_rx) = mpsc::channel::<RpcEvent>();
@@ -3115,13 +3198,13 @@ impl PluginRuntime {
             .get("fs.write")
             .copied()
             .unwrap_or(false);
-        let snapshot_write_roots = fs_scope_roots(
+        let snapshot_write_roots = Rc::new(RefCell::new(fs_scope_roots(
             &package.root,
             &package.fs_write_scopes,
             package.fs_write_allow_all,
             workspace_root,
             settings_override,
-        );
+        )));
         let snapshot_root = package.root.clone();
         let screenshot_write_roots = snapshot_write_roots.clone();
         module
@@ -3139,7 +3222,7 @@ impl PluginRuntime {
                         return Err(mlua::Error::external("permission denied: fs.write"));
                     }
                     let path = resolve_fs_path(&snapshot_root, &path);
-                    if !fs_path_allowed(&path, &screenshot_write_roots) {
+                    if !fs_path_allowed(&path, &screenshot_write_roots.borrow()) {
                         return Err(mlua::Error::external(
                             "screenshot path is outside fs.write scope",
                         ));
@@ -3151,7 +3234,7 @@ impl PluginRuntime {
             )
             .map_err(lua_error)?;
         let debug_snapshot = Rc::clone(&editor_snapshot);
-        let debug_write_roots = snapshot_write_roots;
+        let debug_write_roots = Rc::clone(&snapshot_write_roots);
         let debug_root = package.root.clone();
         let can_debug = can_screen_read
             && package
@@ -3193,7 +3276,7 @@ impl PluginRuntime {
                         return Err(mlua::Error::external("permission denied: fs.write"));
                     }
                     let path = resolve_fs_path(&debug_root, &path);
-                    if !fs_path_allowed(&path, &debug_write_roots) {
+                    if !fs_path_allowed(&path, &debug_write_roots.borrow()) {
                         return Err(mlua::Error::external("debug path is outside fs.write scope"));
                     }
                     fs::write(&path, text).map_err(mlua::Error::external)?;
@@ -3897,6 +3980,7 @@ impl PluginRuntime {
         let exec_commands_for_spawn = exec_commands;
         let spawn_events = spawn_tx.clone();
         let spawn_callbacks_sink = Rc::clone(&spawn_callbacks);
+        let spawn_handles_sink = Rc::clone(&spawn_handles);
         let spawn_ids = Rc::clone(&next_spawn_id);
         system_module
             .set(
@@ -4049,6 +4133,9 @@ impl PluginRuntime {
                         thread::sleep(Duration::from_millis(10));
                     });
                     let handle = Arc::new(Mutex::new(SpawnHandle { child, stdin, pid }));
+                    spawn_handles_sink
+                        .borrow_mut()
+                        .insert(id, Arc::clone(&handle));
                     let process = lua.create_table()?;
                     let write_stdin = Arc::clone(&handle);
                     process.set(
@@ -4774,6 +4861,33 @@ impl PluginRuntime {
             .unwrap_or(false);
         editor_module
             .set(
+                "current_word",
+                lua.create_function(move |_, ()| {
+                    if !editor_read {
+                        return Err(mlua::Error::external("permission denied: editor.read"));
+                    }
+                    let snapshot = editor_snapshot_source.borrow();
+                    Ok(current_word_at_cursor(
+                        snapshot
+                            .lines
+                            .get(snapshot.cursor_line)
+                            .map(String::as_str)
+                            .unwrap_or_default(),
+                        snapshot.cursor_col,
+                    ))
+                })
+                .map_err(lua_error)?,
+            )
+            .map_err(lua_error)?;
+        let editor_snapshot_source = Rc::clone(&editor_snapshot);
+        let editor_read = package
+            .manifest
+            .permissions
+            .get("editor.read")
+            .copied()
+            .unwrap_or(false);
+        editor_module
+            .set(
                 "get_cursors",
                 lua.create_function(move |lua, ()| {
                     if !editor_read {
@@ -4877,7 +4991,7 @@ impl PluginRuntime {
             .map_err(lua_error)?;
 
         let decorations_module = lua.create_table().map_err(lua_error)?;
-        let decorations_sink = Rc::clone(&diagnostics);
+        let decorations_sink = Rc::clone(&decorations);
         let can_decorate = package
             .manifest
             .permissions
@@ -4937,7 +5051,7 @@ impl PluginRuntime {
                 .map_err(lua_error)?,
             )
             .map_err(lua_error)?;
-        let decorations_sink = Rc::clone(&diagnostics);
+        let decorations_sink = Rc::clone(&decorations);
         decorations_module
             .set(
                 "clear",
@@ -5206,20 +5320,30 @@ impl PluginRuntime {
 
         let fs_module = lua.create_table().map_err(lua_error)?;
         let fs_root = package.root.clone();
-        let fs_read_roots = fs_scope_roots(
+        let workspace_read_scope_enabled = package.fs_read_allow_all
+            || package
+                .fs_read_scopes
+                .iter()
+                .any(|scope| scope == "{workspace}");
+        let workspace_write_scope_enabled = package.fs_write_allow_all
+            || package
+                .fs_write_scopes
+                .iter()
+                .any(|scope| scope == "{workspace}");
+        let fs_read_roots = Rc::new(RefCell::new(fs_scope_roots(
             &package.root,
             &package.fs_read_scopes,
             package.fs_read_allow_all,
             workspace_root,
             settings_override,
-        );
-        let fs_write_roots = fs_scope_roots(
+        )));
+        let fs_write_roots = Rc::new(RefCell::new(fs_scope_roots(
             &package.root,
             &package.fs_write_scopes,
             package.fs_write_allow_all,
             workspace_root,
             settings_override,
-        );
+        )));
         let can_read = package
             .manifest
             .permissions
@@ -5227,7 +5351,7 @@ impl PluginRuntime {
             .copied()
             .unwrap_or(false);
         let read_root = fs_root.clone();
-        let read_scopes = fs_read_roots.clone();
+        let read_scopes = Rc::clone(&fs_read_roots);
         fs_module
             .set(
                 "read",
@@ -5236,7 +5360,7 @@ impl PluginRuntime {
                         return Err(mlua::Error::external("permission denied: fs.read"));
                     }
                     let path = resolve_fs_path(&read_root, &relative);
-                    if !fs_path_allowed(&path, &read_scopes) {
+                    if !fs_path_allowed(&path, &read_scopes.borrow()) {
                         return Ok((None, Some("access denied".to_owned())));
                     }
                     match fs::read(path) {
@@ -5250,7 +5374,7 @@ impl PluginRuntime {
             )
             .map_err(lua_error)?;
         let exists_root = fs_root.clone();
-        let exists_scopes = fs_read_roots.clone();
+        let exists_scopes = Rc::clone(&fs_read_roots);
         fs_module
             .set(
                 "exists",
@@ -5259,13 +5383,13 @@ impl PluginRuntime {
                         return Err(mlua::Error::external("permission denied: fs.read"));
                     }
                     let path = resolve_fs_path(&exists_root, &relative);
-                    Ok(fs_path_allowed(&path, &exists_scopes) && path.exists())
+                    Ok(fs_path_allowed(&path, &exists_scopes.borrow()) && path.exists())
                 })
                 .map_err(lua_error)?,
             )
             .map_err(lua_error)?;
         let list_root = fs_root.clone();
-        let list_scopes = fs_read_roots;
+        let list_scopes = Rc::clone(&fs_read_roots);
         fs_module
             .set(
                 "list",
@@ -5275,7 +5399,7 @@ impl PluginRuntime {
                     }
                     let relative = relative.unwrap_or_default();
                     let path = resolve_fs_path(&list_root, &relative);
-                    if !fs_path_allowed(&path, &list_scopes) {
+                    if !fs_path_allowed(&path, &list_scopes.borrow()) {
                         return Ok((None, Some("access denied".to_owned())));
                     }
                     let mut entries = match fs::read_dir(path) {
@@ -5308,7 +5432,7 @@ impl PluginRuntime {
             .get("fs.write")
             .copied()
             .unwrap_or(false);
-        let write_scopes = fs_write_roots;
+        let write_scopes = Rc::clone(&fs_write_roots);
         fs_module
             .set(
                 "write",
@@ -5317,7 +5441,7 @@ impl PluginRuntime {
                         return Err(mlua::Error::external("permission denied: fs.write"));
                     }
                     let path = resolve_fs_path(&fs_root, &relative);
-                    if !fs_path_allowed(&path, &write_scopes) {
+                    if !fs_path_allowed(&path, &write_scopes.borrow()) {
                         return Ok((None, Some("access denied".to_owned())));
                     }
                     match fs::write(path, contents.as_bytes()) {
@@ -5855,6 +5979,7 @@ impl PluginRuntime {
             net_callbacks,
             spawn_rx,
             spawn_callbacks,
+            spawn_handles,
             panel_requests,
             clipboard_text,
             editor_snapshot,
@@ -5864,6 +5989,7 @@ impl PluginRuntime {
             install_callback,
             uninstall_callback,
             diagnostics,
+            decorations,
             bookmarks,
             bookmark_events,
             timers,
@@ -5893,6 +6019,7 @@ impl PluginRuntime {
             panel_scrollview_lines,
             panel_focused_scrollview,
             drawer_checkbox,
+            drawer_password,
             drawer_dropdown,
             rpc_rx,
             rpc_connections,
@@ -5910,7 +6037,47 @@ impl PluginRuntime {
             status_callbacks,
             editor_context_callback,
             editor_context_items,
+            fs_read_roots,
+            fs_write_roots,
+            snapshot_write_roots,
+            workspace_read_scope_enabled,
+            workspace_write_scope_enabled,
         })
+    }
+    pub fn add_workspace_root(&self, root: &Path) {
+        let Ok(root) = root.canonicalize() else {
+            return;
+        };
+        if self.workspace_read_scope_enabled {
+            let mut roots = self.fs_read_roots.borrow_mut();
+            if !roots.iter().any(|candidate| candidate == &root) {
+                roots.push(root.clone());
+            }
+        }
+        if self.workspace_write_scope_enabled {
+            let mut roots = self.fs_write_roots.borrow_mut();
+            if !roots.iter().any(|candidate| candidate == &root) {
+                roots.push(root.clone());
+            }
+            let mut snapshot_roots = self.snapshot_write_roots.borrow_mut();
+            if !snapshot_roots.iter().any(|candidate| candidate == &root) {
+                snapshot_roots.push(root);
+            }
+        }
+    }
+    pub fn remove_workspace_root(&self, root: &Path) {
+        let Ok(root) = root.canonicalize() else {
+            return;
+        };
+        self.fs_read_roots
+            .borrow_mut()
+            .retain(|candidate| candidate != &root);
+        self.fs_write_roots
+            .borrow_mut()
+            .retain(|candidate| candidate != &root);
+        self.snapshot_write_roots
+            .borrow_mut()
+            .retain(|candidate| candidate != &root);
     }
     pub fn registration(&self) -> PluginRegistration {
         self.registration.borrow().clone()
@@ -5985,6 +6152,7 @@ impl PluginRuntime {
         }
         Ok(true)
     }
+    #[allow(dead_code)] // Host-side compatibility API; normal key routing uses dialog_input_key.
     pub fn dialog_input(&self, id: u64, text: String) -> AppResult<bool> {
         let callback = {
             let mut widgets = self.dialog_widgets.borrow_mut();
@@ -5992,6 +6160,7 @@ impl PluginRuntime {
                 return Ok(false);
             };
             state.input_text = text.clone();
+            state.input_cursor = state.input_text.chars().count();
             state
                 .input_on_change
                 .as_ref()
@@ -6005,6 +6174,77 @@ impl PluginRuntime {
         callback
             .call::<()>(text)
             .map_err(|error| plugin_error(format!("dialog input callback failed: {error}")))?;
+        Ok(true)
+    }
+    pub fn dialog_input_key(
+        &self,
+        id: u64,
+        key_name: &str,
+        rune: Option<char>,
+        modifier: &str,
+    ) -> AppResult<bool> {
+        let (text, callback, submit, clear_on_submit) = {
+            let mut widgets = self.dialog_widgets.borrow_mut();
+            let Some(state) = widgets.get_mut(&id) else {
+                return Ok(false);
+            };
+            if state.focus != PluginDialogFocus::Input
+                || (!modifier.is_empty() && key_name != "Backspace")
+            {
+                return Ok(false);
+            }
+            let submit = key_name == "Enter" && !state.input_multiline;
+            if submit {
+                let callback = state
+                    .input_on_submit
+                    .as_ref()
+                    .map(|key| self._lua.registry_value::<Function>(key))
+                    .transpose()
+                    .map_err(lua_error)?;
+                (
+                    state.input_text.clone(),
+                    callback,
+                    true,
+                    state.input_clear_on_submit,
+                )
+            } else {
+                let Some(changed) = edit_plugin_input(
+                    &mut state.input_text,
+                    &mut state.input_cursor,
+                    key_name,
+                    rune,
+                    state.input_multiline,
+                ) else {
+                    return Ok(false);
+                };
+                let callback = if changed {
+                    state
+                        .input_on_change
+                        .as_ref()
+                        .map(|key| self._lua.registry_value::<Function>(key))
+                        .transpose()
+                        .map_err(lua_error)?
+                } else {
+                    None
+                };
+                (state.input_text.clone(), callback, false, false)
+            }
+        };
+        if let Some(callback) = callback {
+            callback.call::<()>(text).map_err(|error| {
+                plugin_error(if submit {
+                    format!("dialog input submit failed: {error}")
+                } else {
+                    format!("dialog input change failed: {error}")
+                })
+            })?;
+        }
+        if submit && clear_on_submit {
+            if let Some(state) = self.dialog_widgets.borrow_mut().get_mut(&id) {
+                state.input_text.clear();
+                state.input_cursor = 0;
+            }
+        }
         Ok(true)
     }
     pub fn dialog_click(&self, id: u64) -> AppResult<bool> {
@@ -6221,6 +6461,7 @@ impl PluginRuntime {
         if clear_on_submit {
             if let Some(state) = self.dialog_widgets.borrow_mut().get_mut(&id) {
                 state.input_text.clear();
+                state.input_cursor = 0;
             }
         }
         Ok(true)
@@ -6260,32 +6501,7 @@ impl PluginRuntime {
         Ok(true)
     }
     pub fn dialog_append(&self, id: u64, value: char) -> AppResult<bool> {
-        let text = {
-            let widgets = self.dialog_widgets.borrow();
-            let Some(state) = widgets.get(&id) else {
-                return Ok(false);
-            };
-            if state.focus != PluginDialogFocus::Input {
-                return Ok(false);
-            }
-            format!("{}{}", state.input_text, value)
-        };
-        self.dialog_input(id, text)
-    }
-    pub fn dialog_backspace(&self, id: u64) -> AppResult<bool> {
-        let text = {
-            let widgets = self.dialog_widgets.borrow();
-            let Some(state) = widgets.get(&id) else {
-                return Ok(false);
-            };
-            if state.focus != PluginDialogFocus::Input {
-                return Ok(false);
-            }
-            let mut text = state.input_text.clone();
-            text.pop();
-            text
-        };
-        self.dialog_input(id, text)
+        self.dialog_input_key(id, "Char", Some(value), "")
     }
     pub fn command_line_change(&self, text: &str) -> AppResult<()> {
         let callback: Option<Function> = {
@@ -6599,7 +6815,10 @@ impl PluginRuntime {
         self.diagnostics.borrow().get(path).and_then(|items| {
             items
                 .iter()
-                .filter(|item| (item.line..=item.end_line).contains(&line))
+                .filter(|item| {
+                    !item.source.starts_with("decoration:")
+                        && (item.line..=item.end_line).contains(&line)
+                })
                 .map(|item| item.severity)
                 .min()
         })
@@ -6608,8 +6827,33 @@ impl PluginRuntime {
         self.diagnostics.borrow().get(path).and_then(|items| {
             items
                 .iter()
-                .find(|item| (item.line..=item.end_line).contains(&line))
+                .find(|item| {
+                    !item.source.starts_with("decoration:")
+                        && (item.line..=item.end_line).contains(&line)
+                })
                 .map(|item| item.message.clone())
+        })
+    }
+    pub fn diagnostics_for_path(&self, path: &str) -> Vec<PluginDiagnostic> {
+        self.diagnostics
+            .borrow()
+            .get(path)
+            .into_iter()
+            .flat_map(|items| items.iter())
+            .filter(|item| !item.source.starts_with("decoration:"))
+            .cloned()
+            .collect()
+    }
+    pub fn decoration_style(&self, path: &str, line: usize) -> Option<String> {
+        self.decorations.borrow().get(path).and_then(|items| {
+            items
+                .iter()
+                .find(|item| {
+                    item.source.starts_with("decoration:")
+                        && (item.line..=item.end_line).contains(&line)
+                })
+                .and_then(|item| item.source.strip_prefix("decoration:"))
+                .map(str::to_owned)
         })
     }
     pub fn bookmark_marker(&self, path: &str, line: usize) -> Option<String> {
@@ -6915,6 +7159,7 @@ impl PluginRuntime {
                             })?;
                     }
                     self.spawn_callbacks.borrow_mut().remove(&event.id);
+                    self.spawn_handles.borrow_mut().remove(&event.id);
                 }
             } else if is_exit {
                 let should_emit_exit = {
@@ -6944,6 +7189,7 @@ impl PluginRuntime {
                             })?;
                     }
                     self.spawn_callbacks.borrow_mut().remove(&event.id);
+                    self.spawn_handles.borrow_mut().remove(&event.id);
                 }
             }
             completed += 1;
@@ -7636,8 +7882,10 @@ impl PluginRuntime {
                             state.input_min_rows = state.input_min_rows.min(state.input_max_rows);
                             if controlled_text.is_some() {
                                 state.input_text = text.clone();
+                                state.input_cursor = state.input_text.chars().count();
                             } else if !state.input_initialized {
                                 state.input_text = text.clone();
+                                state.input_cursor = state.input_text.chars().count();
                                 state.input_initialized = true;
                             }
                             state.input_clear_on_submit = value
@@ -7675,10 +7923,13 @@ impl PluginRuntime {
                             state.min_rows = state.min_rows.min(state.max_rows);
                             if controlled_text.is_some() {
                                 state.text = text.clone();
+                                state.cursor = state.text.chars().count();
                             } else if !state.initialized {
                                 state.text = text.clone();
+                                state.cursor = state.text.chars().count();
                                 state.initialized = true;
                             }
+                            state.cursor = state.cursor.min(state.text.chars().count());
                             state.clear_on_submit = value
                                 .get::<Option<bool>>("clear_on_submit")?
                                 .unwrap_or(false);
@@ -7715,10 +7966,13 @@ impl PluginRuntime {
                             state.min_rows = state.min_rows.min(state.max_rows);
                             if controlled_text.is_some() {
                                 state.text = text.clone();
+                                state.cursor = state.text.chars().count();
                             } else if !state.initialized {
                                 state.text = text.clone();
+                                state.cursor = state.text.chars().count();
                                 state.initialized = true;
                             }
+                            state.cursor = state.cursor.min(state.text.chars().count());
                             state.clear_on_submit = value
                                 .get::<Option<bool>>("clear_on_submit")?
                                 .unwrap_or(false);
@@ -8663,6 +8917,7 @@ impl PluginRuntime {
             .map_err(lua_error)?;
         let password_sink = Rc::clone(&lines);
         let password_widgets = Rc::clone(&self.dialog_widgets);
+        let drawer_password = Rc::clone(&self.drawer_password);
         let panel_passwords = Rc::clone(&self.panel_passwords);
         let panel_password_id = id.to_owned();
         panel
@@ -8680,6 +8935,7 @@ impl PluginRuntime {
                                 let state = widgets.entry(dialog_id).or_default();
                                 if !state.input_initialized {
                                     state.input_text = text;
+                                    state.input_cursor = state.input_text.chars().count();
                                     state.input_initialized = true;
                                 }
                                 state.input_masked = true;
@@ -8699,9 +8955,42 @@ impl PluginRuntime {
                                     "•".repeat(state.input_text.chars().count())
                                 ));
                             } else if is_drawer {
-                                password_sink
-                                    .borrow_mut()
-                                    .push(password_widget_text(lua, LuaValue::Table(value)));
+                                let text = value
+                                    .get::<Option<String>>("text")?
+                                    .or_else(|| value.get::<Option<String>>("value").ok().flatten())
+                                    .unwrap_or_default();
+                                let mut state = drawer_password.borrow_mut();
+                                let state =
+                                    state.get_or_insert_with(PluginDrawerInputState::default);
+                                if !state.initialized {
+                                    state.text = text;
+                                    state.cursor = state.text.chars().count();
+                                    state.initialized = true;
+                                }
+                                state.cursor = state.cursor.min(state.text.chars().count());
+                                state.line = password_sink.borrow().len();
+                                if let Some(existing) = state.on_change.take() {
+                                    let _ = lua.remove_registry_value(existing);
+                                }
+                                if let Some(callback) =
+                                    value.get::<Option<Function>>("on_change")?
+                                {
+                                    state.on_change = Some(lua.create_registry_value(callback)?);
+                                }
+                                let placeholder = value
+                                    .get::<Option<String>>("placeholder")?
+                                    .unwrap_or_default();
+                                let displayed = if state.text.is_empty() && !placeholder.is_empty()
+                                {
+                                    format!("[{placeholder}]")
+                                } else {
+                                    "•".repeat(state.text.chars().count())
+                                };
+                                password_sink.borrow_mut().push(format!(
+                                    "{}❯ {}",
+                                    if state.focused { "▶" } else { "" },
+                                    displayed
+                                ));
                             } else {
                                 let text = value
                                     .get::<Option<String>>("text")?
@@ -8711,8 +9000,10 @@ impl PluginRuntime {
                                 let state = states.entry(panel_password_id.clone()).or_default();
                                 if !state.initialized {
                                     state.text = text;
+                                    state.cursor = state.text.chars().count();
                                     state.initialized = true;
                                 }
+                                state.cursor = state.cursor.min(state.text.chars().count());
                                 state.line = password_sink.borrow().len();
                                 if let Some(existing) = state.on_change.take() {
                                     let _ = lua.remove_registry_value(existing);
@@ -9344,26 +9635,25 @@ impl PluginRuntime {
                     .map_err(lua_error)?;
                 (state.text.clone(), None, submit, state.clear_on_submit)
             } else {
-                match key_name {
-                    "Enter" if state.multiline => {
-                        state.text.push('\n');
-                    }
-                    "Backspace" => {
-                        state.text.pop();
-                    }
-                    _ => {
-                        let Some(rune) = rune else {
-                            return Ok(false);
-                        };
-                        state.text.push(rune);
-                    }
-                }
-                let change = state
-                    .on_change
-                    .as_ref()
-                    .map(|key| self._lua.registry_value::<Function>(key))
-                    .transpose()
-                    .map_err(lua_error)?;
+                let Some(changed) = edit_plugin_input(
+                    &mut state.text,
+                    &mut state.cursor,
+                    key_name,
+                    rune,
+                    state.multiline,
+                ) else {
+                    return Ok(false);
+                };
+                let change = if changed {
+                    state
+                        .on_change
+                        .as_ref()
+                        .map(|key| self._lua.registry_value::<Function>(key))
+                        .transpose()
+                        .map_err(lua_error)?
+                } else {
+                    None
+                };
                 (state.text.clone(), change, None, false)
             }
         };
@@ -9374,6 +9664,7 @@ impl PluginRuntime {
             if clear_on_submit {
                 if let Some(state) = self.panel_inputs.borrow_mut().get_mut(id) {
                     state.text.clear();
+                    state.cursor = 0;
                 }
             }
         } else if let Some(callback) = change {
@@ -9417,17 +9708,16 @@ impl PluginRuntime {
             if !state.focused || (!modifier.is_empty() && key_name != "Backspace") {
                 return Ok(false);
             }
-            match key_name {
-                "Backspace" => state.text.pop(),
-                "Enter" => None,
-                _ => {
-                    let Some(rune) = rune else {
-                        return Ok(false);
-                    };
-                    state.text.push(rune);
-                    None
+            if key_name != "Enter" {
+                let Some(changed) =
+                    edit_plugin_input(&mut state.text, &mut state.cursor, key_name, rune, false)
+                else {
+                    return Ok(false);
+                };
+                if !changed {
+                    return Ok(true);
                 }
-            };
+            }
             let callback = state
                 .on_change
                 .as_ref()
@@ -9536,6 +9826,9 @@ impl PluginRuntime {
         if let Some(state) = self.drawer_input.borrow_mut().as_mut() {
             state.focused = false;
         }
+        if let Some(state) = self.drawer_password.borrow_mut().as_mut() {
+            state.focused = false;
+        }
         if let Some(state) = self.drawer_checkbox.borrow_mut().as_mut() {
             state.focused = false;
         }
@@ -9548,6 +9841,11 @@ impl PluginRuntime {
     pub fn focus_drawer_line(&self, line: usize) -> bool {
         let input = self
             .drawer_input
+            .borrow()
+            .as_ref()
+            .is_some_and(|state| state.line == line);
+        let password = self
+            .drawer_password
             .borrow()
             .as_ref()
             .is_some_and(|state| state.line == line);
@@ -9566,12 +9864,16 @@ impl PluginRuntime {
             .borrow()
             .iter()
             .position(|(action_line, _)| *action_line == line);
-        if !(input || checkbox || dropdown || button.is_some()) {
+        if !(input || password || checkbox || dropdown || button.is_some()) {
             return false;
         }
         self.clear_drawer_focus();
         if input {
             if let Some(state) = self.drawer_input.borrow_mut().as_mut() {
+                state.focused = true;
+            }
+        } else if password {
+            if let Some(state) = self.drawer_password.borrow_mut().as_mut() {
                 state.focused = true;
             }
         } else if checkbox {
@@ -9593,18 +9895,21 @@ impl PluginRuntime {
         if let Some(state) = self.drawer_input.borrow().as_ref() {
             controls.push((state.line, 0_u8, 0_usize));
         }
+        if let Some(state) = self.drawer_password.borrow().as_ref() {
+            controls.push((state.line, 1_u8, 0_usize));
+        }
         if let Some(state) = self.drawer_checkbox.borrow().as_ref() {
-            controls.push((state.line, 1_u8, 0));
+            controls.push((state.line, 2_u8, 0));
         }
         if let Some(state) = self.drawer_dropdown.borrow().as_ref() {
-            controls.push((state.line, 2_u8, 0));
+            controls.push((state.line, 3_u8, 0));
         }
         controls.extend(
             self.drawer_actions
                 .borrow()
                 .iter()
                 .enumerate()
-                .map(|(index, (line, _))| (*line, 3_u8, index)),
+                .map(|(index, (line, _))| (*line, 4_u8, index)),
         );
         if controls.is_empty() {
             return false;
@@ -9617,16 +9922,21 @@ impl PluginRuntime {
                 .as_ref()
                 .is_some_and(|state| state.focused && *kind == 0 && *index == 0),
             1 => self
-                .drawer_checkbox
+                .drawer_password
                 .borrow()
                 .as_ref()
                 .is_some_and(|state| state.focused && *kind == 1),
             2 => self
-                .drawer_dropdown
+                .drawer_checkbox
                 .borrow()
                 .as_ref()
                 .is_some_and(|state| state.focused && *kind == 2),
             3 => self
+                .drawer_dropdown
+                .borrow()
+                .as_ref()
+                .is_some_and(|state| state.focused && *kind == 3),
+            4 => self
                 .drawer_focused_button
                 .borrow()
                 .is_some_and(|focused| focused == *index),
@@ -9644,7 +9954,8 @@ impl PluginRuntime {
             0 => self.focus_drawer_line(line),
             1 => self.focus_drawer_line(line),
             2 => self.focus_drawer_line(line),
-            3 => {
+            3 => self.focus_drawer_line(line),
+            4 => {
                 *self.drawer_focused_button.borrow_mut() = Some(index);
                 true
             }
@@ -9666,6 +9977,11 @@ impl PluginRuntime {
             }
         }
         if let Some(mut state) = self.drawer_checkbox.borrow_mut().take() {
+            if let Some(callback) = state.on_change.take() {
+                let _ = self._lua.remove_registry_value(callback);
+            }
+        }
+        if let Some(mut state) = self.drawer_password.borrow_mut().take() {
             if let Some(callback) = state.on_change.take() {
                 let _ = self._lua.remove_registry_value(callback);
             }
@@ -9774,20 +10090,18 @@ impl PluginRuntime {
             }
             let submit = key_name == "Enter" && !state.multiline;
             if !submit {
-                match key_name {
-                    "Enter" if state.multiline => {
-                        state.text.push('\n');
-                    }
-                    "Backspace" => {
-                        state.text.pop();
-                    }
-                    _ => {
-                        let Some(rune) = rune else {
-                            return Ok(false);
-                        };
-                        state.text.push(rune);
-                    }
+                let Some(changed) = edit_plugin_input(
+                    &mut state.text,
+                    &mut state.cursor,
+                    key_name,
+                    rune,
+                    state.multiline,
+                ) else {
+                    return Ok(false);
                 };
+                if !changed {
+                    return Ok(true);
+                }
             }
             let callback = if submit {
                 state
@@ -9818,7 +10132,49 @@ impl PluginRuntime {
         if submit && clear_on_submit {
             if let Some(state) = self.drawer_input.borrow_mut().as_mut() {
                 state.text.clear();
+                state.cursor = 0;
             }
+        }
+        Ok(true)
+    }
+
+    pub fn drawer_password_key(
+        &self,
+        key_name: &str,
+        rune: Option<char>,
+        modifier: &str,
+    ) -> AppResult<bool> {
+        let (text, callback) = {
+            let mut password = self.drawer_password.borrow_mut();
+            let Some(state) = password.as_mut() else {
+                return Ok(false);
+            };
+            if !state.focused || (!modifier.is_empty() && key_name != "Backspace") {
+                return Ok(false);
+            }
+            if key_name == "Enter" {
+                return Ok(true);
+            }
+            let Some(changed) =
+                edit_plugin_input(&mut state.text, &mut state.cursor, key_name, rune, false)
+            else {
+                return Ok(false);
+            };
+            if !changed {
+                return Ok(true);
+            }
+            let callback = state
+                .on_change
+                .as_ref()
+                .map(|key| self._lua.registry_value::<Function>(key))
+                .transpose()
+                .map_err(lua_error)?;
+            (state.text.clone(), callback)
+        };
+        if let Some(callback) = callback {
+            callback
+                .call::<()>(text)
+                .map_err(|error| plugin_error(format!("drawer password change failed: {error}")))?;
         }
         Ok(true)
     }
@@ -10652,6 +11008,25 @@ impl PluginRuntime {
             .map_err(|error| plugin_error(format!("tab on_close failed: {error}")));
         let _ = self._lua.remove_registry_value(key);
         result.map(|()| true)
+    }
+}
+
+impl Drop for PluginRuntime {
+    fn drop(&mut self) {
+        for flag in self.async_cancel.borrow().values() {
+            flag.store(true, Ordering::Relaxed);
+        }
+        let handles = std::mem::take(&mut *self.spawn_handles.borrow_mut());
+        let children = handles
+            .into_values()
+            .filter_map(|handle| handle.lock().ok().map(|handle| Arc::clone(&handle.child)))
+            .collect::<Vec<_>>();
+        for child in children {
+            if let Ok(mut child) = child.lock() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
     }
 }
 
@@ -12112,13 +12487,40 @@ fn markdown_widget_lines(lua: &Lua, value: LuaValue) -> mlua::Result<Vec<String>
     if wrap_width == Some(0) {
         return Err(mlua::Error::external("wrap_width must be positive"));
     }
-    Ok(markdown
-        .lines()
-        .flat_map(|line| {
+    let mut fence: Option<(char, usize)> = None;
+    let mut lines = Vec::new();
+    for line in markdown.lines() {
+        let first = line
+            .chars()
+            .position(|character| !character.is_whitespace())
+            .unwrap_or(line.chars().count());
+        let chars: Vec<char> = line.chars().collect();
+        let marker = chars.get(first).copied();
+        let fence_length = marker
+            .filter(|marker| *marker == '`' || *marker == '~')
+            .map(|marker| {
+                chars[first..]
+                    .iter()
+                    .take_while(|character| **character == marker)
+                    .count()
+            })
+            .filter(|length| *length >= 3);
+        if let Some((active_marker, active_length)) = fence {
+            let closing = marker == Some(active_marker)
+                && fence_length.is_some_and(|length| length >= active_length);
+            lines.extend(wrap_markdown_line(line, wrap_width));
+            if closing {
+                fence = None;
+            }
+        } else if let Some(length) = fence_length {
+            lines.extend(wrap_markdown_line(line, wrap_width));
+            fence = Some((marker.expect("fence marker"), length));
+        } else {
             let rendered = markdown_widget_line(line);
-            wrap_markdown_line(&rendered, wrap_width)
-        })
-        .collect())
+            lines.extend(wrap_markdown_line(&rendered, wrap_width));
+        }
+    }
+    Ok(lines)
 }
 
 fn wrap_markdown_line(line: &str, width: Option<usize>) -> Vec<String> {
@@ -12328,6 +12730,15 @@ fn image_widget_text(lua: &Lua, table: &Table) -> String {
         .ok()
         .flatten()
         .filter(|value| !value.is_empty());
+    let data_bytes = table
+        .get::<Option<mlua::String>>("data")
+        .ok()
+        .flatten()
+        .map(|value| value.as_bytes().len());
+    if let Some(length) = data_bytes {
+        let label = alt.unwrap_or_else(|| "embedded image".to_owned());
+        return format!("🖼 {label} ({length} bytes)");
+    }
     match (alt, source) {
         (Some(alt), Some(source)) => format!("🖼 {alt} ({source})"),
         (Some(alt), None) => format!("🖼 {alt}"),
@@ -12627,6 +13038,34 @@ fn register_panel_action_regions(
             }
         }
     }
+}
+
+fn current_word_at_cursor(line: &str, column: usize) -> String {
+    let chars: Vec<char> = line.chars().collect();
+    if chars.is_empty() {
+        return String::new();
+    }
+    let cursor = column.min(chars.len());
+    let index = if cursor < chars.len() && is_word_char(chars[cursor]) {
+        cursor
+    } else if cursor > 0 && is_word_char(chars[cursor - 1]) {
+        cursor - 1
+    } else {
+        return String::new();
+    };
+    let mut start = index;
+    while start > 0 && is_word_char(chars[start - 1]) {
+        start -= 1;
+    }
+    let mut end = index + 1;
+    while end < chars.len() && is_word_char(chars[end]) {
+        end += 1;
+    }
+    chars[start..end].iter().collect()
+}
+
+fn is_word_char(ch: char) -> bool {
+    ch == '_' || ch.is_alphanumeric()
 }
 
 fn lua_error(error: mlua::Error) -> crate::error::AppError {
@@ -13541,6 +13980,7 @@ ttt.on("probe", function()
   assert(editor.clear_search() == true)
   local cursor = editor.cursor()
   assert(cursor.line == 2 and cursor.col == 3)
+  assert(editor.current_word() == "two")
   local selection = editor.selection()
   assert(selection.active and selection.start_line == 1 and selection.end_col == 3)
   assert(editor.selection_text() == "one\ntw")
@@ -13556,6 +13996,12 @@ ttt.on("probe", function()
   assert(editor.end_undo_group() == true)
   assert(diagnostics.publish("/tmp/demo.rs", {{line = 2, col = 1, end_line = 2, end_col = 3, severity = "error", message = "bad line", source = "test"}}) == true)
   assert(decorations.set("/tmp/decor.rs", {{line = 3, end_line = 4, style = "hint", note = "decorated"}}) == true)
+  assert(diagnostics.publish("/tmp/shared.rs", {{line = 1, col = 1, severity = "error", message = "shared diagnostic"}}) == true)
+  assert(decorations.set("/tmp/shared.rs", {{line = 1, style = "info"}}) == true)
+  assert(diagnostics.clear("/tmp/shared.rs") == true)
+  assert(diagnostics.publish("/tmp/kept.rs", {{line = 1, col = 1, severity = "warning", message = "kept diagnostic"}}) == true)
+  assert(decorations.set("/tmp/kept.rs", {{line = 1, style = "hint"}}) == true)
+  assert(decorations.clear("/tmp/kept.rs") == true)
   assert(bookmarks.set(2, "★", "success") == true)
   local mark = bookmarks.get(2)
   assert(mark.icon == "★" and mark.style == "success")
@@ -13632,15 +14078,26 @@ end)
             .iter()
             .any(|line| line == "[info] payload-ok"));
         assert_eq!(runtime.diagnostic_severity("/tmp/demo.rs", 1), Some(1));
-        assert_eq!(runtime.diagnostic_severity("/tmp/decor.rs", 2), Some(3));
+        assert_eq!(runtime.diagnostic_severity("/tmp/decor.rs", 2), None);
+        assert_eq!(
+            runtime.decoration_style("/tmp/decor.rs", 2).as_deref(),
+            Some("hint")
+        );
         assert_eq!(
             runtime.diagnostic_message("/tmp/decor.rs", 2).as_deref(),
-            Some("decorated")
+            None
         );
         assert_eq!(
             runtime.diagnostic_message("/tmp/demo.rs", 1).as_deref(),
             Some("bad line")
         );
+        assert_eq!(runtime.diagnostic_severity("/tmp/shared.rs", 0), None);
+        assert_eq!(
+            runtime.decoration_style("/tmp/shared.rs", 0).as_deref(),
+            Some("info")
+        );
+        assert_eq!(runtime.diagnostic_severity("/tmp/kept.rs", 0), Some(2));
+        assert_eq!(runtime.decoration_style("/tmp/kept.rs", 0), None);
         assert_eq!(
             runtime.bookmark_marker("/tmp/demo.rs", 0).as_deref(),
             Some("◆")
@@ -14020,6 +14477,12 @@ assert(ttt.open_dialog({title = "Review", width = 40, height = 8, render = funct
             Some("dialog body\n▶❯ •••\n[ ] Remember\n[ Submit ]\n[ Cancel ]".into())
         );
         assert!(runtime.dialog_input(1, "new".into()).expect("input"));
+        assert!(runtime
+            .dialog_input_key(1, "Left", None, "")
+            .expect("move dialog cursor"));
+        assert!(runtime
+            .dialog_input_key(1, "Char", Some('x'), "")
+            .expect("insert dialog text"));
         assert!(runtime.dialog_focus_next(1));
         assert!(runtime.dialog_activate(1).expect("checkbox"));
         assert!(runtime
@@ -14034,6 +14497,10 @@ assert(ttt.open_dialog({title = "Review", width = 40, height = 8, render = funct
         assert!(runtime.dialog_focus_button(1));
         assert!(runtime.dialog_activate(1).expect("button again"));
         assert!(runtime.logs().iter().any(|line| line == "[info] input:new"));
+        assert!(runtime
+            .logs()
+            .iter()
+            .any(|line| line == "[info] input:nexw"));
         assert!(runtime.logs().iter().any(|line| line == "[info] clicked"));
         assert!(runtime
             .logs()
@@ -14338,6 +14805,24 @@ run("latest")
     }
 
     #[test]
+    fn markdown_widget_preserves_fenced_code_content() {
+        let lua = Lua::new();
+        let markdown = lua
+            .create_string("```rust\n# not a heading\nlet value = **literal**;\n```\n# Title")
+            .expect("markdown");
+        assert_eq!(
+            markdown_widget_lines(&lua, LuaValue::String(markdown)).expect("fenced markdown"),
+            vec![
+                "```rust",
+                "# not a heading",
+                "let value = **literal**;",
+                "```",
+                "Title"
+            ]
+        );
+    }
+
+    #[test]
     fn markdown_widget_wraps_table_text_by_unicode_width() {
         let lua = Lua::new();
         let table = lua.create_table().expect("table");
@@ -14512,6 +14997,7 @@ ttt.open_drawer({render = function(panel)
   panel:input({text = "note", on_change = function(text) ttt.log("drawer-change:" .. text) end, on_submit = function(text) ttt.log("drawer-submit:" .. text) end})
   panel:checkbox({label = "Dry run", checked = false, on_change = function(value) ttt.log("drawer-check:" .. tostring(value)) end})
   panel:dropdown({options = {"one", "two"}, selected = 1, on_change = function(value) ttt.log("drawer-drop:" .. tostring(value)) end})
+  panel:password({text = "secret", on_change = function(text) ttt.log("drawer-password:" .. text) end})
   panel:text(0, 0, "raw")
   panel:cell(0, 1, "*")
 end})
@@ -14523,7 +15009,7 @@ end})
         assert_eq!(
             runtime.render_panel("__drawer").expect("render"),
             Some(
-                "raw       \n*ranch: main\n────────\n[ Go ]\n❯ note\n[ ] Dry run\n▼ one\n  two"
+                "raw       \n*ranch: main\n────────\n[ Go ]\n❯ note\n[ ] Dry run\n▼ one\n  two\n❯ ••••••"
                     .into()
             )
         );
@@ -14563,6 +15049,18 @@ end})
             .logs()
             .iter()
             .any(|line| line == "[info] drawer-drop:2"));
+        assert!(runtime.focus_drawer_line(7));
+        assert!(runtime
+            .drawer_password_key("Char", Some('!'), "")
+            .expect("password input"));
+        assert!(runtime
+            .logs()
+            .iter()
+            .any(|line| line == "[info] drawer-password:secret!"));
+        assert_eq!(
+            runtime.render_panel("__drawer").expect("password render"),
+            Some("raw       \n*ranch: main\n────────\n[ Go ]\n❯ note!\n[x] Dry run\n  one\n▼ two\n▶❯ •••••••".into())
+        );
         fs::remove_dir_all(root).expect("cleanup");
     }
 
@@ -14712,6 +15210,17 @@ end}})
             Some("🖼 Logo (https://example.test/logo.png)".into())
         );
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn panel_image_accepts_embedded_binary_data_in_fallback() {
+        let lua = Lua::new();
+        let table = lua.create_table().expect("table");
+        table.set("alt", "Screenshot").expect("alt");
+        table
+            .set("data", lua.create_string([0_u8, 1, 2, 255]).expect("data"))
+            .expect("data field");
+        assert_eq!(image_widget_text(&lua, &table), "🖼 Screenshot (4 bytes)");
     }
 
     #[test]
@@ -15215,6 +15724,37 @@ end}})
             Some("$ ❯ old!".into())
         );
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn plugin_input_editing_supports_unicode_cursor_navigation_and_delete() {
+        let mut text = "猫🙂尾".to_owned();
+        let mut cursor = text.chars().count();
+        assert_eq!(
+            edit_plugin_input(&mut text, &mut cursor, "Left", None, false),
+            Some(false)
+        );
+        assert_eq!(
+            edit_plugin_input(&mut text, &mut cursor, "Char", Some('中'), false),
+            Some(true)
+        );
+        assert_eq!(text, "猫🙂中尾");
+        assert_eq!(cursor, 3);
+        assert_eq!(
+            edit_plugin_input(&mut text, &mut cursor, "Delete", None, false),
+            Some(true)
+        );
+        assert_eq!(text, "猫🙂中");
+        assert_eq!(
+            edit_plugin_input(&mut text, &mut cursor, "Home", None, false),
+            Some(false)
+        );
+        assert_eq!(cursor, 0);
+        assert_eq!(
+            edit_plugin_input(&mut text, &mut cursor, "End", None, false),
+            Some(false)
+        );
+        assert_eq!(cursor, text.chars().count());
     }
 
     #[test]
@@ -16353,6 +16893,43 @@ assert(input_proc:close_stdin() == true)
             .any(|line| line == "[info] official:official"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn dropping_runtime_terminates_registered_spawn_processes() {
+        let root = std::env::temp_dir().join(format!("mtide-spawn-drop-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("directory");
+        fs::write(
+            root.join("plugin.ttt.json"),
+            r#"{"name":"spawn-drop","entry":"init.lua","api":2,"permissions":{"system.exec":true}}"#,
+        )
+        .expect("manifest");
+        fs::write(
+            root.join("init.lua"),
+            r#"local ttt = require("ttt")
+local sys = require("ttt.system")
+local proc = sys.spawn({shell = "/bin/sh", args = {"-c", "exec sleep 30"}})
+ttt.log(tostring(proc:pid()))"#,
+        )
+        .expect("script");
+        let package = PluginPackage::load(&root).expect("package");
+        let runtime = PluginRuntime::load(&package).expect("runtime");
+        let pid = runtime
+            .logs()
+            .iter()
+            .find_map(|line| line.strip_prefix("[info] ")?.parse::<u32>().ok())
+            .expect("spawn pid log");
+        drop(runtime);
+        let still_running = std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(Stdio::null())
+            .status()
+            .expect("kill probe")
+            .success();
+        assert!(!still_running, "spawn process {pid} survived runtime drop");
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
     fn write_rpc_message_for_test(stream: &mut impl Write, message: &JsonValue) {
         let encoded = serde_json::to_vec(message).expect("encode message");
         write!(stream, "Content-Length: {}\r\n\r\n", encoded.len()).expect("write header");
@@ -16416,6 +16993,46 @@ assert(input_proc:close_stdin() == true)
         assert!(fs_path_allowed(&workspace.join("src/main.rs"), &roots));
         assert!(fs_path_allowed(&package.join("state.json"), &roots));
         assert!(!fs_path_allowed(&outside.join("secret"), &roots));
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn plugin_workspace_scope_expands_for_runtime_workspace_root() {
+        let root = std::env::temp_dir().join(format!(
+            "mtide-plugin-dynamic-workspace-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let workspace = root.join("workspace");
+        let added_workspace = root.join("added-workspace");
+        let package_root = root.join("plugin");
+        fs::create_dir_all(&workspace).expect("workspace");
+        fs::create_dir_all(&added_workspace).expect("added workspace");
+        fs::create_dir_all(&package_root).expect("package");
+        fs::write(
+            package_root.join("plugin.ttt.json"),
+            r#"{"name":"dynamic-workspace","entry":"init.lua","api":2,"permissions":{"commands":true,"fs.write":["{workspace}"]}}"#,
+        )
+        .expect("manifest");
+        fs::write(
+            package_root.join("init.lua"),
+            r#"local ttt = require("ttt")
+local fs = require("ttt.fs")
+ttt.register({commands = {{id = "write-added", title = "Write", handler = function()
+  assert(fs.write("../added-workspace/result.txt", "ok") == true)
+end}}})"#,
+        )
+        .expect("entry");
+        let package = PluginPackage::load(&package_root).expect("package");
+        let runtime =
+            PluginRuntime::load_with_settings_path_and_workspace(&package, None, Some(&workspace))
+                .expect("runtime");
+        runtime.add_workspace_root(&added_workspace);
+        assert!(runtime.execute_command("write-added").expect("command"));
+        assert_eq!(
+            fs::read_to_string(added_workspace.join("result.txt")).unwrap(),
+            "ok"
+        );
         fs::remove_dir_all(root).expect("cleanup");
     }
 
