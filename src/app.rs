@@ -1,11 +1,13 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write;
 use std::path::PathBuf;
 use std::{
     fs,
     path::Path,
     sync::mpsc::{self, Receiver, Sender},
+    time::{Duration, Instant},
 };
 
 use crate::{
@@ -38,6 +40,8 @@ use crate::{
     },
     terminal::{TerminalState, TerminalStyle},
 };
+
+const AGENT_TOOL_MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as JsonValue};
 use unicode_width::UnicodeWidthChar;
@@ -87,6 +91,8 @@ pub struct PluginContextMenu {
     pub runtime_index: usize,
     pub items: Vec<String>,
     pub selected: usize,
+    pub panel_id: Option<String>,
+    pub panel_row: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -204,6 +210,9 @@ pub(crate) struct LspCompletionItem {
     pub(crate) label: String,
     pub(crate) insert_text: String,
     edit_range: Option<LspCompletionRange>,
+    additional_edits: Vec<LspCompletionTextEdit>,
+    commit_characters: Vec<char>,
+    resolve_params: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -212,6 +221,12 @@ struct LspCompletionRange {
     start_character: usize,
     end_line: usize,
     end_character: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LspCompletionTextEdit {
+    range: LspCompletionRange,
+    new_text: String,
 }
 impl BottomTab {
     pub const fn label(self) -> &'static str {
@@ -312,12 +327,15 @@ pub struct App {
     plugin_palette: bool,
     plugin_query: String,
     plugin_index: usize,
+    key_chord_prefix: bool,
     settings_overlay: bool,
     settings_index: usize,
     overlay_focus: Option<Focus>,
     quick_open: bool,
     quick_open_query: String,
     quick_open_save_as: bool,
+    quick_open_results: Vec<PathBuf>,
+    quick_open_index: usize,
     goto_mode: bool,
     goto_input: String,
     selection_anchor: Option<Position>,
@@ -326,13 +344,18 @@ pub struct App {
     horizontal_scroll: usize,
     editor_scroll_line: Option<usize>,
     editor_viewport_height: Cell<usize>,
+    terminal_viewport_rows: Cell<usize>,
     secondary_cursors: Vec<Position>,
     secondary_selections: Vec<(Position, Position)>,
     column_selection: Option<(Position, Position)>,
     mouse_selecting: bool,
+    editor_hover_link: Option<(usize, String)>,
     folded_lines: BTreeSet<usize>,
     diff_base_lines: Option<Vec<String>>,
     plugin_mouse_events: Vec<MouseEvent>,
+    terminal_selection: Option<(TerminalPoint, TerminalPoint)>,
+    terminal_selection_dragging: bool,
+    pending_automation_waits: Vec<PendingAutomationWait>,
     plugin_sidebar_line_start: Cell<Option<usize>>,
     plugin_bottom_line_start: Cell<Option<usize>>,
     plugin_status_hits: RefCell<Vec<PluginStatusHit>>,
@@ -352,6 +375,20 @@ struct PluginStatusHit {
     end: u16,
     runtime_index: usize,
     id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct TerminalPoint {
+    column: u16,
+    row: u16,
+}
+
+#[derive(Debug)]
+struct PendingAutomationWait {
+    runtime_index: usize,
+    id: u64,
+    needle: String,
+    deadline: Instant,
 }
 
 type PluginStatusEntry = (usize, String, String);
@@ -466,16 +503,13 @@ impl App {
         let agent_session_path = agent_session_path();
         let saved_agent_session = agent_session_path.as_deref().and_then(load_agent_session);
         let agent_provider = select_agent_provider(&settings, saved_agent_session.as_ref());
-        let (agent_command, agent_cwd) = settings.agent.providers.get(&agent_provider).map_or_else(
-            || (settings.agent.command.clone(), settings.agent.cwd.clone()),
-            |provider| (provider.command.clone(), provider.cwd.clone()),
-        );
-        let agent =
-            TerminalState::with_command(agent_command, agent_cwd.as_ref().map(PathBuf::from));
+        let (agent_command, agent_cwd, agent_persistent) =
+            configured_agent_command(&settings, &agent_provider);
+        let agent = TerminalState::with_command(agent_command, agent_cwd);
         let mut agent = agent;
         if let Some(session) = saved_agent_session
             .as_ref()
-            .filter(|session| session.provider == agent_provider)
+            .filter(|session| session.provider == agent_provider && !agent_persistent)
         {
             agent.append_input(&session.input);
             agent.restore_screen(&session.screen);
@@ -618,7 +652,14 @@ impl App {
             .map_or_else(Vec::new, |change| git_diff(&search_root, change));
         let explorer_paths = explorer_roots
             .iter()
-            .flat_map(|root| list_directory(root))
+            .flat_map(|root| {
+                visible_explorer_entries(
+                    root,
+                    &BTreeSet::new(),
+                    settings.explorer.show_hidden,
+                    settings.explorer.show_git_ignored,
+                )
+            })
             .collect();
         let status_message = startup_error.unwrap_or_else(|| {
             plugins.first().map_or_else(
@@ -734,12 +775,15 @@ impl App {
             plugin_palette: false,
             plugin_query: String::new(),
             plugin_index: 0,
+            key_chord_prefix: false,
             settings_overlay: false,
             settings_index: 0,
             overlay_focus: None,
             quick_open: false,
             quick_open_query: String::new(),
             quick_open_save_as: false,
+            quick_open_results: Vec::new(),
+            quick_open_index: 0,
             goto_mode: false,
             goto_input: String::new(),
             selection_anchor: None,
@@ -748,13 +792,18 @@ impl App {
             horizontal_scroll: 0,
             editor_scroll_line: None,
             editor_viewport_height: Cell::new(0),
+            terminal_viewport_rows: Cell::new(3),
             secondary_cursors: Vec::new(),
             secondary_selections: Vec::new(),
             column_selection: None,
             mouse_selecting: false,
+            editor_hover_link: None,
             folded_lines: BTreeSet::new(),
             diff_base_lines: None,
             plugin_mouse_events: Vec::new(),
+            terminal_selection: None,
+            terminal_selection_dragging: false,
+            pending_automation_waits: Vec::new(),
             plugin_sidebar_line_start: Cell::new(None),
             plugin_bottom_line_start: Cell::new(None),
             plugin_status_hits: RefCell::new(Vec::new()),
@@ -1211,6 +1260,14 @@ impl App {
             .unwrap_or("?")
             .to_owned()
     }
+    pub fn explorer_git_status(&self, path: &Path) -> Option<(char, char)> {
+        let relative = path.strip_prefix(&self.search_root).ok()?;
+        let relative = relative.to_string_lossy();
+        self.changes
+            .iter()
+            .find(|change| change.path == relative)
+            .map(|change| (change.index, change.worktree))
+    }
     pub fn explorer_depth(&self, path: &Path) -> usize {
         let roots = if self.explorer_roots.len() > 1 {
             &self.explorer_roots
@@ -1273,8 +1330,108 @@ impl App {
     pub fn terminal_title(&self) -> &str {
         self.terminals[self.active_terminal].title()
     }
+    pub fn terminal_working_directory(&self) -> Option<&str> {
+        self.terminals[self.active_terminal].working_directory()
+    }
     pub fn terminal_screen_styled_lines(&self) -> Vec<Vec<(char, TerminalStyle)>> {
-        self.terminals[self.active_terminal].screen_styled_lines()
+        let mut lines = self.terminals[self.active_terminal].screen_styled_lines();
+        let Some((start, end)) = self.terminal_selection else {
+            return lines;
+        };
+        let (start, end) = if start <= end {
+            (start, end)
+        } else {
+            (end, start)
+        };
+        let base = lines
+            .len()
+            .saturating_sub(self.terminal_viewport_rows.get().max(1));
+        for (index, line) in lines.iter_mut().enumerate() {
+            let visible_row = index.checked_sub(base);
+            let Some(row) = visible_row else {
+                continue;
+            };
+            let row = row as u16;
+            if row < start.row || row > end.row {
+                continue;
+            }
+            let from = if row == start.row { start.column } else { 0 };
+            let to = if row == end.row {
+                end.column
+            } else {
+                line.len() as u16
+            };
+            for (_, cell) in line
+                .iter_mut()
+                .enumerate()
+                .skip(usize::from(from))
+                .take(usize::from(to.saturating_sub(from)))
+            {
+                cell.1.inverse = !cell.1.inverse;
+            }
+        }
+        lines
+    }
+    pub fn begin_terminal_selection(&mut self, column: u16, row: u16) {
+        let point = TerminalPoint { column, row };
+        self.terminal_selection = Some((point, point));
+        self.terminal_selection_dragging = true;
+    }
+    pub fn set_terminal_viewport_rows(&self, rows: usize) {
+        self.terminal_viewport_rows.set(rows.max(1));
+    }
+    pub fn update_terminal_selection(&mut self, column: u16, row: u16) {
+        if let Some((start, _)) = self.terminal_selection {
+            self.terminal_selection = Some((start, TerminalPoint { column, row }));
+        }
+    }
+    pub fn finish_terminal_selection(&mut self) {
+        self.terminal_selection_dragging = false;
+    }
+    pub fn terminal_selection_text(&self) -> Option<String> {
+        let (start, end) = self.terminal_selection?;
+        let lines = self.terminals[self.active_terminal].screen_lines();
+        let base = lines
+            .len()
+            .saturating_sub(self.terminal_viewport_rows.get().max(1));
+        let mut start = (usize::from(start.row) + base, usize::from(start.column));
+        let mut end = (usize::from(end.row) + base, usize::from(end.column));
+        if start > end {
+            std::mem::swap(&mut start, &mut end);
+        }
+        let mut selected = Vec::new();
+        let last_row = end.0.min(lines.len().saturating_sub(1));
+        for (row, line) in lines.iter().enumerate().take(last_row + 1).skip(start.0) {
+            let chars = line.chars().collect::<Vec<_>>();
+            let from = if row == start.0 {
+                start.1.min(chars.len())
+            } else {
+                0
+            };
+            let to = if row == end.0 {
+                end.1.min(chars.len())
+            } else {
+                chars.len()
+            };
+            selected.push(
+                chars[from..to]
+                    .iter()
+                    .collect::<String>()
+                    .trim_end_matches(' ')
+                    .to_owned(),
+            );
+        }
+        Some(selected.join("\n"))
+    }
+    pub fn copy_terminal_selection(&mut self) {
+        if let Some(text) = self
+            .terminal_selection_text()
+            .filter(|text| !text.is_empty())
+        {
+            self.clipboard = text;
+            self.queue_osc52_clipboard();
+            self.status_message = "Copied terminal selection".to_owned();
+        }
     }
     pub fn scroll_terminal(&mut self, delta: isize) {
         self.terminal_mut().scroll(delta);
@@ -1341,6 +1498,36 @@ impl App {
             Ok(_) => format!("Opening {url}"),
             Err(error) => format!("Unable to open link: {error}"),
         };
+    }
+
+    pub fn editor_link_at(&self, position: Position) -> Option<String> {
+        editor_link_at(self.file_lines().get(position.line)?, position.column)
+    }
+
+    pub fn open_editor_link(&mut self, position: Position) -> bool {
+        let Some(url) = self.editor_link_at(position) else {
+            return false;
+        };
+        self.open_terminal_link(&url);
+        true
+    }
+
+    pub fn update_editor_hover(&mut self, position: Option<Position>, control: bool) {
+        self.editor_hover_link = if control {
+            position.and_then(|position| {
+                self.editor_link_at(position)
+                    .map(|url| (position.line, url))
+            })
+        } else {
+            None
+        };
+    }
+
+    pub fn editor_hover_link(&self, line: usize) -> Option<&str> {
+        self.editor_hover_link
+            .as_ref()
+            .filter(|(hover_line, _)| *hover_line == line)
+            .map(|(_, url)| url.as_str())
     }
 
     fn reload_active_buffer(&mut self) -> AppResult<()> {
@@ -1440,14 +1627,22 @@ impl App {
         };
         match tool {
             "read_file" => {
+                let size = fs::metadata(&path)?.len();
+                if size > AGENT_TOOL_MAX_FILE_BYTES {
+                    return Err(crate::error::AppError::Workspace(format!(
+                        "agent read_file exceeds {} MiB limit",
+                        AGENT_TOOL_MAX_FILE_BYTES / (1024 * 1024)
+                    )));
+                }
                 let contents = fs::read_to_string(&path)?;
                 Ok(json!({"path": path.display().to_string(), "content": contents}))
             }
             "list_files" => {
-                let entries = fs::read_dir(&path)?
+                let mut entries = fs::read_dir(&path)?
                     .filter_map(Result::ok)
                     .map(|entry| entry.file_name().to_string_lossy().into_owned())
                     .collect::<Vec<_>>();
+                entries.sort();
                 Ok(json!({"path": path.display().to_string(), "entries": entries}))
             }
             "write_file" => {
@@ -1459,8 +1654,22 @@ impl App {
                             "agent write_file content is required".into(),
                         )
                     })?;
+                if content.len() as u64 > AGENT_TOOL_MAX_FILE_BYTES {
+                    return Err(crate::error::AppError::Workspace(format!(
+                        "agent write_file exceeds {} MiB limit",
+                        AGENT_TOOL_MAX_FILE_BYTES / (1024 * 1024)
+                    )));
+                }
                 let temporary = path.with_extension(format!("mtide-agent-{}", std::process::id()));
-                fs::write(&temporary, content)?;
+                let mut file = fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&temporary)?;
+                if let Err(error) = file.write_all(content.as_bytes()) {
+                    let _ = fs::remove_file(&temporary);
+                    return Err(error.into());
+                }
+                drop(file);
                 if let Err(error) = fs::rename(&temporary, &path) {
                     let _ = fs::remove_file(&temporary);
                     return Err(error.into());
@@ -1629,6 +1838,7 @@ impl App {
             if let Err(error) = save_agent_session(
                 path,
                 &AgentSession {
+                    version: AGENT_SESSION_VERSION,
                     provider: self.agent_provider.clone(),
                     input: self.agent.input().to_owned(),
                     screen: self.agent.screen_lines(),
@@ -1690,6 +1900,14 @@ impl App {
                         );
                     }
                 }
+                Ok(Some(ExternalChange::Deleted)) => {
+                    if let Some(path) = path {
+                        self.status_message = format!(
+                            "File deleted on disk; save to recreate or close tab · {}",
+                            path.display()
+                        );
+                    }
+                }
                 Ok(None) => {}
                 Err(error) => self.status_message = format!("External reload failed: {error}"),
             }
@@ -1704,6 +1922,9 @@ impl App {
             if let Some(text) = terminal.take_osc52_clipboard() {
                 self.clipboard = text;
                 self.status_message = "Terminal updated clipboard".to_owned();
+            }
+            if terminal.take_bell() {
+                self.status_message = "Terminal bell".to_owned();
             }
         }
         self.agent.poll();
@@ -1836,6 +2057,17 @@ impl App {
                         self.sidebar_visible = true;
                         if focus {
                             self.focus = Focus::Explorer;
+                            if let Some(runtime) = self.plugin_runtimes.get(runtime_index) {
+                                if let Some(id) = runtime
+                                    .registration()
+                                    .panels
+                                    .into_iter()
+                                    .find(|panel| panel.location == PluginPanelLocation::Sidebar)
+                                    .map(|panel| panel.id)
+                                {
+                                    let _ = runtime.focus_autofocus_input(&id);
+                                }
+                            }
                         }
                     }
                     PluginPanelLocation::Bottom => {
@@ -1843,6 +2075,17 @@ impl App {
                         self.bottom_tab = BottomTab::Output;
                         if focus {
                             self.focus = Focus::Output;
+                            if let Some(runtime) = self.plugin_runtimes.get(runtime_index) {
+                                if let Some(id) = runtime
+                                    .registration()
+                                    .panels
+                                    .into_iter()
+                                    .find(|panel| panel.location == PluginPanelLocation::Bottom)
+                                    .map(|panel| panel.id)
+                                {
+                                    let _ = runtime.focus_autofocus_input(&id);
+                                }
+                            }
                         }
                     }
                 },
@@ -1882,13 +2125,14 @@ impl App {
                             self.plugin_diff_file_path = None;
                             self.plugin_file_view = Some((title, text));
                             self.plugin_file_view_path = file_path.map(PathBuf::from);
-                            self.plugin_custom_tab = Some((runtime_index, id));
+                            self.plugin_custom_tab = Some((runtime_index, id.clone()));
                             self.plugin_tab_scroll = 0;
                             self.plugin_tab_hunk = 0;
                             self.plugin_tab_split = false;
                             self.plugin_tab_collapsed_hunks.clear();
                             if focus {
                                 self.focus = Focus::Editor;
+                                let _ = runtime.focus_autofocus_input(&format!("__tab:{id}"));
                             }
                         } else {
                             self.status_message = "Plugin tab render failed".to_owned();
@@ -1939,6 +2183,8 @@ impl App {
                         self.plugin_tab_split = false;
                         self.plugin_tab_collapsed_hunks.clear();
                         self.focus = Focus::Editor;
+                        self.emit_plugin_event("tab.close");
+                        self.emit_plugin_event("tab.activate");
                     }
                 }
                 PluginPanelRequest::FocusTab { id } => {
@@ -1948,6 +2194,9 @@ impl App {
                         .is_some_and(|(owner, current)| *owner == runtime_index && current == &id)
                     {
                         self.focus = Focus::Editor;
+                        if let Some(runtime) = self.plugin_runtimes.get(runtime_index) {
+                            let _ = runtime.focus_autofocus_input(&format!("__tab:{id}"));
+                        }
                     }
                 }
                 PluginPanelRequest::OpenFile {
@@ -2231,7 +2480,7 @@ impl App {
             .iter()
             .map(|line| line.text.as_str())
             .collect::<Vec<_>>()
-            .join("\n");
+            .join("\r\n");
         self.plugin_custom_tab = None;
         self.git_diff_tab_text = Some(text);
         self.plugin_file_view = Some(("Git diff".to_owned(), String::new()));
@@ -2316,6 +2565,20 @@ impl App {
             target.push((runtime_index, item.id, item.text));
         }
         (left, right)
+    }
+    pub fn plugin_echo(&self) -> Option<String> {
+        self.plugin_runtimes
+            .iter()
+            .rev()
+            .map(PluginRuntime::echo_text)
+            .find(|text| !text.is_empty())
+    }
+    pub fn plugin_notification(&self) -> Option<(String, String)> {
+        self.plugin_runtimes
+            .iter()
+            .rev()
+            .filter_map(|runtime| runtime.notification())
+            .next()
     }
     pub fn set_plugin_status_hits(&self, hits: Vec<(u16, u16, usize, String)>) {
         *self.plugin_status_hits.borrow_mut() = hits
@@ -2409,6 +2672,29 @@ impl App {
         let Some(runtime) = self.plugin_runtimes.get(runtime_index) else {
             return Ok(false);
         };
+        let _ = runtime.focus_panel_dropdown(&id, row);
+        let _ = runtime.focus_panel_radio(&id, row);
+        let _ = runtime.focus_panel_tabs(&id, row);
+        let _ = runtime.focus_panel_scrollview(&id, row);
+        if runtime.activate_panel_checkbox(&id, row)? {
+            self.apply_plugin_editor_requests();
+            self.apply_plugin_bookmark_events();
+            return Ok(true);
+        }
+        if runtime.focus_panel_input(&id, row) {
+            self.apply_plugin_editor_requests();
+            return Ok(true);
+        }
+        if runtime.focus_panel_password(&id, row) {
+            self.apply_plugin_editor_requests();
+            return Ok(true);
+        }
+        if runtime.activate_panel_button(&id, row)? {
+            self.apply_plugin_editor_requests();
+            self.apply_plugin_bookmark_events();
+            self.status_message = format!("Plugin button activated · {}", row + 1);
+            return Ok(true);
+        }
         let activated = runtime.activate_panel_selection(&id, row)?;
         if activated {
             self.apply_plugin_editor_requests();
@@ -2423,6 +2709,12 @@ impl App {
             Focus::Terminal | Focus::Output => PluginPanelLocation::Bottom,
             _ => return Ok(false),
         };
+        if matches!(
+            (key.modifiers, key.code),
+            (KeyModifiers::SHIFT, KeyCode::Enter)
+        ) {
+            return self.open_selected_plugin_panel_context_menu(location);
+        }
         let key_name = key_chord(key).unwrap_or_else(|| format!("{:?}", key.code));
         let rune = match key.code {
             KeyCode::Char(character) => Some(character),
@@ -2439,6 +2731,52 @@ impl App {
             else {
                 continue;
             };
+            if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+                let backwards = key.modifiers.contains(KeyModifiers::SHIFT)
+                    || matches!(key.code, KeyCode::BackTab);
+                if runtime.cycle_panel_focus(&panel_id, backwards) {
+                    self.apply_plugin_editor_requests();
+                    return Ok(true);
+                }
+            }
+            if runtime.panel_checkbox_key(&panel_id, &key_name, rune)? {
+                self.apply_plugin_editor_requests();
+                self.apply_plugin_bookmark_events();
+                return Ok(true);
+            }
+            if runtime.panel_dropdown_key(&panel_id, &key_name)? {
+                self.apply_plugin_editor_requests();
+                self.apply_plugin_bookmark_events();
+                return Ok(true);
+            }
+            if runtime.panel_radio_key(&panel_id, &key_name)? {
+                self.apply_plugin_editor_requests();
+                self.apply_plugin_bookmark_events();
+                return Ok(true);
+            }
+            if runtime.panel_tabs_key(&panel_id, &key_name)? {
+                self.apply_plugin_editor_requests();
+                self.apply_plugin_bookmark_events();
+                return Ok(true);
+            }
+            if runtime.panel_scrollview_key(&panel_id, &key_name)? {
+                self.apply_plugin_editor_requests();
+                self.apply_plugin_bookmark_events();
+                return Ok(true);
+            }
+            if runtime.panel_button_key(&panel_id, &key_name, rune)? {
+                self.apply_plugin_editor_requests();
+                self.apply_plugin_bookmark_events();
+                return Ok(true);
+            }
+            if runtime.panel_input_key(&panel_id, &key_name, rune, &modifier)? {
+                self.apply_plugin_editor_requests();
+                return Ok(true);
+            }
+            if runtime.panel_password_key(&panel_id, &key_name, rune, &modifier)? {
+                self.apply_plugin_editor_requests();
+                return Ok(true);
+            }
             if runtime.emit_panel_key_event(&panel_id, &key_name, rune, &modifier)? {
                 self.apply_plugin_editor_requests();
                 self.apply_plugin_bookmark_events();
@@ -2465,10 +2803,12 @@ impl App {
                     runtime.move_panel_selection(&panel_id, 8)?
                 }
                 (KeyModifiers::NONE, KeyCode::Left) => {
-                    runtime.move_panel_horizontal_selection(&panel_id, -1)?
+                    runtime.move_tree_horizontal_selection(&panel_id, false)?
+                        || runtime.move_panel_horizontal_selection(&panel_id, -1)?
                 }
                 (KeyModifiers::NONE, KeyCode::Right) => {
-                    runtime.move_panel_horizontal_selection(&panel_id, 1)?
+                    runtime.move_tree_horizontal_selection(&panel_id, true)?
+                        || runtime.move_panel_horizontal_selection(&panel_id, 1)?
                 }
                 (KeyModifiers::NONE, KeyCode::Home) => {
                     runtime.move_panel_selection(&panel_id, isize::MIN)?
@@ -2512,6 +2852,17 @@ impl App {
         else {
             return Ok(false);
         };
+        if button == "left"
+            && self.plugin_runtimes[runtime_index].activate_panel_action(
+                &panel_id,
+                usize::from(x),
+                usize::from(y),
+            )?
+        {
+            self.apply_plugin_editor_requests();
+            self.apply_plugin_bookmark_events();
+            return Ok(true);
+        }
         let handled =
             self.plugin_runtimes[runtime_index].emit_panel_mouse_event(&panel_id, x, y, button)?;
         if handled {
@@ -2604,6 +2955,15 @@ impl App {
         let Some(runtime) = self.plugin_runtimes.get(drawer.runtime_index) else {
             return Ok(false);
         };
+        if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+            let backwards =
+                key.modifiers.contains(KeyModifiers::SHIFT) || matches!(key.code, KeyCode::BackTab);
+            if runtime.cycle_drawer_focus(backwards) {
+                self.apply_plugin_editor_requests();
+                self.apply_plugin_bookmark_events();
+                return Ok(true);
+            }
+        }
         let handled = runtime.drawer_input_key(&key_name, rune, &modifier)?;
         if handled {
             self.apply_plugin_editor_requests();
@@ -2744,6 +3104,8 @@ impl App {
                     runtime_index,
                     items,
                     selected: 0,
+                    panel_id: None,
+                    panel_row: None,
                 });
                 self.focus = Focus::Editor;
                 return Ok(());
@@ -2754,11 +3116,89 @@ impl App {
     pub fn close_plugin_context_menu(&mut self) {
         if let Some(menu) = self.plugin_context_menu.take() {
             if let Some(runtime) = self.plugin_runtimes.get(menu.runtime_index) {
-                runtime.clear_editor_context_menu();
+                if menu.panel_id.is_none() {
+                    runtime.clear_editor_context_menu();
+                }
             }
         }
         self.restore_overlay_focus();
     }
+
+    pub fn open_plugin_panel_context_menu(
+        &mut self,
+        location: PluginPanelLocation,
+        _x: u16,
+        y: u16,
+    ) -> AppResult<bool> {
+        let Some((runtime_index, panel_id, items)) = self
+            .plugin_runtimes
+            .iter()
+            .enumerate()
+            .find_map(|(runtime_index, runtime)| {
+                let panel_id = runtime
+                    .registration()
+                    .panels
+                    .into_iter()
+                    .find(|panel| panel.location == location)
+                    .map(|panel| panel.id)?;
+                let items = runtime.panel_context_menu(&panel_id);
+                (!items.is_empty()).then_some((runtime_index, panel_id, items))
+            })
+        else {
+            return Ok(false);
+        };
+        let panel_row = self
+            .plugin_panel_line_start(location)
+            .map(|start| usize::from(y).saturating_sub(start));
+        if let Some(row) = panel_row {
+            if let Some(runtime) = self.plugin_runtimes.get(runtime_index) {
+                runtime.set_panel_selected_row(&panel_id, row);
+            }
+        }
+        self.begin_overlay();
+        self.plugin_context_menu = Some(PluginContextMenu {
+            runtime_index,
+            items,
+            selected: 0,
+            panel_id: Some(panel_id),
+            panel_row,
+        });
+        Ok(true)
+    }
+
+    fn open_selected_plugin_panel_context_menu(
+        &mut self,
+        location: PluginPanelLocation,
+    ) -> AppResult<bool> {
+        let Some((runtime_index, panel_id, items, panel_row)) = self
+            .plugin_runtimes
+            .iter()
+            .enumerate()
+            .find_map(|(runtime_index, runtime)| {
+                let panel_id = runtime
+                    .registration()
+                    .panels
+                    .into_iter()
+                    .find(|panel| panel.location == location)
+                    .map(|panel| panel.id)?;
+                let items = runtime.panel_context_menu(&panel_id);
+                let panel_row = runtime.panel_selected_row(&panel_id).saturating_sub(1);
+                (!items.is_empty()).then_some((runtime_index, panel_id, items, panel_row))
+            })
+        else {
+            return Ok(false);
+        };
+        self.begin_overlay();
+        self.plugin_context_menu = Some(PluginContextMenu {
+            runtime_index,
+            items,
+            selected: 0,
+            panel_id: Some(panel_id),
+            panel_row: Some(panel_row),
+        });
+        Ok(true)
+    }
+
     pub fn plugin_context_menu_click(&mut self, line: usize) -> AppResult<()> {
         let Some(menu) = self.plugin_context_menu.clone() else {
             return Ok(());
@@ -2777,7 +3217,14 @@ impl App {
             return Ok(());
         };
         let activated = if let Some(runtime) = self.plugin_runtimes.get(menu.runtime_index) {
-            runtime.activate_editor_context_item(menu.selected)?
+            if let Some(panel_id) = menu.panel_id.as_deref() {
+                let row = menu
+                    .panel_row
+                    .map_or_else(|| runtime.panel_selected_row(panel_id), |row| row + 1);
+                runtime.activate_panel_context_item(panel_id, menu.selected, row)?
+            } else {
+                runtime.activate_editor_context_item(menu.selected)?
+            }
         } else {
             false
         };
@@ -2852,6 +3299,26 @@ impl App {
                 format!("Indent size: {} (Left/Right)", self.effective_indent_size()),
                 true,
             ),
+            (
+                "Quick Open hidden paths".to_owned(),
+                self.settings.quick_open.show_hidden,
+            ),
+            (
+                "Quick Open Git ignored".to_owned(),
+                self.settings.quick_open.show_git_ignored,
+            ),
+            (
+                "Explorer hidden paths".to_owned(),
+                self.settings.explorer.show_hidden,
+            ),
+            (
+                "Explorer Git ignored".to_owned(),
+                self.settings.explorer.show_git_ignored,
+            ),
+            (
+                "Explorer auto reveal".to_owned(),
+                self.settings.explorer.auto_reveal,
+            ),
         ]
     }
     pub const fn quick_open_open(&self) -> bool {
@@ -2860,9 +3327,22 @@ impl App {
     pub fn quick_open_query(&self) -> &str {
         &self.quick_open_query
     }
+    pub fn quick_open_results(&self) -> &[PathBuf] {
+        &self.quick_open_results
+    }
+    pub const fn quick_open_index(&self) -> usize {
+        self.quick_open_index
+    }
+    pub fn workspace_roots(&self) -> &[PathBuf] {
+        &self.workspace_roots
+    }
     pub fn quick_open_title(&self) -> &'static str {
         if self.quick_open_save_as {
             "Save As"
+        } else if self.quick_open_query.starts_with('>') {
+            "Command Palette"
+        } else if self.quick_open_query.starts_with('?') {
+            "Keyboard Help"
         } else {
             "Open File"
         }
@@ -2874,7 +3354,10 @@ impl App {
         &self.goto_input
     }
     pub fn plugin_palette_items(&self) -> Vec<(String, String)> {
-        let query = self.plugin_query.to_lowercase();
+        self.command_palette_items(&self.plugin_query)
+    }
+    fn command_palette_items(&self, query: &str) -> Vec<(String, String)> {
+        let query = query.trim_start_matches('>').trim().to_lowercase();
         builtin_commands()
             .into_iter()
             .filter(|(id, title)| {
@@ -2901,6 +3384,40 @@ impl App {
     }
     pub fn plugin_palette_query(&self) -> &str {
         &self.plugin_query
+    }
+    pub fn command_palette_items_for_quick_open(&self) -> Vec<(String, String)> {
+        self.command_palette_items(&self.quick_open_query)
+    }
+    pub fn quick_open_help_items(&self) -> Vec<(String, String)> {
+        let query = self
+            .quick_open_query
+            .trim_start_matches('?')
+            .trim()
+            .to_lowercase();
+        [
+            ("Ctrl-P".to_owned(), "Open command palette".to_owned()),
+            ("Ctrl-O".to_owned(), "Open file".to_owned()),
+            ("Ctrl-Shift-S".to_owned(), "Save as a new file".to_owned()),
+            ("Ctrl-G".to_owned(), "Go to line and column".to_owned()),
+            ("Ctrl-F".to_owned(), "Find in workspace".to_owned()),
+            ("Ctrl-R".to_owned(), "Toggle replace mode".to_owned()),
+            ("Ctrl-K E".to_owned(), "Focus Explorer".to_owned()),
+            ("Ctrl-K F".to_owned(), "Focus Find".to_owned()),
+            ("Ctrl-K C".to_owned(), "Focus Changes".to_owned()),
+            ("Ctrl-K T".to_owned(), "Open a new terminal".to_owned()),
+            ("Ctrl-T".to_owned(), "Toggle terminal".to_owned()),
+            ("Alt-T".to_owned(), "Toggle fullscreen terminal".to_owned()),
+            ("Ctrl-S".to_owned(), "Save current file".to_owned()),
+            ("Ctrl-W".to_owned(), "Close current tab".to_owned()),
+            ("Esc".to_owned(), "Close the active overlay".to_owned()),
+        ]
+        .into_iter()
+        .filter(|(key, description)| {
+            query.is_empty()
+                || key.to_lowercase().contains(&query)
+                || description.to_lowercase().contains(&query)
+        })
+        .collect()
     }
 
     fn buffer(&self) -> &Buffer {
@@ -2929,7 +3446,10 @@ impl App {
 
     fn open_terminal(&mut self) {
         let command = terminal_command(&self.settings);
-        let mut terminal = TerminalState::with_command(command, None);
+        let cwd = self.terminals[self.active_terminal]
+            .working_directory_path()
+            .filter(|path| path.is_dir());
+        let mut terminal = TerminalState::with_command(command, cwd);
         terminal.set_scrollback(self.settings.terminal.scrollback);
         self.terminals.push(terminal);
         self.active_terminal = self.terminals.len() - 1;
@@ -3125,8 +3645,16 @@ impl App {
                 .position(|candidate| candidate.path() == Some(path))
             {
                 self.active_tab = index;
+                self.selection_anchor = None;
+                self.secondary_cursors.clear();
+                self.secondary_selections.clear();
+                self.folded_lines.clear();
+                self.diff_base_lines = None;
+                self.horizontal_scroll = 0;
                 self.editor_scroll_line = None;
+                self.refresh_search_results();
                 self.emit_plugin_event("tab.activate");
+                self.reveal_active_file();
                 return;
             }
         }
@@ -3136,8 +3664,10 @@ impl App {
         self.editor_scroll_line = None;
         self.secondary_cursors.clear();
         self.secondary_selections.clear();
+        self.refresh_search_results();
         self.emit_plugin_event("tab.open");
         self.emit_plugin_event("tab.activate");
+        self.reveal_active_file();
     }
 
     pub fn open_external_target(&mut self, target: &str) -> AppResult<()> {
@@ -3200,6 +3730,7 @@ impl App {
             self.plugin_tab_split = false;
             self.plugin_tab_collapsed_hunks.clear();
             self.emit_plugin_event("tab.close");
+            self.emit_plugin_event("tab.activate");
             return;
         }
         let Some((runtime_index, close_id)) = self.plugin_file_close.take() else {
@@ -3215,6 +3746,7 @@ impl App {
             }
         }
         self.emit_plugin_event("tab.close");
+        self.emit_plugin_event("tab.activate");
         self.plugin_file_view = None;
         self.plugin_file_view_path = None;
         self.git_diff_tab_text = None;
@@ -3246,6 +3778,8 @@ impl App {
         self.secondary_cursors.clear();
         self.secondary_selections.clear();
         self.sync_lsp_for_buffer();
+        self.refresh_search_results();
+        self.emit_plugin_event("tab.activate");
     }
 
     fn switch_tab(&mut self, delta: isize) {
@@ -3262,6 +3796,7 @@ impl App {
         self.folded_lines.clear();
         self.diff_base_lines = None;
         self.sync_lsp_for_buffer();
+        self.refresh_search_results();
         self.emit_plugin_event("tab.activate");
         self.status_message = format!("Tab {}/{}", self.active_tab + 1, self.buffers.len());
     }
@@ -3342,6 +3877,25 @@ impl App {
             self.handle_goto_key(key);
             return Ok(());
         }
+        if let Some(consumed) = self.handle_key_chord(key) {
+            if consumed {
+                return Ok(());
+            }
+        }
+        if self.sidebar_tab == SidebarTab::Search && self.replace_mode {
+            if key.modifiers == KeyModifiers::CONTROL
+                && key.code == KeyCode::Char('r')
+                && self.focus != Focus::Search
+            {
+                self.focus = Focus::Search;
+                return Ok(());
+            }
+            if key.code == KeyCode::Esc && self.focus != Focus::Search {
+                self.replace_mode = false;
+                self.focus = Focus::Editor;
+                return Ok(());
+            }
+        }
         if self.dispatch_plugin_keybinding(key)? {
             return Ok(());
         }
@@ -3398,6 +3952,55 @@ impl App {
         }
         self.handle_navigation(key);
         Ok(())
+    }
+
+    fn handle_key_chord(&mut self, key: KeyEvent) -> Option<bool> {
+        if self.key_chord_prefix {
+            self.key_chord_prefix = false;
+            if key.modifiers.is_empty() {
+                match key.code {
+                    KeyCode::Char('p') => {
+                        self.open_quick_open();
+                        return Some(true);
+                    }
+                    KeyCode::Char('e') => {
+                        self.sidebar_visible = true;
+                        self.select_sidebar(SidebarTab::Explorer);
+                        return Some(true);
+                    }
+                    KeyCode::Char('f') => {
+                        self.sidebar_visible = true;
+                        self.select_sidebar(SidebarTab::Search);
+                        return Some(true);
+                    }
+                    KeyCode::Char('c') => {
+                        self.sidebar_visible = true;
+                        self.select_sidebar(SidebarTab::Changes);
+                        return Some(true);
+                    }
+                    KeyCode::Char('t') => {
+                        self.bottom_visible = true;
+                        self.bottom_tab = BottomTab::Terminal;
+                        self.open_terminal();
+                        self.focus = Focus::Terminal;
+                        return Some(true);
+                    }
+                    _ => {}
+                }
+            }
+            return None;
+        }
+        if self.focus != Focus::Terminal
+            && self.focus != Focus::Agent
+            && key.modifiers == KeyModifiers::CONTROL
+            && key.code == KeyCode::Char('k')
+        {
+            self.key_chord_prefix = true;
+            self.status_message =
+                "Ctrl-K chord · P Open · E Explorer · F Find · C Changes · T Terminal".to_owned();
+            return Some(true);
+        }
+        None
     }
 
     fn handle_git_credential_key(&mut self, key: KeyEvent) {
@@ -3470,6 +4073,7 @@ impl App {
         self.quick_open = true;
         self.quick_open_save_as = false;
         self.quick_open_query.clear();
+        self.refresh_quick_open_results();
         self.status_message = "Open file · Enter open · Esc cancel".to_owned();
     }
     fn open_save_as(&mut self) {
@@ -3477,6 +4081,8 @@ impl App {
         self.quick_open = true;
         self.quick_open_save_as = true;
         self.quick_open_query = self.buffer().file_name().to_owned();
+        self.quick_open_results.clear();
+        self.quick_open_index = 0;
         self.status_message = "Save As · Enter save · Esc cancel".to_owned();
     }
     fn open_goto(&mut self) {
@@ -3527,27 +4133,92 @@ impl App {
         self.quick_open = false;
         self.quick_open_query.clear();
         self.quick_open_save_as = false;
+        self.quick_open_results.clear();
+        self.quick_open_index = 0;
         self.restore_overlay_focus();
+    }
+    fn refresh_quick_open_results(&mut self) {
+        if self.quick_open_save_as
+            || self.quick_open_query.starts_with('>')
+            || self.quick_open_query.starts_with('?')
+        {
+            self.quick_open_results.clear();
+            self.quick_open_index = 0;
+            return;
+        }
+        let query = self.quick_open_query.trim().to_ascii_lowercase();
+        let mut candidates = Vec::new();
+        for root in &self.workspace_roots {
+            collect_quick_open_files(
+                root,
+                root,
+                self.settings.quick_open.show_hidden,
+                self.settings.quick_open.show_git_ignored,
+                &mut candidates,
+            );
+        }
+        candidates.retain(|path| {
+            query.is_empty()
+                || quick_open_match_score(
+                    &quick_open_path_label(path, &self.workspace_roots),
+                    &query,
+                ) < usize::MAX
+        });
+        candidates.sort_by_key(|path| {
+            let display = quick_open_path_label(path, &self.workspace_roots);
+            (quick_open_match_score(&display, &query), display)
+        });
+        candidates.truncate(100);
+        self.quick_open_results = candidates;
+        self.quick_open_index = self
+            .quick_open_index
+            .min(self.quick_open_results.len().saturating_sub(1));
     }
     fn handle_quick_open_key(&mut self, key: KeyEvent) -> AppResult<()> {
         match (key.modifiers, key.code) {
             (KeyModifiers::NONE, KeyCode::Char(character)) => {
                 self.quick_open_query.push(character);
+                self.refresh_quick_open_results();
             }
             (KeyModifiers::NONE, KeyCode::Backspace) => {
                 self.quick_open_query.pop();
+                self.refresh_quick_open_results();
             }
             (KeyModifiers::NONE, KeyCode::Esc) => {
                 self.close_quick_open();
                 self.status_message = "Open file cancelled".to_owned();
             }
             (KeyModifiers::NONE, KeyCode::Enter) => {
+                if self.quick_open_query.starts_with('>') {
+                    let items = self.command_palette_items(&self.quick_open_query);
+                    if let Some((id, _)) = items.get(self.quick_open_index) {
+                        let id = id.clone();
+                        self.close_quick_open();
+                        if self.execute_builtin_command(&id)? {
+                            self.status_message = format!("Command executed · {id}");
+                        } else if self.execute_plugin_command(&id)? {
+                            self.status_message = format!("Plugin command executed · {id}");
+                        }
+                    } else {
+                        self.status_message = "No matching command".to_owned();
+                    }
+                    return Ok(());
+                }
+                if self.quick_open_query.starts_with('?') {
+                    self.close_quick_open();
+                    self.status_message = "Keyboard help closed".to_owned();
+                    return Ok(());
+                }
                 let raw = self.quick_open_query.trim();
                 if raw.is_empty() {
                     self.status_message = "Enter a file path".to_owned();
                     return Ok(());
                 }
-                let path = PathBuf::from(raw);
+                let path = self
+                    .quick_open_results
+                    .get(self.quick_open_index)
+                    .cloned()
+                    .unwrap_or_else(|| PathBuf::from(raw));
                 let path = if path.is_absolute() {
                     path
                 } else {
@@ -3594,6 +4265,38 @@ impl App {
                 self.focus = Focus::Editor;
                 self.close_quick_open();
                 self.status_message = format!("Opened {}", path.display());
+            }
+            (KeyModifiers::NONE, KeyCode::Down)
+                if !self.quick_open_save_as && self.quick_open_query.starts_with('>') =>
+            {
+                self.quick_open_index = (self.quick_open_index + 1).min(
+                    self.command_palette_items(&self.quick_open_query)
+                        .len()
+                        .saturating_sub(1),
+                );
+            }
+            (KeyModifiers::NONE, KeyCode::Down)
+                if !self.quick_open_save_as && self.quick_open_query.starts_with('?') =>
+            {
+                self.quick_open_index = (self.quick_open_index + 1)
+                    .min(self.quick_open_help_items().len().saturating_sub(1));
+            }
+            (KeyModifiers::NONE, KeyCode::Down) if !self.quick_open_save_as => {
+                self.quick_open_index = (self.quick_open_index + 1)
+                    .min(self.quick_open_results.len().saturating_sub(1));
+            }
+            (KeyModifiers::NONE, KeyCode::Up)
+                if !self.quick_open_save_as && self.quick_open_query.starts_with('>') =>
+            {
+                self.quick_open_index = self.quick_open_index.saturating_sub(1);
+            }
+            (KeyModifiers::NONE, KeyCode::Up)
+                if !self.quick_open_save_as && self.quick_open_query.starts_with('?') =>
+            {
+                self.quick_open_index = self.quick_open_index.saturating_sub(1);
+            }
+            (KeyModifiers::NONE, KeyCode::Up) if !self.quick_open_save_as => {
+                self.quick_open_index = self.quick_open_index.saturating_sub(1);
             }
             _ => {}
         }
@@ -3765,6 +4468,27 @@ impl App {
                 self.settings.editor.use_tabs = use_tabs;
             }
             10 => self.cycle_indent_size(1),
+            11 => {
+                self.settings.quick_open.show_hidden = !self.settings.quick_open.show_hidden;
+                self.refresh_quick_open_results();
+            }
+            12 => {
+                self.settings.quick_open.show_git_ignored =
+                    !self.settings.quick_open.show_git_ignored;
+                self.refresh_quick_open_results();
+            }
+            13 => {
+                self.settings.explorer.show_hidden = !self.settings.explorer.show_hidden;
+                self.refresh_explorer();
+            }
+            14 => {
+                self.settings.explorer.show_git_ignored = !self.settings.explorer.show_git_ignored;
+                self.refresh_explorer();
+            }
+            15 => {
+                self.settings.explorer.auto_reveal = !self.settings.explorer.auto_reveal;
+                self.reveal_active_file();
+            }
             _ => return,
         }
         self.status_message = "Setting changed for this session".to_owned();
@@ -3837,6 +4561,10 @@ impl App {
             return Ok(true);
         }
         let key = match id {
+            "lsp.restart" => {
+                self.restart_lsp()?;
+                return Ok(true);
+            }
             "lsp.workspaceSymbols" => {
                 self.request_lsp("workspace/symbol")?;
                 return Ok(true);
@@ -4115,24 +4843,15 @@ impl App {
                     }
                     Err(message) => error = Some(message),
                 },
-                "click" => match automation_mouse_coordinates(&task.args, 2) {
-                    Ok([x, y, _, _]) => {
-                        self.plugin_mouse_events.push(MouseEvent {
-                            kind: MouseEventKind::Down(MouseButton::Left),
-                            column: x,
-                            row: y,
-                            modifiers: KeyModifiers::NONE,
-                        });
-                        self.plugin_mouse_events.push(MouseEvent {
-                            kind: MouseEventKind::Up(MouseButton::Left),
-                            column: x,
-                            row: y,
-                            modifiers: KeyModifiers::NONE,
-                        });
-                        result = json!(true);
+                "click" | "rclick" | "right_click" | "hover" => {
+                    match automation_mouse_events(&task.action, &task.args) {
+                        Ok(events) => {
+                            self.plugin_mouse_events.extend(events);
+                            result = json!(true);
+                        }
+                        Err(message) => error = Some(message),
                     }
-                    Err(message) => error = Some(message),
-                },
+                }
                 "drag" => match automation_mouse_coordinates(&task.args, 4) {
                     Ok([start_x, start_y, end_x, end_y]) => {
                         self.plugin_mouse_events.push(MouseEvent {
@@ -4218,6 +4937,24 @@ impl App {
                         "buffer_lines": self.file_lines().len(),
                     });
                 }
+                "wait-for" => match automation_wait_for(&task.args) {
+                    Ok((needle, timeout)) => {
+                        if self.automation_screenshot().contains(&needle) {
+                            result = json!({"matched": true});
+                        } else if timeout.is_zero() {
+                            result = json!({"matched": false, "timed_out": true});
+                        } else {
+                            self.pending_automation_waits.push(PendingAutomationWait {
+                                runtime_index,
+                                id: task.id,
+                                needle,
+                                deadline: Instant::now() + timeout,
+                            });
+                            continue;
+                        }
+                    }
+                    Err(message) => error = Some(message),
+                },
                 "quit" => {
                     self.quit();
                     result = json!({"ok": true});
@@ -4230,6 +4967,39 @@ impl App {
                 }
             }
         }
+        self.poll_pending_automation_waits();
+    }
+
+    fn poll_pending_automation_waits(&mut self) {
+        let screen = self.automation_screenshot();
+        let now = Instant::now();
+        let mut remaining = Vec::new();
+        for wait in std::mem::take(&mut self.pending_automation_waits) {
+            let Some(runtime) = self.plugin_runtimes.get(wait.runtime_index) else {
+                continue;
+            };
+            if runtime.take_cancelled_automation(wait.id) {
+                continue;
+            }
+            if screen.contains(&wait.needle) {
+                if let Err(error) =
+                    runtime.complete_automation(wait.id, json!({"matched": true}), None)
+                {
+                    self.status_message = format!("Plugin automation callback failed: {error}");
+                }
+            } else if now >= wait.deadline {
+                if let Err(error) = runtime.complete_automation(
+                    wait.id,
+                    json!({"matched": false, "timed_out": true}),
+                    Some("wait-for timeout".to_owned()),
+                ) {
+                    self.status_message = format!("Plugin automation callback failed: {error}");
+                }
+            } else {
+                remaining.push(wait);
+            }
+        }
+        self.pending_automation_waits = remaining;
     }
 
     fn apply_plugin_editor_requests(&mut self) {
@@ -4238,6 +5008,12 @@ impl App {
             .iter()
             .flat_map(PluginRuntime::drain_editor_requests)
             .collect::<Vec<_>>();
+        if requests.is_empty() {
+            return;
+        }
+        let initial_cursor = self.cursor();
+        let mut document_changed = false;
+        let mut cursor_or_selection_changed = false;
         for request in requests {
             let line_count = self.file_lines().len();
             let clamp_position = |line: usize, col: usize, lines: &[String]| {
@@ -4252,6 +5028,7 @@ impl App {
                     let position = clamp_position(line, col, self.file_lines());
                     self.buffer_mut().set_cursor(position.line, position.column);
                     self.buffer_mut().insert(&text);
+                    document_changed = true;
                 }
                 PluginEditorRequest::SetLine { line, text } => {
                     if line < line_count {
@@ -4260,6 +5037,7 @@ impl App {
                             &[(Position { line, column: 0 }, Position { line, column: end })],
                             &text,
                         );
+                        document_changed = true;
                     }
                 }
                 PluginEditorRequest::Replace {
@@ -4272,11 +5050,13 @@ impl App {
                     let start = clamp_position(start_line, start_col, self.file_lines());
                     let end = clamp_position(end_line, end_col, self.file_lines());
                     self.buffer_mut().replace_ranges(&[(start, end)], &text);
+                    document_changed = true;
                 }
                 PluginEditorRequest::SetCursor { line, col } => {
                     let position = clamp_position(line, col, self.file_lines());
                     self.buffer_mut().set_cursor(position.line, position.column);
                     self.selection_anchor = None;
+                    cursor_or_selection_changed = true;
                 }
                 PluginEditorRequest::SetSelection {
                     start_line,
@@ -4288,11 +5068,13 @@ impl App {
                     let end = clamp_position(end_line, end_col, self.file_lines());
                     self.selection_anchor = Some(start);
                     self.buffer_mut().set_cursor(end.line, end.column);
+                    cursor_or_selection_changed = true;
                 }
                 PluginEditorRequest::ClearSelection => {
                     self.selection_anchor = None;
                     self.secondary_selections.clear();
                     self.column_selection = None;
+                    cursor_or_selection_changed = true;
                 }
                 PluginEditorRequest::AddCursor { line, col } => {
                     let position = clamp_position(line, col, self.file_lines());
@@ -4300,12 +5082,14 @@ impl App {
                         self.secondary_cursors.push(position);
                         self.secondary_cursors
                             .sort_by_key(|cursor| (cursor.line, cursor.column));
+                        cursor_or_selection_changed = true;
                     }
                 }
                 PluginEditorRequest::ClearCursors => {
                     self.secondary_cursors.clear();
                     self.secondary_selections.clear();
                     self.column_selection = None;
+                    cursor_or_selection_changed = true;
                 }
                 PluginEditorRequest::ScrollTo { line } => {
                     self.editor_scroll_line = Some(line.min(line_count.saturating_sub(1)));
@@ -4339,6 +5123,7 @@ impl App {
                             let line = hunk.line.min(line_count.saturating_sub(1));
                             self.buffer_mut().set_cursor(line, 0);
                             self.editor_scroll_line = Some(line);
+                            cursor_or_selection_changed = true;
                             self.status_message = format!(
                                 "Diff hunk {}/{} · {}",
                                 index + 1,
@@ -4349,6 +5134,13 @@ impl App {
                     }
                 }
             }
+        }
+        if document_changed {
+            self.sync_lsp_for_buffer();
+            self.refresh_search_results();
+            self.emit_plugin_event("editor.change");
+        } else if cursor_or_selection_changed || self.cursor() != initial_cursor {
+            self.emit_plugin_event("cursor.change");
         }
     }
     fn handle_changes_key(&mut self, key: KeyEvent) -> AppResult<()> {
@@ -4876,6 +5668,7 @@ impl App {
                         Ok(()) => {
                             self.refresh_git_state();
                             self.explorer_paths = self.explorer_entries();
+                            self.refresh_buffers_after_workspace_change();
                             self.status_message = format!("Switched to {branch}");
                         }
                         Err(error) => {
@@ -4887,6 +5680,54 @@ impl App {
             _ => self.handle_navigation(key),
         }
         Ok(())
+    }
+
+    fn refresh_buffers_after_workspace_change(&mut self) {
+        let mut active_reloaded = false;
+        let mut any_reloaded = false;
+        let mut dirty_changed = false;
+        let mut deleted_changed = false;
+        for index in 0..self.buffers.len() {
+            if self.buffers[index].dirty() {
+                match self.buffers[index].poll_external_change() {
+                    Ok(Some(ExternalChange::Dirty)) => {
+                        dirty_changed = true;
+                    }
+                    Ok(Some(ExternalChange::Deleted)) => {
+                        deleted_changed = true;
+                    }
+                    Ok(Some(ExternalChange::Reloaded)) | Ok(None) => {}
+                    Err(error) => {
+                        self.status_message = format!("Workspace refresh failed: {error}");
+                    }
+                }
+                continue;
+            }
+            match self.buffers[index].reload_from_disk() {
+                Ok(true) => {
+                    any_reloaded = true;
+                    if index == self.active_tab {
+                        active_reloaded = true;
+                    }
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    self.status_message = format!("Workspace refresh failed: {error}");
+                }
+            }
+        }
+        if any_reloaded {
+            self.refresh_search_results();
+        }
+        if active_reloaded {
+            self.sync_lsp_for_buffer();
+            self.emit_plugin_event("document.reload");
+        }
+        if dirty_changed {
+            self.status_message = "Branch switched; unsaved buffer changed on disk".to_owned();
+        } else if deleted_changed {
+            self.status_message = "Branch switched; an open file was deleted on disk".to_owned();
+        }
     }
     fn handle_branch_name_key(&mut self, key: KeyEvent) -> AppResult<()> {
         match (key.modifiers, key.code) {
@@ -5003,6 +5844,32 @@ impl App {
             Ok(false) => {}
             Err(error) => self.status_message = format!("LSP start failed: {error}"),
         }
+    }
+
+    fn restart_lsp(&mut self) -> AppResult<()> {
+        if !self.settings.lsp.enabled {
+            self.status_message = "LSP is disabled".to_owned();
+            return Ok(());
+        }
+        let language = self.language().to_owned();
+        if language.is_empty() {
+            self.status_message = "LSP restart unavailable: unknown language".to_owned();
+            return Ok(());
+        }
+        if !self.lsp.configured(&language) {
+            self.status_message = format!("No LSP server configured for {language}");
+            return Ok(());
+        }
+        let root_uri = format!("file://{}", self.search_root.to_string_lossy());
+        match self.lsp.restart(&language, Some(&root_uri)) {
+            Ok(true) => {
+                self.sync_lsp_for_buffer();
+                self.status_message = format!("Restarted LSP server for {language}");
+            }
+            Ok(false) => self.status_message = format!("No LSP server configured for {language}"),
+            Err(error) => self.status_message = format!("LSP restart failed: {error}"),
+        }
+        Ok(())
     }
 
     fn notify_lsp_saved(&mut self, language: &str, path: &Path) {
@@ -5171,6 +6038,45 @@ impl App {
             .unwrap_or_else(|| self.search_root.clone())
     }
 
+    fn relocate_open_buffers(&mut self, old: &Path, new: &Path) {
+        let old_key = path_key(old);
+        let override_prefix = format!("{old_key}{}", std::path::MAIN_SEPARATOR);
+        let moved_overrides = self
+            .language_overrides
+            .iter()
+            .filter_map(|(path, language)| {
+                let relative = if path == &old_key {
+                    Some(PathBuf::new())
+                } else {
+                    path.strip_prefix(&override_prefix).map(PathBuf::from)
+                }?;
+                let relocated = if relative.as_os_str().is_empty() {
+                    new.to_path_buf()
+                } else {
+                    new.join(&relative)
+                };
+                Some((path.clone(), path_key(&relocated), language.clone()))
+            })
+            .collect::<Vec<_>>();
+        for (old_path, _, _) in &moved_overrides {
+            self.language_overrides.remove(old_path);
+        }
+        for (_, new_path, language) in moved_overrides {
+            self.language_overrides.insert(new_path, language);
+        }
+        for buffer in &mut self.buffers {
+            let Some(path) = buffer.path().map(Path::to_path_buf) else {
+                continue;
+            };
+            let Some(relative) = path.strip_prefix(old).ok() else {
+                continue;
+            };
+            let relocated = new.join(relative);
+            buffer.relocate(relocated);
+        }
+        self.save_language_overrides();
+    }
+
     fn commit_explorer_input(&mut self) -> AppResult<()> {
         let mode = self.explorer_mode.clone().expect("input mode");
         let name = self.explorer_input.trim();
@@ -5208,7 +6114,23 @@ impl App {
                 if target.exists() && target != path {
                     self.status_message = format!("Already exists: {}", target.display());
                 } else {
+                    let active_old_path = self
+                        .buffer()
+                        .path()
+                        .filter(|open| open.strip_prefix(&path).is_ok())
+                        .map(Path::to_path_buf);
+                    let active_language =
+                        active_old_path.as_ref().map(|_| self.language().to_owned());
+                    if let (Some(language), Some(old_path)) =
+                        (active_language.as_deref(), active_old_path.as_deref())
+                    {
+                        self.notify_lsp_closed(language, old_path);
+                    }
                     fs::rename(&path, &target)?;
+                    self.relocate_open_buffers(&path, &target);
+                    if active_old_path.is_some() {
+                        self.sync_lsp_for_buffer();
+                    }
                     self.refresh_explorer();
                     self.status_message = format!("Renamed to {}", target.display());
                 }
@@ -5251,7 +6173,14 @@ impl App {
         };
         roots
             .iter()
-            .flat_map(|root| visible_explorer_entries(root, &self.explorer_expanded))
+            .flat_map(|root| {
+                visible_explorer_entries(
+                    root,
+                    &self.explorer_expanded,
+                    self.settings.explorer.show_hidden,
+                    self.settings.explorer.show_git_ignored,
+                )
+            })
             .collect()
     }
 
@@ -5273,12 +6202,54 @@ impl App {
             .explorer_index
             .min(self.explorer_paths.len().saturating_sub(1));
     }
+
+    fn reveal_active_file(&mut self) {
+        if !self.settings.explorer.auto_reveal {
+            return;
+        }
+        let Some(active) = self.buffer().path().map(Path::to_path_buf) else {
+            return;
+        };
+        let Some(root) = self
+            .explorer_roots
+            .iter()
+            .find(|root| active.starts_with(root))
+            .cloned()
+        else {
+            return;
+        };
+        let mut directory = if active.is_dir() {
+            active.clone()
+        } else {
+            active.parent().unwrap_or(&root).to_path_buf()
+        };
+        self.explorer_expanded.insert(root.clone());
+        while directory.starts_with(&root) && directory != root {
+            self.explorer_expanded.insert(directory.clone());
+            let Some(parent) = directory.parent() else {
+                break;
+            };
+            directory = parent.to_path_buf();
+        }
+        self.refresh_explorer();
+        if let Some(index) = self.explorer_paths.iter().position(|path| path == &active) {
+            self.explorer_index = index;
+        }
+    }
+
     fn handle_terminal_key(&mut self, key: KeyEvent) -> AppResult<()> {
         if key.code == KeyCode::Char('t')
             && key.modifiers.contains(KeyModifiers::CONTROL)
             && key.modifiers.contains(KeyModifiers::SHIFT)
         {
             self.open_terminal();
+            return Ok(());
+        }
+        if key.code == KeyCode::Char('c')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && key.modifiers.contains(KeyModifiers::SHIFT)
+        {
+            self.copy_terminal_selection();
             return Ok(());
         }
         if key.code == KeyCode::Left
@@ -5350,6 +6321,10 @@ impl App {
                 }
                 (KeyModifiers::NONE, KeyCode::Tab) => {
                     self.terminal_mut().write_bytes(b"\t")?;
+                    return Ok(());
+                }
+                (KeyModifiers::SHIFT, KeyCode::Tab | KeyCode::BackTab) => {
+                    self.terminal_mut().write_bytes(b"\x1b[Z")?;
                     return Ok(());
                 }
                 (KeyModifiers::NONE, KeyCode::Home) => {
@@ -5437,6 +6412,10 @@ impl App {
                 }
                 (KeyModifiers::NONE, KeyCode::Tab) => {
                     self.agent.write_bytes(b"\t")?;
+                    return Ok(());
+                }
+                (KeyModifiers::SHIFT, KeyCode::Tab | KeyCode::BackTab) => {
+                    self.agent.write_bytes(b"\x1b[Z")?;
                     return Ok(());
                 }
                 (KeyModifiers::NONE, KeyCode::PageUp) => {
@@ -5554,19 +6533,8 @@ impl App {
         Ok(())
     }
     fn restart_agent_session(&mut self) {
-        let (command, cwd) = self
-            .settings
-            .agent
-            .providers
-            .get(&self.agent_provider)
-            .map(|provider| (provider.command.clone(), provider.cwd.clone()))
-            .unwrap_or_else(|| {
-                (
-                    self.settings.agent.command.clone(),
-                    self.settings.agent.cwd.clone(),
-                )
-            });
-        self.agent = TerminalState::with_command(command, cwd.map(PathBuf::from));
+        let (command, cwd, _) = configured_agent_command(&self.settings, &self.agent_provider);
+        self.agent = TerminalState::with_command(command, cwd);
     }
     fn cycle_agent(&mut self, delta: isize) {
         let providers: Vec<_> = self.settings.agent.providers.keys().cloned().collect();
@@ -5655,24 +6623,43 @@ impl App {
                     return;
                 }
                 if let Some(result) = self.search_results.get(self.search_index).cloned() {
-                    match Buffer::open(&result.path) {
-                        Ok(mut buffer) => {
-                            buffer.set_cursor(
-                                result.line.saturating_sub(1),
-                                result.column.saturating_sub(1),
-                            );
-                            self.open_buffer(buffer);
-                            self.sync_lsp_for_buffer();
-                            self.emit_plugin_event("document.open");
-                            self.focus = Focus::Editor;
-                            self.status_message = format!(
-                                "Opened {}:{}:{}",
-                                result.path.display(),
-                                result.line,
-                                result.column
-                            );
+                    let target_line = result.line.saturating_sub(1);
+                    let target_column = result.column.saturating_sub(1);
+                    if let Some(index) = self
+                        .buffers
+                        .iter()
+                        .position(|buffer| buffer.path() == Some(result.path.as_path()))
+                    {
+                        self.active_tab = index;
+                        self.buffer_mut().set_cursor(target_line, target_column);
+                        self.selection_anchor = None;
+                        self.sync_lsp_for_buffer();
+                        self.refresh_search_results();
+                        self.emit_plugin_event("tab.activate");
+                        self.focus = Focus::Editor;
+                        self.status_message = format!(
+                            "Opened {}:{}:{}",
+                            result.path.display(),
+                            result.line,
+                            result.column
+                        );
+                    } else {
+                        match Buffer::open(&result.path) {
+                            Ok(mut buffer) => {
+                                buffer.set_cursor(target_line, target_column);
+                                self.open_buffer(buffer);
+                                self.sync_lsp_for_buffer();
+                                self.emit_plugin_event("document.open");
+                                self.focus = Focus::Editor;
+                                self.status_message = format!(
+                                    "Opened {}:{}:{}",
+                                    result.path.display(),
+                                    result.line,
+                                    result.column
+                                );
+                            }
+                            Err(error) => self.status_message = format!("Open failed: {error}"),
                         }
-                        Err(error) => self.status_message = format!("Open failed: {error}"),
                     }
                 } else {
                     self.status_message = format!("{} matches", self.search_results.len());
@@ -5765,10 +6752,18 @@ impl App {
             &self.settings.search.exclude,
             self.search_regex,
         );
-        let active_path = self.buffer().path().map(Path::to_path_buf);
-        if let Some(path) = active_path {
+        let open_buffers = self
+            .buffers
+            .iter()
+            .filter_map(|buffer| {
+                buffer
+                    .path()
+                    .map(Path::to_path_buf)
+                    .map(|path| (path, buffer.lines().join("\n")))
+            })
+            .collect::<Vec<_>>();
+        for (path, text) in open_buffers {
             self.search_results.retain(|result| result.path != path);
-            let text = self.buffer().lines().join("\n");
             self.search_results.extend(search_text_with_options(
                 &path,
                 &text,
@@ -5899,11 +6894,19 @@ impl App {
         if key.modifiers == (KeyModifiers::ALT | KeyModifiers::SHIFT) {
             match key.code {
                 KeyCode::Up => {
-                    self.move_selected_lines(true);
+                    if self.selection_anchor.is_some() || !self.secondary_selections.is_empty() {
+                        self.move_selected_lines(true);
+                    } else {
+                        self.add_secondary_cursor(-1);
+                    }
                     return Ok(());
                 }
                 KeyCode::Down => {
-                    self.move_selected_lines(false);
+                    if self.selection_anchor.is_some() || !self.secondary_selections.is_empty() {
+                        self.move_selected_lines(false);
+                    } else {
+                        self.add_secondary_cursor(1);
+                    }
                     return Ok(());
                 }
                 KeyCode::Char('s') => {
@@ -6733,9 +7736,25 @@ impl App {
     }
     fn add_secondary_cursor(&mut self, line_delta: isize) {
         let primary = self.cursor();
-        let line = (primary.line as isize + line_delta)
-            .clamp(0, self.buffer().lines().len().saturating_sub(1) as isize)
-            as usize;
+        let line = if line_delta.is_negative() {
+            self.cursor_positions()
+                .into_iter()
+                .map(|position| position.line)
+                .min()
+                .unwrap_or(primary.line)
+                .checked_sub(line_delta.unsigned_abs())
+        } else {
+            self.cursor_positions()
+                .into_iter()
+                .map(|position| position.line)
+                .max()
+                .unwrap_or(primary.line)
+                .checked_add(line_delta as usize)
+        };
+        let Some(line) = line.filter(|line| *line < self.buffer().lines().len()) else {
+            self.status_message = "No more lines in that direction".to_owned();
+            return;
+        };
         let column = primary
             .column
             .min(self.buffer().lines()[line].chars().count());
@@ -7760,7 +8779,7 @@ impl App {
                     let new_exists = *virtual_exists
                         .entry(new.clone())
                         .or_insert_with(|| new.exists());
-                    if !old_exists || uri_to_path(current_uri).as_deref() == Some(old) {
+                    if !old_exists {
                         return Err(crate::error::AppError::Lsp(format!(
                             "RenameFile source is unavailable: {}",
                             old.display()
@@ -7852,6 +8871,7 @@ impl App {
                 }
             }
         }
+        let mut active_file_deleted = false;
         for operation in resource_operations {
             match operation {
                 ResourceOperation::Create { path, overwrite } => {
@@ -7867,21 +8887,58 @@ impl App {
                     new,
                     overwrite,
                 } => {
+                    let active_old_path = self
+                        .buffer()
+                        .path()
+                        .filter(|open| open.strip_prefix(&old).is_ok())
+                        .map(Path::to_path_buf);
+                    let active_language =
+                        active_old_path.as_ref().map(|_| self.language().to_owned());
+                    if let (Some(language), Some(old_path)) =
+                        (active_language.as_deref(), active_old_path.as_deref())
+                    {
+                        self.notify_lsp_closed(language, old_path);
+                    }
                     if overwrite && new.exists() {
                         fs::remove_file(&new)?;
                     }
                     fs::rename(&old, &new)?;
+                    self.relocate_open_buffers(&old, &new);
+                    if active_old_path.is_some() {
+                        self.sync_lsp_for_buffer();
+                    }
                     changed += 1;
                 }
                 ResourceOperation::Delete { path, .. } => {
+                    let active_old_path = self
+                        .buffer()
+                        .path()
+                        .filter(|open| open.strip_prefix(&path).is_ok())
+                        .map(Path::to_path_buf);
+                    if let Some(old_path) = active_old_path.as_deref() {
+                        let language = self.language().to_owned();
+                        self.notify_lsp_closed(&language, old_path);
+                        active_file_deleted = true;
+                    }
                     if path.exists() {
                         fs::remove_file(&path)?;
+                        for buffer in &mut self.buffers {
+                            if buffer
+                                .path()
+                                .is_some_and(|open| open.strip_prefix(&path).is_ok())
+                            {
+                                let _ = buffer.poll_external_change();
+                            }
+                        }
                         changed += 1;
                     }
                 }
             }
         }
-        if changed > 0 {
+        if active_file_deleted {
+            self.status_message =
+                "LSP deleted the active file; save to recreate or close the tab".to_owned();
+        } else if changed > 0 {
             self.sync_lsp_for_buffer();
         }
         Ok(changed)
@@ -7904,7 +8961,7 @@ impl App {
             self.status_message = "No inline conflict block found".to_owned();
             return;
         };
-        let lines = self.file_lines();
+        let lines = self.file_lines().to_vec();
         let mut preview = vec!["Ours".to_owned()];
         preview.extend(
             lines[block.ours_start..block.ours_end]
@@ -7932,30 +8989,82 @@ impl App {
     }
 
     fn apply_completion_item(&mut self, item: &LspCompletionItem) {
-        let Some(range) = &item.edit_range else {
-            self.buffer_mut().insert(&item.insert_text);
-            return;
+        let lines = self.file_lines().to_vec();
+        let primary_range = item.edit_range.clone().unwrap_or_else(|| {
+            let cursor = self.buffer().cursor();
+            LspCompletionRange {
+                start_line: cursor.line,
+                start_character: utf16_column(&lines[cursor.line], cursor.column),
+                end_line: cursor.line,
+                end_character: utf16_column(&lines[cursor.line], cursor.column),
+            }
+        });
+        let mut edits = std::iter::once((primary_range, item.insert_text.clone()))
+            .chain(
+                item.additional_edits
+                    .iter()
+                    .map(|edit| (edit.range.clone(), edit.new_text.clone())),
+            )
+            .collect::<Vec<_>>();
+        edits.sort_by(|(left, _), (right, _)| {
+            (
+                right.start_line,
+                right.start_character,
+                right.end_line,
+                right.end_character,
+            )
+                .cmp(&(
+                    left.start_line,
+                    left.start_character,
+                    left.end_line,
+                    left.end_character,
+                ))
+        });
+        for (range, text) in edits {
+            let start_line = range.start_line.min(lines.len().saturating_sub(1));
+            let end_line = range.end_line.min(lines.len().saturating_sub(1));
+            let start_column = editor_column_from_utf16(&lines[start_line], range.start_character)
+                .unwrap_or_else(|| lines[start_line].chars().count());
+            let end_column = editor_column_from_utf16(&lines[end_line], range.end_character)
+                .unwrap_or_else(|| lines[end_line].chars().count());
+            self.buffer_mut().replace_ranges(
+                &[(
+                    Position {
+                        line: start_line,
+                        column: start_column,
+                    },
+                    Position {
+                        line: end_line,
+                        column: end_column,
+                    },
+                )],
+                &text,
+            );
+        }
+    }
+
+    fn resolve_completion_item(&mut self, item: LspCompletionItem) -> AppResult<LspCompletionItem> {
+        let Some(params) = item.resolve_params.clone() else {
+            return Ok(item);
         };
-        let lines = self.file_lines();
-        let start_line = range.start_line.min(lines.len().saturating_sub(1));
-        let end_line = range.end_line.min(lines.len().saturating_sub(1));
-        let start_column = editor_column_from_utf16(&lines[start_line], range.start_character)
-            .unwrap_or_else(|| lines[start_line].chars().count());
-        let end_column = editor_column_from_utf16(&lines[end_line], range.end_character)
-            .unwrap_or_else(|| lines[end_line].chars().count());
-        self.buffer_mut().replace_ranges(
-            &[(
-                Position {
-                    line: start_line,
-                    column: start_column,
-                },
-                Position {
-                    line: end_line,
-                    column: end_column,
-                },
-            )],
-            &item.insert_text,
+        let language = self.language().to_owned();
+        if language.is_empty() {
+            return Ok(item);
+        }
+        let Some(result) = self
+            .lsp
+            .request(&language, "completionItem/resolve", params)?
+        else {
+            return Ok(item);
+        };
+        let merged = merge_completion_item(
+            item.resolve_params
+                .as_ref()
+                .expect("resolve params are present"),
+            &result,
         );
+        let mut resolved = completion_items(&json!({"items": [merged]}));
+        Ok(resolved.pop().unwrap_or(item))
     }
 
     fn handle_lsp_popup_key(&mut self, key: KeyEvent) -> AppResult<bool> {
@@ -7972,10 +9081,26 @@ impl App {
                     *selected = (*selected + 1).min(items.len().saturating_sub(1));
                     Ok(true)
                 }
+                (KeyModifiers::NONE, KeyCode::Char(character))
+                    if items
+                        .get(*selected)
+                        .is_some_and(|item| item.commit_characters.contains(&character)) =>
+                {
+                    let item = items.get(*selected).cloned();
+                    self.close_lsp_popup();
+                    if let Some(item) = item {
+                        let item = self.resolve_completion_item(item)?;
+                        self.apply_completion_item(&item);
+                        self.buffer_mut().insert(&character.to_string());
+                        self.sync_lsp_for_buffer();
+                    }
+                    Ok(true)
+                }
                 (KeyModifiers::NONE, KeyCode::Enter) => {
                     let item = items.get(*selected).cloned();
                     self.close_lsp_popup();
                     if let Some(item) = item {
+                        let item = self.resolve_completion_item(item)?;
                         self.apply_completion_item(&item);
                         self.sync_lsp_for_buffer();
                     }
@@ -8363,18 +9488,25 @@ fn collapse_plugin_diff_hunks(text: &str, collapsed: &BTreeSet<usize>) -> String
     output.join("\n")
 }
 
-fn list_directory(root: &Path) -> Vec<PathBuf> {
-    let Ok(entries) = fs::read_dir(root) else {
+fn list_directory(
+    workspace_root: &Path,
+    current: &Path,
+    show_hidden: bool,
+    show_git_ignored: bool,
+) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(current) else {
         return Vec::new();
     };
     let mut paths: Vec<_> = entries
         .flatten()
         .map(|entry| entry.path())
         .filter(|path| {
-            !path
+            let hidden = path
                 .file_name()
                 .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with('.'))
+                .is_some_and(|name| name.starts_with('.'));
+            (!hidden || show_hidden)
+                && (show_git_ignored || !quick_open_is_git_ignored(workspace_root, path))
         })
         .map(|path| {
             let is_file = !path.is_dir();
@@ -8386,17 +9518,125 @@ fn list_directory(root: &Path) -> Vec<PathBuf> {
     paths.into_iter().map(|(_, _, path)| path).collect()
 }
 
-fn visible_explorer_entries(root: &Path, expanded: &BTreeSet<PathBuf>) -> Vec<PathBuf> {
+fn collect_quick_open_files(
+    root: &Path,
+    current: &Path,
+    show_hidden: bool,
+    show_git_ignored: bool,
+    output: &mut Vec<PathBuf>,
+) {
+    let Ok(entries) = fs::read_dir(current) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if (!show_hidden && name.starts_with('.'))
+            || (!show_hidden && matches!(name, "target" | "node_modules" | "vendor"))
+        {
+            continue;
+        }
+        if !show_git_ignored && quick_open_is_git_ignored(root, &path) {
+            continue;
+        }
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if metadata.is_dir() {
+            collect_quick_open_files(root, &path, show_hidden, show_git_ignored, output);
+        } else if metadata.is_file() {
+            output.push(path);
+        }
+    }
+}
+
+fn quick_open_is_git_ignored(root: &Path, path: &Path) -> bool {
+    if !root.join(".git").exists() && !root.join(".gitignore").is_file() {
+        return false;
+    }
+    let Ok(relative) = path.strip_prefix(root) else {
+        return false;
+    };
+    std::process::Command::new("git")
+        .args([
+            "-C",
+            &root.to_string_lossy(),
+            "check-ignore",
+            "--quiet",
+            "--no-index",
+            "--",
+        ])
+        .arg(relative)
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn quick_open_match_score(path: &str, query: &str) -> usize {
+    if query.is_empty() {
+        return 0;
+    }
+    let mut score = 0;
+    let mut cursor = 0;
+    for character in query.chars() {
+        let Some(relative) = path[cursor..].find(character) else {
+            return usize::MAX;
+        };
+        score += relative;
+        cursor += relative + character.len_utf8();
+    }
+    score
+}
+
+fn quick_open_path_label(path: &Path, roots: &[PathBuf]) -> String {
+    roots
+        .iter()
+        .find_map(|root| path.strip_prefix(root).ok())
+        .map_or_else(
+            || path.to_string_lossy().to_ascii_lowercase(),
+            |relative| relative.to_string_lossy().to_ascii_lowercase(),
+        )
+}
+
+fn visible_explorer_entries(
+    root: &Path,
+    expanded: &BTreeSet<PathBuf>,
+    show_hidden: bool,
+    show_git_ignored: bool,
+) -> Vec<PathBuf> {
     let mut output = Vec::new();
-    fn visit(path: &Path, expanded: &BTreeSet<PathBuf>, output: &mut Vec<PathBuf>) {
-        for child in list_directory(path) {
+    fn visit(
+        workspace_root: &Path,
+        path: &Path,
+        expanded: &BTreeSet<PathBuf>,
+        show_hidden: bool,
+        show_git_ignored: bool,
+        output: &mut Vec<PathBuf>,
+    ) {
+        for child in list_directory(workspace_root, path, show_hidden, show_git_ignored) {
             output.push(child.clone());
             if child.is_dir() && expanded.contains(&child) {
-                visit(&child, expanded, output);
+                visit(
+                    workspace_root,
+                    &child,
+                    expanded,
+                    show_hidden,
+                    show_git_ignored,
+                    output,
+                );
             }
         }
     }
-    visit(root, expanded, &mut output);
+    visit(
+        root,
+        root,
+        expanded,
+        show_hidden,
+        show_git_ignored,
+        &mut output,
+    );
     output
 }
 
@@ -8461,6 +9701,27 @@ fn automation_key_events(input: &str) -> Result<Vec<KeyEvent>, String> {
         .collect()
 }
 
+fn automation_wait_for(input: &str) -> Result<(String, Duration), String> {
+    let mut parts = input.split_whitespace().collect::<Vec<_>>();
+    let mut timeout_ms = 5_000_u64;
+    if let Some(last) = parts.last().copied() {
+        if let Some(value) = last.strip_prefix("timeout=") {
+            timeout_ms = value
+                .parse::<u64>()
+                .map_err(|_| "wait-for timeout must be an integer".to_owned())?;
+            if timeout_ms > 30_000 {
+                return Err("wait-for timeout must be <= 30000ms".to_owned());
+            }
+            parts.pop();
+        }
+    }
+    let needle = parts.join(" ");
+    if needle.is_empty() {
+        return Err("wait-for requires screen text".to_owned());
+    }
+    Ok((needle, Duration::from_millis(timeout_ms)))
+}
+
 fn automation_mouse_coordinates(input: &str, count: usize) -> Result<[u16; 4], String> {
     if count != 2 && count != 4 {
         return Err("invalid automation mouse coordinate count".to_owned());
@@ -8484,6 +9745,37 @@ fn automation_mouse_coordinates(input: &str, count: usize) -> Result<[u16; 4], S
         values[1],
         values.get(2).copied().unwrap_or(values[0]),
         values.get(3).copied().unwrap_or(values[1]),
+    ])
+}
+
+fn automation_mouse_events(action: &str, input: &str) -> Result<Vec<MouseEvent>, String> {
+    let [column, row, _, _] = automation_mouse_coordinates(input, 2)?;
+    let kind = match action {
+        "hover" => {
+            return Ok(vec![MouseEvent {
+                kind: MouseEventKind::Moved,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            }])
+        }
+        "rclick" | "right_click" => MouseButton::Right,
+        "click" => MouseButton::Left,
+        _ => return Err(format!("unsupported automation mouse action: {action}")),
+    };
+    Ok(vec![
+        MouseEvent {
+            kind: MouseEventKind::Down(kind),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+        MouseEvent {
+            kind: MouseEventKind::Up(kind),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
     ])
 }
 
@@ -8608,11 +9900,93 @@ fn executable_available(executable: &str) -> bool {
     })
 }
 
+fn configured_agent_command(
+    settings: &Settings,
+    provider_name: &str,
+) -> (Vec<String>, Option<PathBuf>, bool) {
+    let (mut command, cwd, persistent) = settings
+        .agent
+        .providers
+        .get(provider_name)
+        .map(|provider| {
+            (
+                provider.command.clone(),
+                provider.cwd.clone(),
+                provider.persist,
+            )
+        })
+        .unwrap_or_else(|| {
+            (
+                settings.agent.command.clone(),
+                settings.agent.cwd.clone(),
+                settings.agent.persist,
+            )
+        });
+    if !persistent || !executable_available("tmux") {
+        return (command, cwd.map(PathBuf::from), false);
+    }
+    if command.is_empty() {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "sh".to_owned());
+        command = vec![shell, "-i".to_owned()];
+    }
+    let session_name = agent_tmux_session_name(provider_name, cwd.as_deref());
+    let mut wrapped = vec![
+        "tmux".to_owned(),
+        "new-session".to_owned(),
+        "-A".to_owned(),
+        "-s".to_owned(),
+        session_name,
+    ];
+    if let Some(cwd) = cwd.as_deref() {
+        wrapped.push("-c".to_owned());
+        wrapped.push(cwd.to_owned());
+    }
+    wrapped.push("--".to_owned());
+    wrapped.extend(command);
+    (wrapped, None, true)
+}
+
+fn agent_tmux_session_name(provider: &str, cwd: Option<&str>) -> String {
+    let mut name = String::from("mtide-agent-");
+    for value in [provider, cwd.unwrap_or("default")] {
+        for character in value.chars() {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                name.push(character);
+            } else {
+                name.push('_');
+            }
+            if name.len() >= 72 {
+                break;
+            }
+        }
+        if name.len() < 72 {
+            name.push('_');
+        }
+        if name.len() >= 72 {
+            break;
+        }
+    }
+    name.truncate(72);
+    name.trim_end_matches('_').to_owned()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct AgentSession {
+    #[serde(default = "agent_session_version")]
+    version: u8,
     provider: String,
     input: String,
     screen: Vec<String>,
+}
+
+const AGENT_SESSION_VERSION: u8 = 1;
+const AGENT_SESSION_MAX_FILE_BYTES: usize = 4 * 1024 * 1024;
+const AGENT_SESSION_MAX_INPUT_BYTES: usize = 64 * 1024;
+const AGENT_SESSION_MAX_LINES: usize = 2_000;
+const AGENT_SESSION_MAX_LINE_BYTES: usize = 16 * 1024;
+
+const fn agent_session_version() -> u8 {
+    AGENT_SESSION_VERSION
 }
 
 fn editor_diff_markers(base: &[String], current: &[String]) -> Vec<Option<char>> {
@@ -8658,6 +10032,7 @@ fn builtin_commands() -> Vec<(String, String)> {
         ("editor.gotoLine", "Go to Line"),
         ("lsp.documentSymbols", "Document Symbols"),
         ("lsp.workspaceSymbols", "Workspace Symbols (Find query)"),
+        ("lsp.restart", "Restart Language Server"),
         ("editor.goToMatchingBracket", "Go to Matching Bracket"),
         ("editor.joinLines", "Join Lines"),
         ("editor.sortLines", "Sort Lines"),
@@ -8705,16 +10080,55 @@ fn agent_session_path() -> Option<PathBuf> {
 
 fn load_agent_session(path: &Path) -> Option<AgentSession> {
     let contents = fs::read_to_string(path).ok()?;
-    serde_json::from_str(&contents).ok()
+    if contents.len() > AGENT_SESSION_MAX_FILE_BYTES {
+        return None;
+    }
+    let mut session: AgentSession = serde_json::from_str(&contents).ok()?;
+    if session.version != AGENT_SESSION_VERSION
+        || session.provider.is_empty()
+        || session.input.len() > AGENT_SESSION_MAX_INPUT_BYTES
+        || session.screen.len() > AGENT_SESSION_MAX_LINES
+        || session
+            .screen
+            .iter()
+            .any(|line| line.len() > AGENT_SESSION_MAX_LINE_BYTES)
+    {
+        return None;
+    }
+    session.input = session.input.replace('\0', "");
+    Some(session)
 }
 
 fn save_agent_session(path: &Path, session: &AgentSession) -> AppResult<()> {
+    if session.version != AGENT_SESSION_VERSION
+        || session.provider.is_empty()
+        || session.input.len() > AGENT_SESSION_MAX_INPUT_BYTES
+        || session.screen.len() > AGENT_SESSION_MAX_LINES
+        || session
+            .screen
+            .iter()
+            .any(|line| line.len() > AGENT_SESSION_MAX_LINE_BYTES)
+    {
+        return Err(crate::error::AppError::Workspace(
+            "agent session exceeds persistence limits".to_owned(),
+        ));
+    }
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     let contents = serde_json::to_string_pretty(session)
         .map_err(|error| crate::error::AppError::Workspace(error.to_string()))?;
-    fs::write(path, contents)?;
+    if contents.len() > AGENT_SESSION_MAX_FILE_BYTES {
+        return Err(crate::error::AppError::Workspace(
+            "agent session file exceeds persistence limits".to_owned(),
+        ));
+    }
+    let temporary = path.with_extension(format!("json.tmp-{}", std::process::id()));
+    fs::write(&temporary, contents)?;
+    if let Err(error) = fs::rename(&temporary, path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error.into());
+    }
     Ok(())
 }
 
@@ -8828,19 +10242,37 @@ fn completion_items(result: &serde_json::Value) -> Vec<LspCompletionItem> {
                 .iter()
                 .filter_map(|item| {
                     let label = item.get("label")?.as_str()?.to_owned();
-                    let edit_range = item
-                        .get("textEdit")
-                        .and_then(|edit| edit.get("range"))
-                        .and_then(|range| {
-                            let start = range.get("start")?;
-                            let end = range.get("end")?;
-                            Some(LspCompletionRange {
-                                start_line: start.get("line")?.as_u64()? as usize,
-                                start_character: start.get("character")?.as_u64()? as usize,
-                                end_line: end.get("line")?.as_u64()? as usize,
-                                end_character: end.get("character")?.as_u64()? as usize,
-                            })
-                        });
+                    let edit_range = item.get("textEdit").and_then(completion_text_edit_range);
+                    let additional_edits = item
+                        .get("additionalTextEdits")
+                        .and_then(serde_json::Value::as_array)
+                        .map(|edits| {
+                            edits
+                                .iter()
+                                .filter_map(|edit| {
+                                    Some(LspCompletionTextEdit {
+                                        range: completion_range(edit.get("range")?)?,
+                                        new_text: edit.get("newText")?.as_str()?.to_owned(),
+                                    })
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    let commit_characters = item
+                        .get("commitCharacters")
+                        .and_then(serde_json::Value::as_array)
+                        .map(|characters| {
+                            characters
+                                .iter()
+                                .filter_map(serde_json::Value::as_str)
+                                .filter_map(|value| {
+                                    let mut chars = value.chars();
+                                    let character = chars.next()?;
+                                    chars.next().is_none().then_some(character)
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
                     let insert_text = item
                         .get("insertText")
                         .and_then(serde_json::Value::as_str)
@@ -8851,15 +10283,130 @@ fn completion_items(result: &serde_json::Value) -> Vec<LspCompletionItem> {
                         })
                         .unwrap_or(&label)
                         .to_owned();
+                    let insert_text = if item
+                        .get("insertTextFormat")
+                        .and_then(|value| value.as_u64())
+                        == Some(2)
+                    {
+                        expand_lsp_snippet(&insert_text)
+                    } else {
+                        insert_text
+                    };
+                    let resolve_params = item.get("data").map(|_| item.clone());
                     Some(LspCompletionItem {
                         label,
                         insert_text,
                         edit_range,
+                        additional_edits,
+                        commit_characters,
+                        resolve_params,
                     })
                 })
                 .take(20)
                 .collect()
         })
+}
+
+fn completion_range(range: &serde_json::Value) -> Option<LspCompletionRange> {
+    let start = range.get("start")?;
+    let end = range.get("end")?;
+    Some(LspCompletionRange {
+        start_line: start.get("line")?.as_u64()? as usize,
+        start_character: start.get("character")?.as_u64()? as usize,
+        end_line: end.get("line")?.as_u64()? as usize,
+        end_character: end.get("character")?.as_u64()? as usize,
+    })
+}
+
+fn completion_text_edit_range(edit: &serde_json::Value) -> Option<LspCompletionRange> {
+    edit.get("range")
+        .or_else(|| edit.get("replace"))
+        .or_else(|| edit.get("insert"))
+        .and_then(completion_range)
+}
+
+fn merge_completion_item(
+    original: &serde_json::Value,
+    resolved: &serde_json::Value,
+) -> serde_json::Value {
+    let (Some(original), Some(resolved)) = (original.as_object(), resolved.as_object()) else {
+        return resolved.clone();
+    };
+    let mut merged = original.clone();
+    for (key, value) in resolved {
+        merged.insert(key.clone(), value.clone());
+    }
+    serde_json::Value::Object(merged)
+}
+
+fn expand_lsp_snippet(snippet: &str) -> String {
+    let chars = snippet.chars().collect::<Vec<_>>();
+    let mut output = String::with_capacity(snippet.len());
+    let mut index = 0;
+    while index < chars.len() {
+        if chars[index] == '\\' {
+            if let Some(next) = chars.get(index + 1) {
+                output.push(*next);
+                index += 2;
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+        if chars[index] != '$' {
+            output.push(chars[index]);
+            index += 1;
+            continue;
+        }
+        if chars.get(index + 1) == Some(&'{') {
+            let Some(close) = chars[index + 2..]
+                .iter()
+                .position(|character| *character == '}')
+            else {
+                output.push('$');
+                index += 1;
+                continue;
+            };
+            let close = index + 2 + close;
+            let body = chars[index + 2..close].iter().collect::<String>();
+            let digit_end = body
+                .char_indices()
+                .find_map(|(offset, character)| (!character.is_ascii_digit()).then_some(offset))
+                .unwrap_or(body.len());
+            if digit_end > 0 {
+                let default = &body[digit_end..];
+                if let Some(default) = default.strip_prefix(':') {
+                    output.push_str(default);
+                } else if let Some(choices) = default.strip_prefix('|') {
+                    if let Some(first) = choices
+                        .split('|')
+                        .next()
+                        .and_then(|value| value.split(',').next())
+                    {
+                        output.push_str(first);
+                    }
+                }
+            }
+            index = close + 1;
+            continue;
+        }
+        if chars
+            .get(index + 1)
+            .is_some_and(|character| character.is_ascii_digit())
+        {
+            index += 2;
+            while chars
+                .get(index)
+                .is_some_and(|character| character.is_ascii_digit())
+            {
+                index += 1;
+            }
+            continue;
+        }
+        output.push('$');
+        index += 1;
+    }
+    output
 }
 
 fn hover_text(result: &serde_json::Value) -> String {
@@ -9068,21 +10615,48 @@ fn workspace_edit_resource_conflicts(edit: &serde_json::Value) -> Vec<String> {
     };
     let mut conflicts = Vec::new();
     for change in changes {
-        let kind = change.get("kind").and_then(serde_json::Value::as_str);
-        let path = match kind {
-            Some("create") | Some("rename") => change
-                .get("uri")
-                .or_else(|| change.get("newUri"))
-                .and_then(serde_json::Value::as_str)
-                .and_then(uri_to_path),
-            _ => None,
-        };
-        let Some(path) = path else { continue };
-        if path.exists() {
-            conflicts.push(format!(
-                "resource target already exists: {}",
-                path.display()
-            ));
+        let options = change.get("options");
+        let overwrite = options
+            .and_then(|value| value.get("overwrite"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        match change.get("kind").and_then(serde_json::Value::as_str) {
+            Some("create") | Some("rename") => {
+                let target = change
+                    .get("uri")
+                    .or_else(|| change.get("newUri"))
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(uri_to_path);
+                if let Some(path) = target.filter(|path| path.exists() && !overwrite) {
+                    conflicts.push(format!(
+                        "resource target already exists: {}",
+                        path.display()
+                    ));
+                }
+                if change.get("kind").and_then(serde_json::Value::as_str) == Some("rename") {
+                    let source = change
+                        .get("oldUri")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(uri_to_path);
+                    if let Some(path) = source.filter(|path| !path.exists()) {
+                        conflicts.push(format!("rename source does not exist: {}", path.display()));
+                    }
+                }
+            }
+            Some("delete") => {
+                let ignore_if_missing = options
+                    .and_then(|value| value.get("ignoreIfNotExists"))
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                let path = change
+                    .get("uri")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(uri_to_path);
+                if let Some(path) = path.filter(|path| !path.exists() && !ignore_if_missing) {
+                    conflicts.push(format!("delete target does not exist: {}", path.display()));
+                }
+            }
+            _ => {}
         }
     }
     conflicts
@@ -9287,6 +10861,39 @@ fn parse_github_pull_request_url(value: &str) -> Option<PullRequestTarget> {
         repository: format!("https://github.com/{owner}/{repository}.git"),
         number,
     })
+}
+
+fn editor_link_at(line: &str, column: usize) -> Option<String> {
+    let byte_column = line
+        .char_indices()
+        .nth(column)
+        .map_or(line.len(), |(byte, _)| byte);
+    let mut search_from = 0;
+    for token in line.split_whitespace() {
+        let Some(relative_start) = line[search_from..].find(token) else {
+            break;
+        };
+        let start = search_from + relative_start;
+        let end = start + token.len();
+        search_from = end;
+        if byte_column < start || byte_column > end {
+            continue;
+        }
+        let url = token.trim_matches(|character: char| {
+            matches!(
+                character,
+                '<' | '>' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | '.' | ';' | ':' | '!' | '?'
+            )
+        });
+        let url = url
+            .split(['，', '。', '；', '：', '！', '？', '、'])
+            .next()
+            .unwrap_or_default();
+        if url.starts_with("https://") || url.starts_with("http://") {
+            return Some(url.to_owned());
+        }
+    }
+    None
 }
 
 #[derive(Debug, Deserialize)]
@@ -9553,8 +11160,8 @@ fn discover_plugin_packages(workspace_roots: &[PathBuf]) -> Vec<PluginPackage> {
     let mut packages = Vec::new();
     let mut names = BTreeSet::new();
     let mut plugin_directories = Vec::new();
-    if let Some(config_directory) = std::env::var_os("MTIDE_CONFIG_DIR")
-        .or_else(|| std::env::var_os("TTT_CONFIG_DIR"))
+    if let Some(config_directory) =
+        std::env::var_os("MTIDE_CONFIG_DIR").or_else(|| std::env::var_os("TTT_CONFIG_DIR"))
     {
         plugin_directories.push(PathBuf::from(config_directory).join("plugins"));
     } else {
@@ -9935,6 +11542,17 @@ mod tests {
     }
 
     #[test]
+    fn automation_wait_for_parses_text_and_bounded_timeout() {
+        let (needle, timeout) = automation_wait_for("ready state timeout=1200").expect("wait-for");
+        assert_eq!(needle, "ready state");
+        assert_eq!(timeout, Duration::from_millis(1200));
+        let (_, default_timeout) = automation_wait_for("ready").expect("default timeout");
+        assert_eq!(default_timeout, Duration::from_secs(5));
+        assert!(automation_wait_for("ready timeout=30001").is_err());
+        assert!(automation_wait_for("timeout=10").is_err());
+    }
+
+    #[test]
     fn collapses_selected_plugin_diff_hunk() {
         let text = "diff --git a/a b/a\n@@ -1 +1 @@\n-old\n+new\n@@ -4 +4 @@\n-old2\n+new2";
         let mut collapsed = BTreeSet::new();
@@ -10004,6 +11622,27 @@ mod tests {
     }
 
     #[test]
+    fn automation_mouse_events_cover_click_right_click_and_hover() {
+        let click = automation_mouse_events("click", "4 8").expect("click");
+        assert!(matches!(
+            click[0].kind,
+            MouseEventKind::Down(MouseButton::Left)
+        ));
+        assert!(matches!(
+            click[1].kind,
+            MouseEventKind::Up(MouseButton::Left)
+        ));
+        let right = automation_mouse_events("rclick", "4 8").expect("right click");
+        assert!(matches!(
+            right[0].kind,
+            MouseEventKind::Down(MouseButton::Right)
+        ));
+        let hover = automation_mouse_events("hover", "4 8").expect("hover");
+        assert!(matches!(hover[0].kind, MouseEventKind::Moved));
+        assert!(automation_mouse_events("unknown", "4 8").is_err());
+    }
+
+    #[test]
     fn automation_scroll_coordinates_validate_signed_bounded_count() {
         assert_eq!(
             automation_scroll_coordinates("4 8 -12").expect("scroll coordinates"),
@@ -10027,6 +11666,50 @@ mod tests {
             .expect("undo");
         assert_eq!(app.file_lines()[0], "# mtide");
         assert_eq!(app.file_lines()[1], "");
+    }
+
+    #[test]
+    fn alt_shift_adds_repeated_cursors_above_and_below() {
+        let mut app = App::new(&[]).expect("welcome app");
+        app.buffers[0] = Buffer::new(
+            vec!["zero".into(), "one".into(), "two".into(), "three".into()],
+            None,
+        );
+        app.buffer_mut().set_cursor(1, 2);
+        app.handle_key(key(KeyCode::Down, KeyModifiers::ALT | KeyModifiers::SHIFT))
+            .expect("add cursor below");
+        app.handle_key(key(KeyCode::Down, KeyModifiers::ALT | KeyModifiers::SHIFT))
+            .expect("extend cursor stack below");
+        assert_eq!(
+            app.cursor_positions(),
+            vec![
+                Position { line: 1, column: 2 },
+                Position { line: 2, column: 2 },
+                Position { line: 3, column: 2 },
+            ]
+        );
+        app.handle_key(key(KeyCode::Up, KeyModifiers::ALT | KeyModifiers::SHIFT))
+            .expect("add cursor above");
+        assert_eq!(
+            app.cursor_positions(),
+            vec![
+                Position { line: 1, column: 2 },
+                Position { line: 0, column: 2 },
+                Position { line: 2, column: 2 },
+                Position { line: 3, column: 2 },
+            ]
+        );
+    }
+
+    #[test]
+    fn alt_shift_keeps_moving_selected_lines() {
+        let mut app = App::new(&[]).expect("welcome app");
+        app.buffers[0] = Buffer::new(vec!["one".into(), "two".into()], None);
+        app.selection_anchor = Some(Position { line: 1, column: 0 });
+        app.buffer_mut().set_cursor(1, 3);
+        app.handle_key(key(KeyCode::Up, KeyModifiers::ALT | KeyModifiers::SHIFT))
+            .expect("move selected line");
+        assert_eq!(app.file_lines(), &["two", "one"]);
     }
 
     #[test]
@@ -10352,6 +12035,7 @@ mod tests {
                 cwd: None,
                 install: Some("echo install".to_owned()),
                 tools: Vec::new(),
+                persist: false,
             },
         );
         app.agent_provider = "test".to_owned();
@@ -10366,6 +12050,21 @@ mod tests {
         let mut app = App::new(&[]).expect("welcome app");
         app.open_terminal_link("file:///etc/passwd");
         assert!(app.status_message().contains("only http(s)"));
+    }
+
+    #[test]
+    fn editor_link_lookup_handles_unicode_columns_and_punctuation() {
+        let line = "说明 https://example.com/path?q=1，继续";
+        let column = line.chars().position(|character| character == 'e').unwrap();
+        assert_eq!(
+            editor_link_at(line, column).as_deref(),
+            Some("https://example.com/path?q=1")
+        );
+        assert_eq!(editor_link_at(line, 0), None);
+        assert_eq!(
+            editor_link_at("http://a.test", 13),
+            Some("http://a.test".into())
+        );
     }
 
     #[test]
@@ -10425,6 +12124,34 @@ mod tests {
     }
 
     #[test]
+    fn replace_mode_can_refocus_from_editor_without_reopening_search() {
+        let mut app = App::new(&[]).expect("welcome app");
+        app.sidebar_tab = SidebarTab::Search;
+        app.replace_mode = true;
+        app.search_query = "needle".into();
+        app.replace_query = "done".into();
+        app.focus = Focus::Editor;
+        app.handle_key(key(KeyCode::Char('r'), KeyModifiers::CONTROL))
+            .expect("refocus replace bar");
+        assert_eq!(app.focus(), Focus::Search);
+        assert!(app.replace_mode());
+        assert_eq!(app.search_query(), "needle");
+        assert_eq!(app.replace_query(), "done");
+    }
+
+    #[test]
+    fn escape_from_editor_closes_replace_mode() {
+        let mut app = App::new(&[]).expect("welcome app");
+        app.sidebar_tab = SidebarTab::Search;
+        app.replace_mode = true;
+        app.focus = Focus::Editor;
+        app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("close replace bar");
+        assert_eq!(app.focus(), Focus::Editor);
+        assert!(!app.replace_mode());
+    }
+
+    #[test]
     fn editor_mouse_scroll_viewport_is_clamped_and_shift_scrolls_horizontally() {
         let mut app = App::new(&[]).expect("app");
         app.buffers[0] = Buffer::new((0..20).map(|index| format!("line {index}")).collect(), None);
@@ -10455,6 +12182,117 @@ mod tests {
     }
 
     #[test]
+    fn search_results_follow_unsaved_buffer_when_switching_tabs() {
+        let root =
+            std::env::temp_dir().join(format!("mtide-live-search-tabs-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("directory");
+        let first = root.join("first.rs");
+        let second = root.join("second.rs");
+        std::fs::write(&first, "needle").expect("first file");
+        std::fs::write(&second, "plain").expect("second file");
+        let mut app = App::new(&[first.to_string_lossy().into_owned()]).expect("app");
+        app.search_query = "needle".to_owned();
+        app.refresh_search();
+        assert_eq!(app.search_results().len(), 1);
+        app.open_buffer(Buffer::open(&second).expect("second buffer"));
+        app.handle_paste(" needle").expect("edit second buffer");
+        assert_eq!(app.search_results().len(), 2);
+        app.switch_tab(-1);
+        assert_eq!(app.search_results().len(), 2);
+        app.switch_tab(1);
+        assert_eq!(app.search_results().len(), 2);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn closing_active_tab_notifies_plugin_of_new_active_tab() {
+        let root = std::env::temp_dir().join(format!("mtide-tab-events-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let workspace = root.join("workspace");
+        let plugin_root = root.join("plugin");
+        std::fs::create_dir_all(&workspace).expect("workspace directory");
+        std::fs::create_dir_all(&plugin_root).expect("plugin directory");
+        let first = workspace.join("first.rs");
+        let second = workspace.join("second.rs");
+        std::fs::write(&first, "first").expect("first");
+        std::fs::write(&second, "second").expect("second");
+        std::fs::write(
+            plugin_root.join("plugin.ttt.json"),
+            r#"{"name":"tab-events","entry":"init.lua","api":2,"permissions":{"events.editor":true,"panel.editor":true}}"#,
+        )
+        .expect("manifest");
+        std::fs::write(
+            plugin_root.join("init.lua"),
+            r#"local ttt = require("ttt")
+local events = require("ttt.events")
+events.on("tab.change", function(path) ttt.log("active:" .. path) end)
+events.on("tab.close", function(path) ttt.log("close:" .. path) end)
+ttt.open_tab({id = "custom", title = "Custom", render = function(panel) panel:label("custom") end})
+"#,
+        )
+        .expect("entry");
+        let mut app = App::new(&[first.to_string_lossy().into_owned()]).expect("app");
+        app.plugin_runtimes.push(
+            PluginRuntime::load(&PluginPackage::load(&plugin_root).expect("package"))
+                .expect("runtime"),
+        );
+        let plugin_index = app.plugin_runtimes.len() - 1;
+        app.open_buffer(Buffer::open(&second).expect("second buffer"));
+        app.close_active_tab();
+        let close = format!("[info] close:{}", second.display());
+        let active = format!("[info] active:{}", first.display());
+        assert!(app.plugin_runtimes.iter().any(|runtime| {
+            let logs = runtime.logs();
+            let close_index = logs.iter().position(|line| line == &close);
+            let active_index = logs.iter().position(|line| line == &active);
+            close_index.is_some_and(|index| active_index.is_some_and(|active| index < active))
+        }));
+        app.plugin_custom_tab = Some((plugin_index, "custom".to_owned()));
+        app.plugin_file_view = Some(("Custom".to_owned(), "custom".to_owned()));
+        app.close_plugin_file_view();
+        let logs = app.plugin_runtimes[plugin_index].logs();
+        let close = format!("[info] close:{}", first.display());
+        let active = format!("[info] active:{}", first.display());
+        let close_index = logs
+            .iter()
+            .rposition(|line| line == &close)
+            .expect("custom close");
+        assert!(logs
+            .iter()
+            .enumerate()
+            .skip(close_index + 1)
+            .any(|(_, line)| line == &active));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn search_enter_navigates_existing_unsaved_tab_in_memory() {
+        let root =
+            std::env::temp_dir().join(format!("mtide-search-open-tab-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("directory");
+        let first = root.join("first.rs");
+        let second = root.join("second.rs");
+        std::fs::write(&first, "needle").expect("first file");
+        std::fs::write(&second, "plain").expect("second file");
+        let mut app = App::new(&[first.to_string_lossy().into_owned()]).expect("app");
+        app.handle_paste("x").expect("dirty first buffer");
+        app.open_buffer(Buffer::open(&second).expect("second buffer"));
+        app.search_query = "needle".to_owned();
+        app.refresh_search();
+        let index = app
+            .search_results
+            .iter()
+            .position(|result| result.path == first)
+            .expect("first result");
+        app.search_index = index;
+        app.handle_search_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.buffer().path(), Some(first.as_path()));
+        assert_eq!(app.cursor().column, 1);
+        assert_eq!(app.file_lines(), &vec!["xneedle".to_owned()]);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn bracketed_paste_routes_to_editor_and_search_inputs() {
         let mut app = App::new(&[]).expect("welcome app");
         app.handle_paste("你好\nworld").expect("editor paste");
@@ -10480,6 +12318,188 @@ mod tests {
             "initial pasted\ntext"
         );
         assert_eq!(app.file_lines()[0], "# mtide");
+    }
+
+    #[test]
+    fn quick_open_discovers_workspace_files_with_fuzzy_filtering() {
+        let root = std::env::temp_dir().join(format!("mtide-quick-open-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).expect("src");
+        std::fs::create_dir_all(root.join(".hidden")).expect("hidden");
+        std::fs::create_dir_all(root.join("target")).expect("target");
+        std::fs::write(root.join(".gitignore"), "ignored.rs\n").expect("gitignore");
+        std::fs::write(root.join("src/main.rs"), "fn main() {}").expect("main");
+        std::fs::write(root.join(".hidden/secret.rs"), "secret").expect("secret");
+        std::fs::write(root.join("target/generated.rs"), "generated").expect("generated");
+        std::fs::write(root.join("ignored.rs"), "ignored").expect("ignored");
+        let _ = std::process::Command::new("git")
+            .args(["-C", &root.to_string_lossy(), "init", "-q"])
+            .status();
+        let mut app = App::new(&[root.to_string_lossy().into_owned()]).expect("app");
+        app.open_quick_open();
+        assert!(app
+            .quick_open_results()
+            .iter()
+            .any(|path| path.ends_with("src/main.rs")));
+        assert!(!app
+            .quick_open_results()
+            .iter()
+            .any(|path| path.to_string_lossy().contains(".hidden")));
+        assert!(!app
+            .quick_open_results()
+            .iter()
+            .any(|path| path.to_string_lossy().contains("target")));
+        assert!(!app
+            .quick_open_results()
+            .iter()
+            .any(|path| path.ends_with("ignored.rs")));
+        assert!(!app
+            .explorer_paths()
+            .iter()
+            .any(|path| path.to_string_lossy().contains(".hidden")));
+        assert!(!app
+            .explorer_paths()
+            .iter()
+            .any(|path| path.ends_with("ignored.rs")));
+        app.settings.quick_open.show_hidden = true;
+        app.settings.quick_open.show_git_ignored = true;
+        app.refresh_quick_open_results();
+        assert!(app
+            .quick_open_results()
+            .iter()
+            .any(|path| path.ends_with(".hidden/secret.rs")));
+        assert!(app
+            .quick_open_results()
+            .iter()
+            .any(|path| path.ends_with("ignored.rs")));
+        app.settings.explorer.show_hidden = true;
+        app.settings.explorer.show_git_ignored = true;
+        app.refresh_explorer();
+        assert!(app
+            .explorer_paths()
+            .iter()
+            .any(|path| path.to_string_lossy().contains(".hidden")));
+        assert!(app
+            .explorer_paths()
+            .iter()
+            .any(|path| path.ends_with("ignored.rs")));
+        for character in "main".chars() {
+            app.handle_quick_open_key(key(KeyCode::Char(character), KeyModifiers::NONE))
+                .expect("filter");
+        }
+        assert_eq!(app.quick_open_results().len(), 1);
+        app.handle_quick_open_key(key(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("open");
+        assert_eq!(
+            app.buffer().path(),
+            Some(root.join("src/main.rs").as_path())
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn quick_open_gt_switches_to_command_mode() {
+        let mut app = App::new(&[]).expect("welcome app");
+        assert!(app.sidebar_visible());
+        app.open_quick_open();
+        app.handle_quick_open_key(key(KeyCode::Char('>'), KeyModifiers::NONE))
+            .expect("command mode");
+        for character in "view.toggleSidebar".chars() {
+            app.handle_quick_open_key(key(KeyCode::Char(character), KeyModifiers::NONE))
+                .expect("command query");
+        }
+        assert_eq!(app.quick_open_title(), "Command Palette");
+        assert_eq!(
+            app.command_palette_items_for_quick_open(),
+            vec![("view.toggleSidebar".into(), "Toggle Sidebar".into())]
+        );
+        app.handle_quick_open_key(key(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("execute command");
+        assert!(!app.sidebar_visible());
+        assert!(!app.quick_open_open());
+    }
+
+    #[test]
+    fn quick_open_question_mark_browses_keyboard_help() {
+        let mut app = App::new(&[]).expect("welcome app");
+        app.open_quick_open();
+        app.handle_quick_open_key(key(KeyCode::Char('?'), KeyModifiers::NONE))
+            .expect("help mode");
+        for character in "terminal".chars() {
+            app.handle_quick_open_key(key(KeyCode::Char(character), KeyModifiers::NONE))
+                .expect("help query");
+        }
+        assert_eq!(app.quick_open_title(), "Keyboard Help");
+        assert_eq!(
+            app.quick_open_help_items(),
+            vec![
+                ("Ctrl-K T".into(), "Open a new terminal".into()),
+                ("Ctrl-T".into(), "Toggle terminal".into()),
+                ("Alt-T".into(), "Toggle fullscreen terminal".into()),
+            ]
+        );
+        app.handle_quick_open_key(key(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("close help");
+        assert!(!app.quick_open_open());
+    }
+
+    #[test]
+    fn ctrl_k_p_opens_quick_open_and_other_chords_focus_sidebar() {
+        let mut app = App::new(&[]).expect("welcome app");
+        app.handle_key(key(KeyCode::Char('k'), KeyModifiers::CONTROL))
+            .expect("start chord");
+        app.handle_key(key(KeyCode::Char('p'), KeyModifiers::NONE))
+            .expect("open quick open");
+        assert!(app.quick_open_open());
+        app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("close quick open");
+        app.handle_key(key(KeyCode::Char('k'), KeyModifiers::CONTROL))
+            .expect("start explorer chord");
+        app.handle_key(key(KeyCode::Char('e'), KeyModifiers::NONE))
+            .expect("focus explorer");
+        assert_eq!(app.focus(), Focus::Explorer);
+    }
+
+    #[test]
+    fn ctrl_k_t_opens_a_new_terminal_tab() {
+        let mut app = App::new(&[]).expect("welcome app");
+        let initial = app.terminals.len();
+        app.handle_key(key(KeyCode::Char('k'), KeyModifiers::CONTROL))
+            .expect("start terminal chord");
+        app.handle_key(key(KeyCode::Char('t'), KeyModifiers::NONE))
+            .expect("open terminal");
+        assert_eq!(app.terminals.len(), initial + 1);
+        assert_eq!(app.active_terminal, initial);
+        assert_eq!(app.focus(), Focus::Terminal);
+        assert_eq!(app.bottom_tab, BottomTab::Terminal);
+    }
+
+    #[test]
+    fn terminal_selection_copies_visible_rows() {
+        let mut app = App::new(&[]).expect("welcome app");
+        let output = (0..24)
+            .map(|line| format!("line{line}"))
+            .collect::<Vec<_>>()
+            .join("\r\n");
+        app.terminals[0].feed_output(output.as_bytes());
+        let lines = app.terminals[0].screen_lines();
+        let base = lines.len().saturating_sub(3);
+        let first = lines
+            .iter()
+            .position(|line| line.contains("line21"))
+            .expect("first line");
+        let second = lines
+            .iter()
+            .position(|line| line.contains("line22"))
+            .expect("second line");
+        app.begin_terminal_selection(0, (first - base) as u16);
+        app.update_terminal_selection(80, (second - base) as u16);
+        app.finish_terminal_selection();
+        let selected = app.terminal_selection_text().expect("selection");
+        assert!(selected.contains("line21"));
+        assert!(selected.contains("line22"));
+        app.copy_terminal_selection();
+        assert_eq!(app.clipboard, selected);
     }
 
     #[test]
@@ -10653,6 +12673,45 @@ mod tests {
     }
 
     #[test]
+    fn settings_overlay_toggles_workspace_visibility_values() {
+        let mut app = App::new(&[]).expect("welcome app");
+        app.open_settings();
+        app.settings_index = 11;
+        app.handle_settings_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        app.settings_index = 12;
+        app.handle_settings_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        app.settings_index = 13;
+        app.handle_settings_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        app.settings_index = 14;
+        app.handle_settings_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        app.settings_index = 15;
+        app.handle_settings_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.settings.quick_open.show_hidden);
+        assert!(app.settings.quick_open.show_git_ignored);
+        assert!(app.settings.explorer.show_hidden);
+        assert!(app.settings.explorer.show_git_ignored);
+        assert!(app.settings.explorer.auto_reveal);
+        let rows = app.settings_rows();
+        assert!(rows[11].1 && rows[12].1 && rows[13].1 && rows[14].1 && rows[15].1);
+    }
+
+    #[test]
+    fn explorer_auto_reveal_expands_and_selects_active_file() {
+        let root = std::env::temp_dir().join(format!("mtide-auto-reveal-{}", std::process::id()));
+        let file = root.join("src").join("nested").join("main.rs");
+        std::fs::create_dir_all(file.parent().expect("parent")).expect("directories");
+        std::fs::write(&file, "fn main() {}\n").expect("file");
+        let mut app = App::new(&[root.to_string_lossy().into_owned()]).expect("app");
+        app.settings.explorer.auto_reveal = true;
+        app.open_buffer(Buffer::open(&file).expect("buffer"));
+        assert!(app.explorer_expanded(&root));
+        assert!(app.explorer_expanded(&root.join("src")));
+        assert!(app.explorer_expanded(&root.join("src/nested")));
+        assert_eq!(app.selected_explorer_path(), Some(file.clone()));
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
     fn selection_tab_indents_and_shift_tab_outdents_as_one_edit() {
         let mut app = App::new(&[]).expect("welcome app");
         app.buffers[0] = Buffer::new(vec!["one".into(), "two".into()], None);
@@ -10740,6 +12799,34 @@ mod tests {
             .expect("rename file");
         assert!(root.join("renamed.txt").is_file());
 
+        app.explorer_index = app
+            .explorer_paths
+            .iter()
+            .position(|path| path == &source)
+            .expect("source entry");
+        app.language_overrides
+            .insert(path_key(&source), "rust".to_owned());
+        app.handle_key(key(KeyCode::Char('r'), KeyModifiers::NONE))
+            .expect("rename open file mode");
+        for _ in "source.rs".chars() {
+            app.handle_key(key(KeyCode::Backspace, KeyModifiers::NONE))
+                .expect("clear open file name");
+        }
+        for character in "moved.rs".chars() {
+            app.handle_key(key(KeyCode::Char(character), KeyModifiers::NONE))
+                .expect("new open file name");
+        }
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("rename open file");
+        assert_eq!(app.buffer().path(), Some(root.join("moved.rs").as_path()));
+        assert!(root.join("moved.rs").is_file());
+        assert_eq!(
+            app.language_overrides
+                .get(&path_key(&root.join("moved.rs"))),
+            Some(&"rust".to_owned())
+        );
+        assert!(!app.language_overrides.contains_key(&path_key(&source)));
+
         app.handle_key(key(KeyCode::Char('N'), KeyModifiers::SHIFT))
             .expect("new directory mode");
         for character in "empty".chars() {
@@ -10798,6 +12885,7 @@ mod tests {
         let mut app = App::new(&[]).expect("app");
         app.buffers[0] = Buffer::new(vec!["a".into(), "b".into(), "c".into()], None);
         app.buffer_mut().set_cursor(1, 0);
+        app.selection_anchor = Some(Position { line: 1, column: 0 });
         app.handle_key(key(KeyCode::Up, KeyModifiers::ALT | KeyModifiers::SHIFT))
             .expect("move line");
         assert_eq!(app.file_lines(), &["b", "a", "c"]);
@@ -11107,6 +13195,24 @@ mod tests {
     }
 
     #[test]
+    fn explorer_git_status_resolves_paths_relative_to_search_root() {
+        let root =
+            std::env::temp_dir().join(format!("mtide-explorer-status-{}", std::process::id()));
+        let file = root.join("src").join("main.rs");
+        std::fs::create_dir_all(file.parent().expect("parent")).expect("directories");
+        std::fs::write(&file, "fn main() {}\n").expect("file");
+        let mut app = App::new(&[root.to_string_lossy().into_owned()]).expect("app");
+        app.changes = vec![GitChange {
+            index: ' ',
+            worktree: 'M',
+            path: "src/main.rs".into(),
+        }];
+        assert_eq!(app.explorer_git_status(&file), Some((' ', 'M')));
+        assert_eq!(app.explorer_git_status(&root.join("missing.rs")), None);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
     fn extracts_completion_labels_and_hover_text() {
         let result = serde_json::json!({
             "items": [
@@ -11122,6 +13228,9 @@ mod tests {
                     label: "alpha".into(),
                     insert_text: "alpha()".into(),
                     edit_range: None,
+                    additional_edits: Vec::new(),
+                    commit_characters: Vec::new(),
+                    resolve_params: None,
                 },
                 LspCompletionItem {
                     label: "beta".into(),
@@ -11132,10 +13241,121 @@ mod tests {
                         end_line: 0,
                         end_character: 3,
                     }),
+                    additional_edits: Vec::new(),
+                    commit_characters: Vec::new(),
+                    resolve_params: None,
                 },
             ]
         );
         assert_eq!(hover_text(&result), "fn alpha()");
+    }
+
+    #[test]
+    fn preserves_completion_item_data_for_resolve_request() {
+        let result = serde_json::json!({
+            "items": [{
+                "label": "detail",
+                "data": {"source": "language-server", "id": 7}
+            }]
+        });
+        let items = completion_items(&result);
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0].resolve_params,
+            Some(serde_json::json!({
+                "label": "detail",
+                "data": {"source": "language-server", "id": 7}
+            }))
+        );
+    }
+
+    #[test]
+    fn parses_insert_replace_completion_edit_using_replace_range() {
+        let result = serde_json::json!({
+            "items": [{
+                "label": "completion",
+                "textEdit": {
+                    "newText": "completion",
+                    "insert": {"start": {"line": 0, "character": 1}, "end": {"line": 0, "character": 3}},
+                    "replace": {"start": {"line": 0, "character": 1}, "end": {"line": 0, "character": 5}}
+                }
+            }]
+        });
+        let items = completion_items(&result);
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0].edit_range,
+            Some(LspCompletionRange {
+                start_line: 0,
+                start_character: 1,
+                end_line: 0,
+                end_character: 5,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_single_character_completion_commit_characters() {
+        let items = completion_items(&serde_json::json!({
+            "items": [{"label": "method", "commitCharacters": [".", "(", ".."]}]
+        }));
+        assert_eq!(items[0].commit_characters, vec!['.', '(']);
+    }
+
+    #[test]
+    fn expands_lsp_snippets_without_leaking_tabstops() {
+        assert_eq!(
+            expand_lsp_snippet("fn ${1:name}($2) { $0 }"),
+            "fn name() {  }"
+        );
+        assert_eq!(expand_lsp_snippet("${10:value} $10"), "value ");
+        assert_eq!(expand_lsp_snippet("${1|one,two|}"), "one");
+        assert_eq!(expand_lsp_snippet(r#"\${1:literal}"#), "${1:literal}");
+    }
+
+    #[test]
+    fn merges_completion_resolve_details_without_losing_original_edit() {
+        let original = serde_json::json!({
+            "label": "item",
+            "insertText": "item()",
+            "textEdit": {
+                "newText": "item()",
+                "range": {"start": {"line": 0, "character": 1}, "end": {"line": 0, "character": 4}}
+            },
+            "data": {"id": 1}
+        });
+        let merged =
+            merge_completion_item(&original, &serde_json::json!({"documentation": "detail"}));
+        assert_eq!(merged["documentation"], "detail");
+        assert_eq!(merged["textEdit"], original["textEdit"]);
+        assert_eq!(merged["data"], original["data"]);
+    }
+
+    #[test]
+    fn completion_applies_additional_text_edits_from_back_to_front() {
+        let mut app = App::new_with_stdin(&[], Some("abc\nuse old;\n")).expect("app");
+        app.apply_completion_item(&LspCompletionItem {
+            label: "value".into(),
+            insert_text: "value".into(),
+            edit_range: Some(LspCompletionRange {
+                start_line: 0,
+                start_character: 3,
+                end_line: 0,
+                end_character: 3,
+            }),
+            additional_edits: vec![LspCompletionTextEdit {
+                range: LspCompletionRange {
+                    start_line: 1,
+                    start_character: 4,
+                    end_line: 1,
+                    end_character: 7,
+                },
+                new_text: "new".into(),
+            }],
+            commit_characters: Vec::new(),
+            resolve_params: None,
+        });
+        assert_eq!(app.file_lines(), vec!["abcvalue", "use new;", ""]);
     }
 
     #[test]
@@ -11150,6 +13370,9 @@ mod tests {
                 end_line: 0,
                 end_character: 3,
             }),
+            additional_edits: Vec::new(),
+            commit_characters: Vec::new(),
+            resolve_params: None,
         });
         assert_eq!(app.file_lines(), vec!["你X"]);
     }
@@ -11321,6 +13544,23 @@ mod tests {
     }
 
     #[test]
+    fn resource_conflict_preview_respects_overwrite_and_missing_sources() {
+        let missing = format!("/tmp/mtide-missing-rename-source-{}", std::process::id());
+        let summary = workspace_edit_summary(&json!({
+            "documentChanges": [
+                {"kind": "create", "uri": "file:///tmp", "options": {"overwrite": true}},
+                {"kind": "rename", "oldUri": format!("file://{missing}"), "newUri": "file:///tmp", "options": {"overwrite": true}}
+            ]
+        }));
+        assert_eq!(
+            summary,
+            vec![format!(
+                "! CONFLICT  rename source does not exist: {missing}"
+            )]
+        );
+    }
+
+    #[test]
     fn rejects_overlapping_workspace_edits_before_mutating() {
         let mut app = App::new(&[]).expect("welcome app");
         app.buffers[0] = Buffer::new(vec!["abcdef".into()], None);
@@ -11380,6 +13620,62 @@ mod tests {
         assert!(!source.exists());
         assert!(renamed.is_file());
         assert!(!created.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn lsp_rename_file_migrates_the_active_buffer_path() {
+        let root =
+            std::env::temp_dir().join(format!("mtide-lsp-active-rename-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("directory");
+        let source = root.join("source.rs");
+        let renamed = root.join("renamed.rs");
+        std::fs::write(&source, "fn main() {}\n").expect("source");
+        let mut app = App::new(&[source.to_string_lossy().into_owned()]).expect("app");
+        let current_uri = format!("file://{}", source.display());
+        let edit = json!({
+            "documentChanges": [{
+                "kind": "rename",
+                "oldUri": current_uri,
+                "newUri": format!("file://{}", renamed.display())
+            }]
+        });
+        assert_eq!(
+            app.apply_workspace_edit(&format!("file://{}", source.display()), &edit)
+                .expect("rename active resource"),
+            1
+        );
+        assert_eq!(app.buffer().path(), Some(renamed.as_path()));
+        assert!(renamed.is_file());
+        assert!(!source.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn lsp_delete_file_marks_active_buffer_deleted_without_resyncing_old_uri() {
+        let root =
+            std::env::temp_dir().join(format!("mtide-lsp-active-delete-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("directory");
+        let source = root.join("source.rs");
+        std::fs::write(&source, "fn main() {}\n").expect("source");
+        let mut app = App::new(&[source.to_string_lossy().into_owned()]).expect("app");
+        let current_uri = format!("file://{}", source.display());
+        let edit = json!({
+            "documentChanges": [{
+                "kind": "delete",
+                "uri": current_uri
+            }]
+        });
+        assert_eq!(
+            app.apply_workspace_edit(&format!("file://{}", source.display()), &edit)
+                .expect("delete active resource"),
+            1
+        );
+        assert!(!source.exists());
+        assert_eq!(app.buffer().path(), Some(source.as_path()));
+        assert!(app.status_message().contains("deleted"));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -11598,6 +13894,31 @@ mod tests {
     }
 
     #[test]
+    fn reopening_existing_tab_clears_transient_editor_state() {
+        let root =
+            std::env::temp_dir().join(format!("mtide-reopen-tab-state-{}", std::process::id()));
+        let path = root.join("main.rs");
+        std::fs::create_dir_all(&root).expect("directory");
+        std::fs::write(&path, "one\ntwo").expect("file");
+        let mut app = App::new(&[path.to_string_lossy().into_owned()]).expect("app");
+        app.selection_anchor = Some(Position { line: 0, column: 0 });
+        app.secondary_cursors.push(Position { line: 1, column: 1 });
+        app.secondary_selections.push((
+            Position { line: 0, column: 0 },
+            Position { line: 0, column: 1 },
+        ));
+        app.folded_lines.insert(0);
+        app.horizontal_scroll = 4;
+        app.open_buffer(Buffer::open(&path).expect("reopen"));
+        assert!(app.selection_anchor.is_none());
+        assert!(app.secondary_cursors.is_empty());
+        assert!(app.secondary_selections.is_empty());
+        assert!(app.folded_lines.is_empty());
+        assert_eq!(app.horizontal_scroll, 0);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn language_override_is_scoped_to_tab_and_survives_switching() {
         let root = std::env::temp_dir().join(format!("mtide-language-tabs-{}", std::process::id()));
         let first = root.join("first.rs");
@@ -11681,12 +14002,35 @@ mod tests {
     fn agent_session_round_trips_provider_input_and_screen() {
         let path = std::env::temp_dir().join(format!("mtide-agent-session-{}", std::process::id()));
         let session = AgentSession {
+            version: AGENT_SESSION_VERSION,
             provider: "local".into(),
             input: "review".into(),
             screen: vec!["ready".into(), "output".into()],
         };
         save_agent_session(&path, &session).expect("save session");
         assert_eq!(load_agent_session(&path), Some(session));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn agent_session_rejects_oversized_or_unknown_state() {
+        let path = std::env::temp_dir().join(format!(
+            "mtide-agent-session-invalid-{}",
+            std::process::id()
+        ));
+        let oversized = AgentSession {
+            version: AGENT_SESSION_VERSION,
+            provider: "local".into(),
+            input: "x".repeat(AGENT_SESSION_MAX_INPUT_BYTES + 1),
+            screen: Vec::new(),
+        };
+        assert!(save_agent_session(&path, &oversized).is_err());
+        std::fs::write(
+            &path,
+            r#"{"version":99,"provider":"local","input":"","screen":[]}"#,
+        )
+        .expect("write invalid session");
+        assert!(load_agent_session(&path).is_none());
         let _ = std::fs::remove_file(path);
     }
 
@@ -11703,6 +14047,7 @@ mod tests {
                 cwd: None,
                 install: None,
                 tools: Vec::new(),
+                persist: false,
             },
         );
         settings.agent.providers.insert(
@@ -11714,9 +14059,11 @@ mod tests {
                 cwd: None,
                 install: None,
                 tools: Vec::new(),
+                persist: false,
             },
         );
         let session = AgentSession {
+            version: AGENT_SESSION_VERSION,
             provider: "review".to_owned(),
             input: String::new(),
             screen: Vec::new(),
@@ -11738,6 +14085,7 @@ mod tests {
                 cwd: None,
                 install: None,
                 tools: vec!["shell".to_owned()],
+                persist: false,
             },
         );
         app.agent_provider = "local".to_owned();
@@ -11791,6 +14139,53 @@ mod tests {
             std::fs::read_to_string(root.join("created.txt")).expect("created"),
             "created"
         );
+        std::fs::write(root.join("a.txt"), "a").expect("a");
+        std::fs::write(root.join("z.txt"), "z").expect("z");
+        let listed = app
+            .agent_tool_call("list_files", &json!({"path": "."}))
+            .expect("list tool");
+        assert_eq!(
+            listed["entries"].as_array().expect("entries"),
+            &vec![
+                json!("a.txt"),
+                json!("created.txt"),
+                json!("note.txt"),
+                json!("z.txt")
+            ]
+        );
+        std::fs::write(
+            root.join("large.txt"),
+            vec![b'x'; AGENT_TOOL_MAX_FILE_BYTES as usize + 1],
+        )
+        .expect("large file");
+        assert!(app
+            .agent_tool_call("read_file", &json!({"path": "large.txt"}))
+            .is_err());
+        assert!(app
+            .agent_tool_call(
+                "write_file",
+                &json!({"path": "large-write.txt", "content": "x".repeat(AGENT_TOOL_MAX_FILE_BYTES as usize + 1)})
+            )
+            .is_err());
+        #[cfg(unix)]
+        {
+            let outside = root.join("outside.txt");
+            let temporary = root.join(format!("note.mtide-agent-{}", std::process::id()));
+            std::fs::write(&outside, "protected").expect("outside");
+            std::os::unix::fs::symlink(&outside, &temporary).expect("temporary symlink");
+            assert!(app
+                .agent_tool_call(
+                    "write_file",
+                    &json!({"path": "note.txt", "content": "must not escape"})
+                )
+                .is_err());
+            assert_eq!(
+                std::fs::read_to_string(&outside).expect("protected file"),
+                "protected"
+            );
+            std::fs::remove_file(&temporary).expect("temporary symlink cleanup");
+            std::fs::remove_file(&outside).expect("outside cleanup");
+        }
         let search = app
             .agent_tool_call(
                 "search",

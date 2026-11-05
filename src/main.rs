@@ -43,6 +43,13 @@ fn main() -> AppResult<()> {
         print_help();
         return Ok(());
     }
+    if args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "--version" | "-v"))
+    {
+        println!("mtide {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     let instance_server =
         if args.iter().any(|arg| arg == "--new-window") || !reuse_window_enabled(&args) {
             None
@@ -59,13 +66,6 @@ fn main() -> AppResult<()> {
                 None
             }
         };
-    if args
-        .iter()
-        .any(|arg| matches!(arg.as_str(), "--version" | "-v"))
-    {
-        println!("mtide {}", env!("CARGO_PKG_VERSION"));
-        return Ok(());
-    }
     let has_explicit_target = args.iter().enumerate().any(|(index, arg)| {
         if arg == "-" {
             return true;

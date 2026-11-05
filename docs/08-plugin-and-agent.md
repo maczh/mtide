@@ -1,6 +1,6 @@
 # 插件与 AI Agent
 
-插件 tree/list 的 `on_select(node)`、table 的 `on_select(row_index)`、table 的 `on_activate(row_index)` 和 tabs 的 `on_change(tab_id)` 回调会在插件标签中随上下翻页选择移动、按 Enter 或在侧栏/底栏面板中用鼠标点击激活；table 的 `key_commands` 会把单字符快捷键映射到 `on_command(command, row_index)`，插件标签 Enter 优先调用 table 的 `on_activate`，没有时回退到 `on_select`，Host 同时保留 tabs 的 `on_select` 兼容别名。tree 支持 `children`/`expanded` 递归渲染，tree/list/table 行支持 `icon`、`badge`、`right` 和 `actions` 文本兼容。回调执行后 Host 会刷新标签内容并消费编辑请求。
+插件 tree/list 的 `on_select(node)`、叶节点激活用 `on_command("activate", node)`、table 的 `on_select(row_index)`、table 的 `on_activate(row_index)` 和 tabs 的 `on_change(tab_id)` 回调会在插件标签中随上下翻页选择移动、按 Enter 或在侧栏/底栏面板中用鼠标点击激活；table 的 `key_commands` 会把单字符快捷键映射到 `on_command(command, row_index)`，插件标签 Enter 优先调用 table 的 `on_activate`，没有时回退到 `on_select`，Host 同时保留 tabs 的 `on_select` 兼容别名。tree 支持 `children`/`expanded` 递归渲染，`indent` 可配置嵌套层级空格数，控件级 `inset` 可为 Tree/List/Table 增加内容边距，`truncate_left=true` 会按当前面板终端列宽从左侧截断长标签并保留尾部，`badge_right=true` 会把每行的 `badge` 对齐到右侧并在空间不足时安全截断；Enter 对父节点只在展开时调用 `on_expand`，同时按官方语义调用 `on_select`；Left/Right 可折叠或展开当前节点。tree/list 的 `node_menu` 右键菜单会先同步右键所在行的选择，再调用 `on_command(command, node)`，支持 `separator` 与 `checked` 展示，并复用宿主上下文菜单的键盘和鼠标操作。tree/list/table 行支持 `icon`、`badge`、`right` 和 `actions` 文本兼容。回调执行后 Host 会刷新标签内容并消费编辑请求。
 
 插件面板和自定义标签支持 progress widget：传入 value（0 到 1）、可选 label 和 char，Host 会按终端文本宽度渲染进度条并将越界值安全限制在有效范围。
 
@@ -31,7 +31,7 @@ Lua 模块通过 `require("ttt")` 注入，不假设全局变量。插件加载�
 
 `require("ttt.bookmarks")` 需要 `editor.bookmarks` 权限，所有操作针对当前活动文件：`set(line, icon, style)`、`get(line)`、`remove(line)`、`set_all(items)`、`get_all()` 和 `clear()`。书签图标显示在编辑器行号区，书签数据只存在当前运行时；插件可自行持久化。设置、移除、批量设置和清空会排队触发 `bookmark.change(path, line, action, icon, style)`；用户点击行号左侧书签列时会触发 `gutter.click(path, line)`，插件可据此实现书签切换。两个事件均受 `editor.bookmarks` 权限保护；没有监听器时点击保持编辑器原有行为。
 
-`require("ttt.automation")` 提供 `run(action, args, callback)`。Host 在主循环串行执行 `session`、`buffer`、`type`、`paste`、`key`、`open`、`screenshot` 和 `debug` 动作，完成后调用 `callback(result, error)`；返回的取消函数可取消尚未执行的请求。`key` 支持常见组合键和空格分隔的连续按键，`open` 参数为 JSON 对象字符串。该模块是单进程 Host 自动化桥接，跨进程会话服务仍由后续 `ttt.rpc` 适配层提供。
+`require("ttt.automation")` 提供 `run(action, args, callback)`。Host 在主循环串行执行 `session`、`buffer`、`type`、`paste`、`key`、`click`、`drag`、`scroll`、`open`、`screenshot`、`debug` 和 `wait-for` 动作，完成后调用 `callback(result, error)`；返回的取消函数可取消尚未执行或正在等待的请求。`key` 支持常见组合键和空格分隔的连续按键，`scroll` 参数为 `x y signed-count` 且滚动次数上限为 1000，`open` 参数为 JSON 对象字符串；`wait-for` 参数为待匹配屏幕文本，可追加 `timeout=MS`，默认 5000ms、上限 30000ms。`wait-for` 在主循环中轮询，不阻塞 TUI，成功返回 `{matched=true}`，超时返回 `{matched=false, timed_out=true}` 并提供错误信息。该模块是单进程 Host 自动化桥接，跨进程会话服务仍由后续 `ttt.rpc` 适配层提供。
 
 `require("ttt.rpc")` 支持 `connect(endpoint, options, callback)`，接受 `unix:` 和 TCP endpoint，并返回具有 `notify(method, params)`、异步 `request(method, params, callback)`、`close()` 的连接对象；需要 `network.rpc` 权限，出站使用 TTT/LSP 兼容的 JSON-RPC `Content-Length` framing，入站同时兼容旧版换行 JSON。manifest 中 `network.rpc=true` 允许任意 endpoint；字符串数组仅允许精确声明的 TCP/Unix endpoint，空数组拒绝全部连接。`request` 返回可调用的取消函数，取消会删除本地 pending 回调并发送 `$/cancelRequest`，重复取消或响应已到达时返回 `false`。`options.on_notification(method, params)`、`options.on_request(method, params)` 和 `options.on_close()` 分别接收服务端通知、反向请求和断开事件；反向请求回调的返回值会作为 JSON-RPC result，回调异常会转换为错误响应。网络读取在线程中完成，Lua 回调统一在 Host 主循环执行，避免跨线程访问 Lua 状态。
 
@@ -49,11 +49,11 @@ Lua 模块通过 `require("ttt")` 注入，不假设全局变量。插件加载�
 
 `sidebar` 与 `bottom` 注册面板按各自位置渲染；Bottom panel 不再被错误地显示到 Sidebar。
 
-可注册 Sidebar/Bottom/Drawer/Editor panel、command、keybinding、file handler、status item、tab 和 Widget。Widget 包括 tree/table/list/input/dialog/dropdown/tabs/scrollview/markdown/image，并支持命名 style 和必要的 raw cell API。
+可注册 Sidebar/Bottom/Drawer/Editor panel、command、keybinding、file handler、status item、tab 和 Widget。Widget 包括 tree/table/list/input/button/checkbox/dialog/dropdown/radio/tabs/scrollview/markdown/image；普通面板中的 input 支持鼠标聚焦、输入、退格、Enter 提交和 `on_change`/`on_submit`，checkbox 支持鼠标/Enter/空格切换与 `on_change(checked)`，button `on_click` 可通过鼠标激活并在聚焦后用 Enter/空格重复触发，dropdown/radio/tabs 支持鼠标聚焦、Tab/Shift-Tab、方向键和 Enter 选择，List/Table 行内 `actions` 可点击并复用 `on_command`，并支持命名 style 和必要的 raw cell API。
 
 `panel:image({src, alt})` 在当前无 Kitty/iTerm 图形协议时使用文本降级（优先显示 `alt`，同时保留 `src`），因此图像型插件仍可正常加载和表达内容；`ttt.graphics()` 会报告当前协议能力。
 
-兼容的近期插件 API 还包括 pager、border/title/password input、checkbox（`checked` 与 `label/text`）、table row actions/selected/loading/empty/inset、tree/list right badge、hstack/vstack/box/scrollview 容器 render、keyvalue、divider、`panel:size()` 当前 Sidebar/Bottom/Drawer/自定义 Tab 内容区尺寸、带坐标的顶层 raw text/cell/clear（支持多行文本、空白填充和区域清理）、hstack align、表格水平滚动（`scroll_x`/`horizontal_scroll` 与可选 `width`，按 Unicode 字符裁剪）、双击选择复制、插件 selectionStyle、插件 tab id/on_close/focus、读取/导航 diff tabs、bundled theme manifest、`ttt.text` terminal-column width、`ttt.terminal` 的 spawn/send/read/screen/focus/close/list 进程终端 API、`sys.spawn` 交互 stdio、`sys.exec` 的 env/timeout/cancel 和 `sys.exec_async` 限长流式输出。
+兼容的近期插件 API 还包括 pager、border/title/password input、checkbox（`checked` 与 `label/text`）、table 的 `columns` 标题/自动与固定宽度/`min_width`/left-center-right 对齐、数组行与 `{cells=...}` 行、列 actions 文本与鼠标命令命中、row actions/selected/loading/empty/inset、tree/list right badge（`badge`/`badge_right`）与 `inset`、hstack/vstack/box/scrollview 容器 render、keyvalue、divider、`panel:size()` 当前 Sidebar/Bottom/Drawer/自定义 Tab 内容区尺寸、带坐标的顶层 raw text/cell/clear（支持多行文本、空白填充和区域清理）、hstack align、表格水平滚动（`scroll_x`/`horizontal_scroll` 与可选 `width`，按 Unicode 字符裁剪）、双击选择复制、插件 selectionStyle、插件 tab id/on_close/focus、读取/导航 diff tabs、bundled theme manifest、`ttt.text` terminal-column width、`ttt.terminal` 的 spawn/send/read/screen/focus/close/list 进程终端 API、`sys.spawn` 交互 stdio、`sys.exec` 的 env/timeout/cancel 和 `sys.exec_async` 限长流式输出。普通 Sidebar/Bottom 面板的 `password` 已具备受控状态、鼠标聚焦、字符输入、退格、实时 `on_change` 和等长度掩码渲染；input/password/checkbox/button 之间支持 Tab/Shift-Tab 焦点循环。
 
 权限按文件、网络、process、terminal、storage、screen 和事件订阅拆分；`events.file` 保护 `file.open`/`file.close`/`file.save`，`events.editor` 保护 `editor.change`/`cursor.change`/`tab.change`，`editor.bookmarks` 保护 `bookmark.change`/`gutter.click`，`keybindings` 保护 `key.press`。权限拒绝必须返回可处理错误；插件整体禁用时核心编辑器仍可运行。
 
@@ -65,7 +65,7 @@ Lua 模块通过 `require("ttt")` 注入，不假设全局变量。插件加载�
 
 `ttt.show_panel("sidebar"|"bottom")` 和 `ttt.focus_panel("sidebar"|"bottom")` 会把已注册的插件面板重新显示到对应区域；后者还会把 Host 焦点切换到该区域。调用前必须声明对应的 `panel.sidebar` 或 `panel.bottom` 权限，且插件必须已经注册该位置的面板。
 
-`ttt.open_drawer(config)` / `ttt.close_drawer()` 已兼容原版 Drawer schema：`config` 支持 `side`（`left`/`right`）、`width`、`min_width` 和必需的 `render(panel)`，需要 `panel.drawer` 权限；Drawer 由 Host 作为编辑器覆盖层渲染，重复打开会替换当前插件 Drawer。Drawer 中的 `button({on_click})` 已接入鼠标点击和 Lua 回调执行，`input({text, placeholder, on_change, on_submit})` 支持鼠标聚焦、字符输入、退格和 Enter 提交，`checkbox({checked, on_change})` 支持状态保持、鼠标聚焦和 Enter/Space 切换，`dropdown({options, selected, on_change})` 支持鼠标聚焦、方向键循环和 Enter 触发回调，容器 `render`、`keyvalue`、`divider` 与顶层 raw `text/cell` 可用于构建 `ttt-mcp` 的 JSON Drawer。
+`ttt.open_drawer(config)` / `ttt.close_drawer()` 已兼容原版 Drawer schema：`config` 支持 `side`（`left`/`right`）、`width`、`min_width` 和必需的 `render(panel)`，需要 `panel.drawer` 权限；Drawer 由 Host 作为编辑器覆盖层渲染，重复打开会替换当前插件 Drawer。Drawer 中的 `button({on_click})` 已接入鼠标点击、Enter/Space 和重复回调执行，`input({text, placeholder, on_change, on_submit})` 支持鼠标聚焦、字符输入、退格和 Enter 提交，`checkbox({checked, on_change})` 支持状态保持、鼠标聚焦和 Enter/Space 切换，`dropdown({options, selected, on_change})` 支持鼠标聚焦、方向键循环和 Enter 触发回调；四类控件支持 Tab/Shift-Tab 双向焦点循环。容器 `render`、`keyvalue`、`divider` 与顶层 raw `text/cell` 可用于构建 `ttt-mcp` 的 JSON Drawer。
 
 `ttt.open_tab(config)` / `ttt.focus_tab(id)` / `ttt.close_tab(id)` 已支持自定义编辑器标签：`config` 需要 `title` 与 `render(panel)`，可选 `id`/`focus`/`on_close`/`on_event`，并要求 `panel.editor` 权限；`on_event(event)` 可消费未被宿主导航快捷键占用的按键事件，也可接收编辑器内容区的鼠标事件。按键事件包含 `type="key"`、`key`、可选 `rune` 与 `mod` 字段；鼠标事件包含 `type="mouse"`、零基 `x`/`y` 和 `button`（`left`/`right`/`middle`/`wheel_up` 等）。回调返回 `true` 即消费事件，返回 `false` 时继续执行宿主的滚动、选择等行为；Host 会保留自定义标签的 ID 和标题、在每次主循环刷新其渲染内容，并支持按 ID 聚焦或关闭。重复打开同一 ID 会复用该标签标识并更新其内容；未知 ID 的 `focus_tab`/`close_tab` 返回 `false`。
 
@@ -75,9 +75,11 @@ Lua 模块通过 `require("ttt")` 注入，不假设全局变量。插件加载�
 
 `ttt.open_diff(title, old_lines, new_lines, file_path)` 可创建只读差异标签，按行级 LCS 生成上下文（`  `）、删除（`- `）和新增（`+ `）行，并复用自定义编辑器标签生命周期；超大输入采用有界的删除/新增回退策略；Host 会保留可选 `file_path` 作为差异资源上下文。
 
-`ttt.open_file(path, line, readonly)` 会向 Host 请求打开工作区文件，支持 1-based 行号定位和只读打开；相对路径按当前工作区根解析，读取失败会转为 Host 状态栏错误。只读缓冲区拒绝编辑、撤销/重做和保存操作。
+`ttt.open_file(path, line, readonly)` 会向 Host 请求打开工作区文件，支持 1-based 行号定位和只读打开；相对路径按当前工作区根解析，读取失败会转为 Host 状态栏错误。只读缓冲区拒绝普通编辑、多光标编辑、撤销/重做和保存操作。
 
 `ttt.clipboard_write(text)` 要求 `commands` 权限，会更新 Host 内部剪贴板并通过 OSC52 通道向外部终端同步；`ttt.clipboard_read()` 需要单独的 `clipboard.read` 权限，并读取 Host 当前同步的剪贴板内容。因此在 SSH 或容器环境中也能完成插件复制与受控读取操作。
+
+普通 Terminal 面板在应用未启用鼠标协议时支持拖拽选择可见文本，选区会反色显示，按 `Ctrl-Shift-C` 复制并通过内部剪贴板/OSC52 同步；启用 PTY 鼠标协议后，事件优先原样发送给终端程序。
 
 manifest 至少包含名称、版本、入口、兼容版本和权限。安装来源可为本地文件、URL、社区 registry；下载后校验路径与 manifest，更新时保留旧版本回滚信息。
 
@@ -88,7 +90,11 @@ manifest 至少包含名称、版本、入口、兼容版本和权限。安装�
 插件文件权限需限制在 manifest 声明路径；权限撤销、插件禁用、卸载和 reload 必须清理 decorations、status items、tabs、timers 和 pending callbacks。HTTP 每次 redirect 都重新校验目标权限；用户批准的自定义 binary path 也必须显式授权。
 
 当前 Rust host 已实现 Lua 5.4 嵌入、`require("ttt")`、`ttt.log`、`ttt.notify`、`ttt.register`、`ttt.on`、`ttt.version/platform/arch/plugin_dir`，以及 `require("ttt.json")` 的 encode/decode。注册的 command 回调保存在 Lua registry 中，插件 keybinding 和 `Ctrl-P` 命令面板可触发对应 command；sidebar/bottom panel 支持 `render` 回调返回文本并绘制，panel proxy 的 `list/table` 已处理 `items/rows`、1-based `selected`、`loading`、`empty`、table 行 `cells` 和右侧 `right` 标记，并对 pager、tabs、scrollview、dialog、dropdown、password、border、badge、hstack/vstack、row_action 等常见 TTT widget 提供兼容入口；`app.start`、`app.tick`、`document.open`、`document.save` 会触发订阅回调；`require("ttt.events")` 的文件/编辑器/按键事件订阅已按 manifest 权限拒绝未授权注册；`require("ttt.terminal")` 在 manifest 授权 `terminal.control`/`terminal.read` 后提供受管控的 portable-pty `spawn/send/read/screen/resize/focus/close/list` 终端 API，`screen` 返回 VT 解析后的可视文本，`list` 返回尺寸，输出尾部限制为 1 MiB，`focus(id)` 会实际显示并聚焦 Host Terminal 面板；支持扩展名和最多 512 字节 `magic` 文件头匹配且 magic 优先的 `file_handlers.open(path, tab)` 可生成插件文件视图，tab proxy 提供 `id`、`title`、`focus`、`set_title`、`close` 和 `on_close` 生命周期入口，其中 `set_title` 会实际更新插件文件视图标题，`tab.on_close` 会在 Host 替换/关闭插件视图时回调并清理 Lua registry 资源；`ttt.open_tab({id,title,render,on_close})` 的自定义标签也会在 Host 关闭、替换或插件主动关闭时执行 `on_close` 并清理注册回调；另外 `tab.open`、`tab.activate`、`tab.close` 会覆盖普通编辑标签和插件视图的打开、切换、关闭生命周期。manifest 支持 `themes` 字符串或 descriptor 声明，主题资源型（无 Lua entry）插件可加载，且所有主题路径都会做包目录越界校验；首个有效主题可在启动时加载并应用到菜单、编辑器、侧栏、弹窗、Agent 面板、背景、面板、边框和状态栏。`require("ttt.system").exec` 仅在 manifest 声明 `system.exec` 权限时可用，支持 `options.stdin`/`options.env`/`options.timeout_ms`，超时会终止子进程并返回 `timed_out`；`exec_async` 在后台线程执行并由主循环回调 Lua；`system.spawn(options)` 同样要求 `system.exec`，返回带 `write`、`close_stdin`、`kill`、`pid` 的长生命周期进程句柄，并通过 `on_stdout`、`on_stderr`、`on_exit` 回调把流式输出和退出状态交回 Host 主循环；`require("ttt.fs")` 提供受 `fs.read`/`fs.write` 保护、限制在插件目录内的 read/write；`ttt.text.width/truncate` 按终端列宽处理宽字符；拒绝权限时返回 Lua 错误。LSP 重命名请求会先进入按文件汇总的预览弹层，用户确认后才应用 Workspace Edit。
+`ttt.set_echo(text)` 与 `ttt.clear_echo()` 兼容原版 TTT 的状态栏回显：非空文本会暂时独占整条状态栏，清空后恢复宿主状态、诊断和 status items；插件卸载时其回显状态随运行时一并消失。
+`ttt.notify(message, level?)` 会把通知写入插件日志并显示在状态栏，`level` 保留 `info`、`warn`、`error` 等级；后加载插件的当前通知优先显示，插件卸载后通知状态自动清理。
 `require("ttt.storage")` 在 manifest 声明 `storage` 权限后提供 `get(key)`、`set(key, value)`、`remove(key)`、`keys()`；值兼容 JSON 可表示的字符串、数字、布尔值和嵌套表，数据按插件名称私有保存到配置目录的 `plugin-storage/<name>.json`，单插件上限 1 MiB，`set(key, nil)` 等价于删除，未授权插件得到空模块且不会暴露存储函数。
+
+`ttt.fs.read`/`ttt.fs.write` 使用 Lua 原始字节串，可安全读写非 UTF-8 文件；路径仍必须通过 manifest 的 `fs.read`/`fs.write` scope 校验。
 
 沙箱内置全局 `crypto` 表（同时兼容 `require("ttt.crypto")`）提供 `base64_encode`、支持外围空白与省略 padding 且返回 `nil,error` 的 `base64_decode`、系统 CSPRNG 生成的十六进制 `random_bytes` 和 RFC 4122 v4 `uuid`；随机长度限制为 1–1024 字节，避免插件无界申请资源。
 
@@ -105,9 +111,9 @@ manifest 至少包含名称、版本、入口、兼容版本和权限。安装�
 ## 4. AI Agent
 `Ctrl-P` 命令面板同时包含内置编辑器、视图、工作区命令和插件命令，支持按命令 ID 或标题过滤并直接执行。
 
-Agent 是右侧持久终端会话，不与普通 bottom terminal 共用状态。Provider 配置包含 executable、args、cwd、可选 install command、显示名和启用状态。Host 同时兼容 mtide 的 `agent.providers` 和 TTT 的 `agents` 顶层 schema（`cli`、字符串/数组 `args`、`install`），统一归一化后再启动。Host 会先检查 executable 是否存在于 PATH；缺失时在右侧显示完整安装命令，只有用户按 Enter 明确确认后才会把命令发送到普通 Terminal 执行，禁止启动阶段静默安装。安装命令执行期间保持 pending 状态；一旦 executable 进入 PATH，Host 自动重建该 provider 的独立 Agent PTY 会话，切换 provider 会取消旧 pending 状态。
+Agent 是右侧持久终端会话，不与普通 bottom terminal 共用状态。Provider 配置包含 executable、args、cwd、可选 install command、显示名、启用状态和 `persist`。Host 同时兼容 mtide 的 `agent.providers` 和 TTT 的 `agents` 顶层 schema（`cli`、字符串/数组 `args`、`install`），统一归一化后再启动。Host 会先检查 executable 是否存在于 PATH；缺失时在右侧显示完整安装命令，只有用户按 Enter 明确确认后才会把命令发送到普通 Terminal 执行，禁止启动阶段静默安装。安装命令执行期间保持 pending 状态；一旦 executable 进入 PATH，Host 自动重建该 provider 的独立 Agent PTY 会话，切换 provider 会取消旧 pending 状态。开启 `persist` 且系统存在 `tmux` 时，Agent 命令会在按 provider 与 cwd 稳定命名的 tmux session 中运行，mtide 退出/重启只关闭客户端 PTY，下一次启动自动 attach 到原有进程；未满足条件时安全回退普通 portable-pty。
 
-Agent 默认输出是 PTY 文本，不直接改变编辑器状态；Agent 进入 alternate screen 后，字符、退格、回车和 Tab 直接写入其 PTY，bracketed paste 和启用的鼠标协议也使用标准终端事件。Agent 也可逐行发送 `{"type":"tool_call","id":...,"tool":"read_file|list_files|write_file|search","args":{...}}`，Host 在主循环异步执行并回写 `tool_result` JSONL，权限和 workspace 根目录校验与本地工具入口一致。Host 会在退出时保存 active provider、未提交输入和 VT 屏幕文本快照，下一次启动且 provider 一致时恢复这些可视状态，PTY 进程本身不会被伪持久化。
+Agent 默认输出是 PTY 文本，不直接改变编辑器状态；Agent 进入 alternate screen 后，字符、退格、回车和 Tab 直接写入其 PTY，bracketed paste 和启用的鼠标协议也使用标准终端事件。Agent 也可逐行发送 `{"type":"tool_call","id":...,"tool":"read_file|list_files|write_file|search","args":{...}}`，Host 在主循环异步执行并回写 `tool_result` JSONL，权限和 workspace 根目录校验与本地工具入口一致。Host 会在退出时以版本化 JSON 原子保存 active provider、未提交输入和 VT 屏幕文本快照；恢复文件限制为 4 MiB、输入 64 KiB、最多 2000 行且单行 16 KiB，损坏、未知版本或超限文件会安全忽略。下一次启动且 provider 一致时恢复这些可视状态，PTY 进程本身不会被伪持久化。
 
 ## 5. 安全边界
 
@@ -130,7 +136,7 @@ Lua 沙箱仅保留 TTT 约定的安全运行时：`os` 只暴露 `time`、`cloc
 
 `require("ttt.events")` 可在声明 `keybindings` 权限后订阅 `key.press`。该事件只在编辑器获得焦点且没有 overlay、终端或 Agent 等更高优先级输入模式时触发；事件字段为 `type="key"`、`key`、可选 `rune`/`mod`，回调返回 `true` 会消费按键，返回其他值则继续执行编辑器默认行为。插件命令键绑定和宿主强制快捷键优先于该事件；回调发生 Lua 错误时 Host 记录错误并按未消费处理，确保输入不会被故障插件卡住。
 
-面板中的 tree/list/table/tabs/dropdown 也支持宿主键盘选择：Up/Down/PageUp/PageDown/Home/End 更新选中项并调用 `on_select`/`on_change`，Enter 对 table 优先调用 `on_activate`，没有时调用 `on_select`；树节点存在 `children` 时 Enter 会切换 `expanded` 并调用 `on_expand(node)`，叶节点仍调用 `on_select(node)`；tree/list 的 `key_commands` 会将命令和当前节点传递给 `on_command(command, node)`，table 保持 `on_command(command, row_index)`；普通面板 dropdown 的方向键会改变选项，Enter 调用 `on_change(value)` 或 `on_menu(command)`；宿主会在重绘时保留选中行。
+面板中的 tree/list/table/tabs/dropdown 也支持宿主键盘选择：Up/Down/PageUp/PageDown/Home/End 更新选中项并调用 `on_select`/`on_change`，Enter 对 table 优先调用 `on_activate`，没有时调用 `on_select`；树节点存在 `children` 时 Enter 会展开（已展开时不重复触发展开回调）并调用 `on_select(node)`，Left/Right 分别折叠/展开当前节点，叶节点仍调用 `on_select(node)`；tree/list 的 `key_commands` 会将命令和当前节点传递给 `on_command(command, node)`，`node_menu` 右键菜单也传递同样的节点对象，table 保持 `on_command(command, row_index)`；普通面板 dropdown 的方向键会改变选项，Enter 调用 `on_change(value)` 或 `on_menu(command)`；宿主会在重绘时保留选中行。
 
 `ttt.debounce(milliseconds, callback)` 返回 `run(...)` 与 `cancel()` 两个函数。连续调用 `run` 会取消旧计时并只把最后一次参数传给 callback；计时器在 Host 主循环执行，`cancel()` 可取消尚未触发的回调。
 
@@ -139,6 +145,18 @@ Lua 沙箱仅保留 TTT 约定的安全运行时：`os` 只暴露 `time`、`cloc
 `ttt.on_uninstall(callback)` 可注册一次卸载清理钩子。Host 的卸载流程显式调用 `run_uninstall_hook`，回调异常会保留失败结果供上层决定是否重试或强制移除；正常加载不会执行该钩子。
 
 `ttt.markdown(text)` 返回 1-based 行数组，每行由 `{text, style}` span 组成；当前解析支持普通文本、`#`/`##`/`###` 标题、`**粗体**`、`*斜体*`/`_斜体_` 和 `` `行内代码` ``，便于插件将 Markdown 转成 panel 内容。
+
+`panel:markdown` 同时接受 Markdown 字符串和 `{text = "..."}` 配置表；面板会按行渲染标题、基础 inline 样式，并把 `[label](url)` 显示为可读标签。配置表的 `wrap_width` 会按 Unicode 终端列宽对文本换行。
+
+`panel:label` 同时接受普通字符串和 `{text = "...", badge = "..."}` 配置表；配置表会显示主文本及右侧 badge，兼容插件作者指南中的两种写法。
+
+`panel:input` 支持可选 `prefix`、`autofocus`、`multiline`、`wrap`、`min_rows` 和 `max_rows`；前缀仅作为不可编辑的显示文本，回调始终只收到输入内容本身。`multiline=true` 时 Enter 插入换行而不是提交，`wrap=true` 按面板 Unicode 列宽换行，`min_rows`/`max_rows` 约束显示高度；`autofocus=true` 会在面板或自定义 Tab 获得焦点时自动聚焦该输入；若同时提供 `value` 与旧式 `text`，受控 `value` 优先。
+
+`panel:title` 支持普通字符串和 `{text = "...", badge = "..."}` 配置表；标题配置表会显示主标题和 badge。
+
+`panel:box({title, render})` 提供兼容的容器 widget；`render(child_panel)` 会在同一面板上下文中绘制子控件，Sidebar、Bottom、Drawer、自定义 Tab 与文件视图均可使用。
+
+标题配置表还支持 `menu`/`on_menu`；菜单复用宿主键盘/鼠标上下文菜单，覆盖主面板、自定义 Tab 与文件视图，选择后向回调传递 command。
 
 `ttt.executable_path()` 返回当前 mtide 可执行文件的绝对路径，供插件调用自身宿主或展示诊断信息使用。
 

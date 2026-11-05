@@ -58,6 +58,7 @@ pub fn detect_indent(lines: &[String]) -> IndentInfo {
 struct Snapshot {
     lines: Vec<String>,
     cursor: Position,
+    state_id: u64,
 }
 
 #[derive(Debug)]
@@ -75,12 +76,16 @@ pub struct Buffer {
     undo_group_depth: usize,
     undo_group_checkpointed: bool,
     indent_info: IndentInfo,
+    state_id: u64,
+    next_state_id: u64,
+    saved_state_id: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ExternalChange {
     Reloaded,
     Dirty,
+    Deleted,
 }
 
 impl Buffer {
@@ -135,6 +140,9 @@ impl Buffer {
             undo_group_depth: 0,
             undo_group_checkpointed: false,
             indent_info,
+            state_id: 0,
+            next_state_id: 1,
+            saved_state_id: Some(0),
         }
     }
 
@@ -153,6 +161,15 @@ impl Buffer {
     pub fn path(&self) -> Option<&Path> {
         self.path.as_deref()
     }
+
+    pub(crate) fn relocate(&mut self, path: impl AsRef<Path>) {
+        let path = path.as_ref().to_path_buf();
+        self.disk_mtime = fs::metadata(&path)
+            .ok()
+            .and_then(|metadata| metadata.modified().ok());
+        self.external_change = false;
+        self.path = Some(path);
+    }
     pub const fn indent_info(&self) -> IndentInfo {
         self.indent_info
     }
@@ -169,8 +186,21 @@ impl Buffer {
         let Some(path) = self.path.as_deref() else {
             return Ok(None);
         };
-        let Ok(metadata) = fs::metadata(path) else {
-            return Ok(None);
+        let metadata = match fs::metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if self.disk_mtime.is_none() && self.external_change {
+                    return Ok(None);
+                }
+                self.disk_mtime = None;
+                self.external_change = true;
+                return Ok(Some(if self.dirty() {
+                    ExternalChange::Dirty
+                } else {
+                    ExternalChange::Deleted
+                }));
+            }
+            Err(error) => return Err(error.into()),
         };
         let modified = metadata.modified().ok();
         if modified == self.disk_mtime {
@@ -187,6 +217,9 @@ impl Buffer {
         self.saved_lines = self.lines.clone();
         self.undo.clear();
         self.redo.clear();
+        self.state_id = 0;
+        self.next_state_id = 1;
+        self.saved_state_id = Some(self.state_id);
         self.cursor.line = self.cursor.line.min(self.lines.len().saturating_sub(1));
         self.cursor.column = self
             .cursor
@@ -205,6 +238,9 @@ impl Buffer {
         self.saved_lines = self.lines.clone();
         self.undo.clear();
         self.redo.clear();
+        self.state_id = 0;
+        self.next_state_id = 1;
+        self.saved_state_id = Some(self.state_id);
         self.disk_mtime = fs::metadata(path)
             .ok()
             .and_then(|metadata| metadata.modified().ok());
@@ -347,7 +383,7 @@ impl Buffer {
         };
     }
     pub fn dirty(&self) -> bool {
-        self.lines != self.saved_lines
+        self.saved_state_id != Some(self.state_id) || self.lines != self.saved_lines
     }
 
     pub fn has_unresolved_conflicts(&self) -> bool {
@@ -453,7 +489,7 @@ impl Buffer {
     }
 
     pub fn backspace_at_positions(&mut self, positions: &[Position]) -> Vec<Position> {
-        if positions.is_empty() {
+        if self.readonly || positions.is_empty() {
             return positions.to_vec();
         }
         self.checkpoint();
@@ -793,6 +829,7 @@ impl Buffer {
             }
             fs::write(path, text)?;
             self.saved_lines = self.lines.clone();
+            self.saved_state_id = Some(self.state_id);
             self.disk_mtime = fs::metadata(path)
                 .ok()
                 .and_then(|metadata| metadata.modified().ok());
@@ -825,6 +862,7 @@ impl Buffer {
         fs::write(&path, text)?;
         self.path = Some(path);
         self.saved_lines = self.lines.clone();
+        self.saved_state_id = Some(self.state_id);
         self.disk_mtime = self
             .path
             .as_deref()
@@ -986,6 +1024,7 @@ impl Buffer {
             return;
         }
         if self.lines.len() == 1 {
+            self.checkpoint();
             self.lines[0].clear();
             self.cursor.column = 0;
             return;
@@ -1092,21 +1131,36 @@ impl Buffer {
         Snapshot {
             lines: self.lines.clone(),
             cursor: self.cursor,
+            state_id: self.state_id,
         }
     }
     fn restore(&mut self, snapshot: Snapshot) {
         self.lines = snapshot.lines;
         self.cursor = snapshot.cursor;
+        self.state_id = snapshot.state_id;
     }
     fn checkpoint(&mut self) {
         if self.undo_group_depth > 0 && self.undo_group_checkpointed {
+            if self.saved_state_id == Some(self.state_id) {
+                self.saved_state_id = None;
+            }
+            self.state_id = self.next_state_id;
+            self.next_state_id = self.next_state_id.saturating_add(1);
             return;
         }
         if self.undo_group_depth > 0 {
             self.undo_group_checkpointed = true;
         }
+        if self
+            .saved_state_id
+            .is_some_and(|saved| self.redo.iter().any(|snapshot| snapshot.state_id == saved))
+        {
+            self.saved_state_id = None;
+        }
         self.undo.push(self.snapshot());
         self.redo.clear();
+        self.state_id = self.next_state_id;
+        self.next_state_id = self.next_state_id.saturating_add(1);
     }
     fn char_to_byte(&self) -> usize {
         self.lines[self.cursor.line]
@@ -1172,6 +1226,48 @@ mod tests {
         assert!(b.dirty());
         b.undo();
         assert!(!b.dirty());
+    }
+
+    #[test]
+    fn branching_after_save_does_not_recreate_the_old_save_point() {
+        let path =
+            std::env::temp_dir().join(format!("mtide-undo-save-point-{}", std::process::id()));
+        std::fs::write(&path, "hello").expect("initial file");
+        let mut buffer = Buffer::open(&path).expect("open file");
+        buffer.insert("A");
+        buffer.save().expect("save A");
+        buffer.undo();
+        buffer.insert("B");
+        buffer.undo();
+        assert_eq!(buffer.lines(), &["hello"]);
+        assert!(buffer.dirty());
+        buffer.redo();
+        assert_eq!(buffer.lines(), &["Bhello"]);
+        assert!(buffer.dirty());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn save_inside_undo_group_is_invalidated_by_a_later_group_edit() {
+        let path = std::env::temp_dir().join(format!(
+            "mtide-undo-group-save-point-{}",
+            std::process::id()
+        ));
+        std::fs::write(&path, "hello").expect("initial file");
+        let mut buffer = Buffer::open(&path).expect("open file");
+        buffer.begin_undo_group();
+        buffer.insert("A");
+        buffer.save().expect("save inside group");
+        buffer.insert("B");
+        buffer.end_undo_group();
+        assert!(buffer.dirty());
+        buffer.undo();
+        assert_eq!(buffer.lines(), &["hello"]);
+        assert!(buffer.dirty());
+        buffer.redo();
+        assert_eq!(buffer.lines(), &["ABhello"]);
+        assert!(buffer.dirty());
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -1448,6 +1544,31 @@ mod tests {
     }
 
     #[test]
+    fn clean_buffer_reports_external_file_deletion() {
+        let path =
+            std::env::temp_dir().join(format!("mtide-external-deleted-{}", std::process::id()));
+        fs::write(&path, "before").expect("seed file");
+        let mut buffer = Buffer::open(&path).expect("open file");
+        fs::remove_file(&path).expect("delete file");
+        assert_eq!(
+            buffer.poll_external_change().expect("poll"),
+            Some(ExternalChange::Deleted)
+        );
+        assert_eq!(buffer.lines(), &["before"]);
+        assert_eq!(
+            buffer.poll_external_change().expect("deduplicated poll"),
+            None
+        );
+        fs::write(&path, "restored").expect("restore file");
+        assert_eq!(
+            buffer.poll_external_change().expect("restored poll"),
+            Some(ExternalChange::Reloaded)
+        );
+        assert_eq!(buffer.lines(), &["restored"]);
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
     fn inserts_at_multiple_positions_in_reverse_order_as_one_undo() {
         let mut b = Buffer::new(vec!["abcd".into(), "efgh".into()], None);
         let positions = [
@@ -1508,10 +1629,21 @@ mod tests {
         buffer.set_readonly(true);
         buffer.insert(" after");
         buffer.delete();
+        let readonly_positions = buffer.backspace_at_positions(&[Position { line: 0, column: 3 }]);
+        assert_eq!(readonly_positions, vec![Position { line: 0, column: 3 }]);
         assert_eq!(buffer.lines(), &["before"]);
         assert!(buffer.save().is_err());
         assert_eq!(fs::read_to_string(&path).expect("read file"), "before");
         fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn deleting_the_only_line_is_undoable() {
+        let mut buffer = Buffer::new(vec!["content".into()], None);
+        buffer.delete_line();
+        assert_eq!(buffer.lines(), &[""]);
+        buffer.undo();
+        assert_eq!(buffer.lines(), &["content"]);
     }
 
     #[test]

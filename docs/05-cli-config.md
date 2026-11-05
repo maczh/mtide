@@ -8,6 +8,8 @@ mtide [options] [files|folders|urls...]
 
 兼容参数：`--help/-h`、`--version/-v`、`--workspace FILE`、`--config FILE`、`--plugin DIR`（可重复）、`--exec SCRIPT`、`--exec-split-on SEP`、`--size WxH`、`--debug`、`--listen`、`--new-window`、`--clear-default-folders`、`--welcome`、`-`。Rust 版支持这些参数及标准输入目标；`--size WxH` 会在启动时调整 PTY 与 Agent 会话尺寸，`--debug` 会将启动阶段的 `--exec` 动作写入 stderr，`--exec` 接受 JSON 动作数组并支持 `key`、`type`、`paste`、`wait`、`quit`，可用 `--exec-split-on SEP` 将一个参数拆分为多个 JSON 动作数组。默认启动实例在当前用户/目录对应的 loopback Unix socket 上监听文件目标，后续调用会转发目标和行列位置；`--listen` 显式保留监听实例，`--new-window` 绕过复用并启动独立实例。
 
+Agent 配置支持 `agent.persist: true` 或 provider 级 `persist: true`（别名 `persistent`/`persist_session`）。当系统存在 `tmux` 时，Agent 会运行在稳定命名的 tmux session 中，mtide 重启后重新 attach 并保留真实进程；未安装 tmux 或未开启该选项时回退到普通 portable-pty。Provider 级设置优先于全局设置。
+
 位置参数支持文件、目录、`file:line[:column]` 和 `.ttt` 工作区；文件定位使用 1-based 行列并转换为内部 0-based 光标。无显式目标且 stdin 为 pipe/regular file 时，会在进入终端 raw mode 前自动读取并以未保存 tab 打开；显式 `-` 强制执行同样行为，适用于 `cat file | mtide -`。文件/目录目标和配置中的默认 folder 优先于自动 stdin。
 
 `--exec` 用于无交互测试和复现，当前已支持 `click`、`rclick`、`hover`、`drag`、`key`、`type`、`paste`、`copy`、`debug`、`screenshot`、`panel`、`open`、`exec`、`wait`、`wait-for` 和 `quit`；鼠标动作按当前终端尺寸通过 Host 的真实鼠标分发链路执行，`debug`/`screenshot` 默认将状态或编辑器文本快照输出到 stdout，也可通过 `path` 保存快照，`panel` 通过 `panel`/`name` 选择已知焦点，`open` 支持 `path`、可选 1-based `line`/`column` 与 `readonly`，`exec` 只接受字符串命令数组并限制 60 秒，`wait-for` 使用 `path` 文件存在作为可观察条件，并以 `ms`（最多 60 秒）为超时。其余动作仍需对应的输出/进程协议实现后再开放，失败返回非零退出码。
@@ -65,5 +67,7 @@ mtide [OPTIONS] [FILE|DIRECTORY]
     --version
 ```
 
-侧栏快捷键：`1` Explorer、`2` Find、`3` Changes、`4` Branches；Explorer 中 `n` 新建文件、`Shift-N` 新建目录、`r` 重命名、`x` 删除（需 `y` 确认）、`F5` 刷新；Branches 中 Up/Down 选择、Enter 切换分支。编辑器中 `Ctrl-Shift-[` 折叠当前缩进块，`Ctrl-Shift-]` 展开全部。
+侧栏快捷键：`1` Explorer、`2` Find、`3` Changes、`4` Branches；Explorer 中 `n` 新建文件、`Shift-N` 新建目录、`r` 重命名、`x` 删除（需 `y` 确认）、`F5` 刷新；`explorer.autoReveal` 开启后打开或切换文件会自动展开并定位到活动文件；Branches 中 Up/Down 选择、Enter 切换分支。编辑器中 `Ctrl-Shift-[` 折叠当前缩进块，`Ctrl-Shift-]` 展开全部。
+
+Quick Open 兼容快捷键：`Ctrl-O` 和 `Ctrl-K P` 打开文件，`Ctrl-K E/F/C` 分别聚焦 Explorer、Find、Changes；Quick Open 中输入 `>` 进入命令模式，输入 `?` 浏览快捷键帮助。
 

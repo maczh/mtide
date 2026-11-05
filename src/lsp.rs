@@ -42,11 +42,19 @@ pub struct LspManager {
     clients: HashMap<String, LspClient>,
     states: HashMap<String, LspServerState>,
     diagnostics: HashMap<String, Vec<LspDiagnostic>>,
-    document_versions: HashMap<String, i32>,
+    document_versions: HashMap<(String, String), i32>,
 }
 
 #[allow(dead_code)]
 impl LspManager {
+    fn mark_failed(&mut self, language: &str) {
+        self.clients.remove(language);
+        self.states
+            .insert(language.to_owned(), LspServerState::Failed);
+        self.document_versions
+            .retain(|(document_language, _), _| document_language != language);
+    }
+
     pub fn from_settings(settings: &LspSettings) -> Self {
         Self {
             configs: settings
@@ -88,6 +96,8 @@ impl LspManager {
         let Some(config) = self.configs.get(language) else {
             return Ok(false);
         };
+        self.document_versions
+            .retain(|(document_language, _), _| document_language != language);
         if config.command.is_empty() {
             self.states
                 .insert(language.to_owned(), LspServerState::Failed);
@@ -114,6 +124,20 @@ impl LspManager {
         Ok(true)
     }
 
+    /// Stop and recreate one language server.
+    ///
+    /// Restarting clears document versions so the next synchronization emits
+    /// `didOpen` instead of an invalid `didChange` for the new process.
+    pub fn restart(&mut self, language: &str, root_uri: Option<&str>) -> AppResult<bool> {
+        if let Some(mut client) = self.clients.remove(language) {
+            let _ = client.shutdown();
+        }
+        self.states.remove(language);
+        self.document_versions
+            .retain(|(document_language, _), _| document_language != language);
+        self.start(language, root_uri)
+    }
+
     pub fn client_mut(&mut self, language: &str) -> Option<&mut LspClient> {
         self.clients.get_mut(language)
     }
@@ -131,9 +155,7 @@ impl LspManager {
         match result {
             Ok(result) => Ok(Some(result)),
             Err(error) => {
-                self.clients.remove(language);
-                self.states
-                    .insert(language.to_owned(), LspServerState::Failed);
+                self.mark_failed(language);
                 Err(error)
             }
         }
@@ -149,15 +171,26 @@ impl LspManager {
         let Some(client) = self.clients.get_mut(language) else {
             return Ok(false);
         };
-        let version = self.document_versions.entry(uri.to_owned()).or_insert(0);
-        if *version == 0 {
-            *version = 1;
-            client.did_open(uri, language_id, *version, text)?;
-        } else {
-            *version += 1;
-            client.did_change(uri, *version, text)?;
+        let result = {
+            let version = self
+                .document_versions
+                .entry((language.to_owned(), uri.to_owned()))
+                .or_insert(0);
+            if *version == 0 {
+                *version = 1;
+                client.did_open(uri, language_id, *version, text)
+            } else {
+                *version += 1;
+                client.did_change(uri, *version, text)
+            }
+        };
+        match result {
+            Ok(()) => Ok(true),
+            Err(error) => {
+                self.mark_failed(language);
+                Err(error)
+            }
         }
-        Ok(true)
     }
 
     pub fn save_document(&mut self, language: &str, uri: &str) -> AppResult<bool> {
@@ -165,9 +198,7 @@ impl LspManager {
             return Ok(false);
         };
         if let Err(error) = client.did_save(uri) {
-            self.clients.remove(language);
-            self.states
-                .insert(language.to_owned(), LspServerState::Failed);
+            self.mark_failed(language);
             return Err(error);
         }
         Ok(true)
@@ -175,16 +206,19 @@ impl LspManager {
 
     pub fn close_document(&mut self, language: &str, uri: &str) -> AppResult<bool> {
         let Some(client) = self.clients.get_mut(language) else {
-            self.document_versions.remove(uri);
+            self.document_versions
+                .remove(&(language.to_owned(), uri.to_owned()));
+            self.diagnostics.remove(uri);
             return Ok(false);
         };
         if let Err(error) = client.did_close(uri) {
-            self.clients.remove(language);
-            self.states
-                .insert(language.to_owned(), LspServerState::Failed);
+            self.mark_failed(language);
+            self.diagnostics.remove(uri);
             return Err(error);
         }
-        self.document_versions.remove(uri);
+        self.document_versions
+            .remove(&(language.to_owned(), uri.to_owned()));
+        self.diagnostics.remove(uri);
         Ok(true)
     }
 
@@ -207,8 +241,7 @@ impl LspManager {
             .filter_map(|(language, client)| client.has_exited().then(|| language.clone()))
             .collect();
         for language in exited {
-            self.clients.remove(&language);
-            self.states.insert(language, LspServerState::Failed);
+            self.mark_failed(&language);
         }
         let messages: Vec<_> = self
             .clients
@@ -580,6 +613,23 @@ mod tests {
     }
 
     #[test]
+    fn closing_document_clears_stale_diagnostics() {
+        let mut manager = LspManager::default();
+        let uri = "file:///src/main.rs";
+        let message = json!({
+            "method": "textDocument/publishDiagnostics",
+            "params": {"uri": uri, "diagnostics": [{
+                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}},
+                "message": "stale"
+            }]}
+        });
+        assert!(manager.apply_notification(&message));
+        assert_eq!(manager.diagnostics(uri).len(), 1);
+        assert!(!manager.close_document("rust", uri).expect("close"));
+        assert!(manager.diagnostics(uri).is_empty());
+    }
+
+    #[test]
     fn records_failed_state_for_invalid_server_configuration() {
         let settings = LspSettings {
             extra: BTreeMap::new(),
@@ -595,6 +645,31 @@ mod tests {
         let mut manager = LspManager::from_settings(&settings);
         assert_eq!(manager.state("rust"), None);
         assert!(manager.start("rust", None).is_err());
+        assert_eq!(manager.state("rust"), Some(LspServerState::Failed));
+        assert!(manager.restart("rust", None).is_err());
+        assert_eq!(manager.state("rust"), Some(LspServerState::Failed));
+    }
+
+    #[test]
+    fn fresh_start_drops_versions_from_a_failed_server() {
+        let settings = LspSettings {
+            extra: BTreeMap::new(),
+            enabled: true,
+            servers: BTreeMap::from([(
+                "rust".to_owned(),
+                LspServerConfig {
+                    command: vec!["/definitely/missing/mtide-lsp".to_owned()],
+                    languages: Vec::new(),
+                },
+            )]),
+        };
+        let mut manager = LspManager::from_settings(&settings);
+        manager
+            .document_versions
+            .insert(("rust".to_owned(), "file:///src/main.rs".to_owned()), 7);
+
+        assert!(manager.start("rust", None).is_err());
+        assert!(manager.document_versions.is_empty());
         assert_eq!(manager.state("rust"), Some(LspServerState::Failed));
     }
 }

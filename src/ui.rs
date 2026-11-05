@@ -14,6 +14,7 @@ use crate::git::ConflictBlock;
 use crate::lsp::LspServerState;
 use crate::plugin::PluginPanelLocation;
 use crate::terminal::{AnsiColor, CursorShape, TerminalStyle};
+use regex::Regex;
 use unicode_width::UnicodeWidthChar;
 
 static ACTIVE_THEME: OnceLock<RwLock<Theme>> = OnceLock::new();
@@ -423,6 +424,15 @@ pub fn handle_mouse(app: &mut App, event: MouseEvent, area: Rect) {
                 let button = mouse_event_button(event.kind);
                 let x = event.column.saturating_sub(body.x.saturating_add(1));
                 let y = body_line as u16;
+                if matches!(event.kind, MouseEventKind::Down(MouseButton::Right)) {
+                    match app.open_plugin_panel_context_menu(PluginPanelLocation::Sidebar, x, y) {
+                        Ok(true) => return,
+                        Ok(false) => {}
+                        Err(error) => app.set_status_message(format!(
+                            "Plugin sidebar context menu failed: {error}"
+                        )),
+                    }
+                }
                 match app.emit_plugin_panel_mouse(PluginPanelLocation::Sidebar, x, y, button) {
                     Ok(true) => return,
                     Ok(false) => {}
@@ -472,8 +482,8 @@ pub fn handle_mouse(app: &mut App, event: MouseEvent, area: Rect) {
                     _ => {}
                 }
             }
+            return;
         }
-        return;
     }
     if let Some(agent) = agent_area(app, area) {
         if event.column >= agent.x
@@ -489,36 +499,43 @@ pub fn handle_mouse(app: &mut App, event: MouseEvent, area: Rect) {
             && event.row >= bottom.y
             && event.row < bottom.bottom()
         {
-            if app.bottom_tab() == crate::app::BottomTab::Output
-                && matches!(event.kind, MouseEventKind::Down(MouseButton::Left))
-            {
-                let line = event.row.saturating_sub(bottom.y.saturating_add(1)) as usize;
-                if let Some(start) = app.plugin_panel_line_start(PluginPanelLocation::Bottom) {
-                    if line >= start {
-                        match app.activate_plugin_panel_selection(
-                            PluginPanelLocation::Bottom,
-                            line.saturating_sub(start),
-                        ) {
-                            Ok(true) => return,
-                            Ok(false) => {}
-                            Err(error) => {
-                                app.set_status_message(format!(
-                                    "Plugin bottom selection failed: {error}"
-                                ));
-                            }
-                        }
-                    }
-                }
-            }
             if app.bottom_tab() == crate::app::BottomTab::Output {
                 let button = mouse_event_button(event.kind);
                 let x = event.column.saturating_sub(bottom.x.saturating_add(1));
                 let y = event.row.saturating_sub(bottom.y.saturating_add(1));
+                if matches!(event.kind, MouseEventKind::Down(MouseButton::Right)) {
+                    match app.open_plugin_panel_context_menu(PluginPanelLocation::Bottom, x, y) {
+                        Ok(true) => return,
+                        Ok(false) => {}
+                        Err(error) => app.set_status_message(format!(
+                            "Plugin bottom context menu failed: {error}"
+                        )),
+                    }
+                }
                 match app.emit_plugin_panel_mouse(PluginPanelLocation::Bottom, x, y, button) {
                     Ok(true) => return,
                     Ok(false) => {}
                     Err(error) => {
                         app.set_status_message(format!("Plugin bottom mouse failed: {error}"))
+                    }
+                }
+                if matches!(event.kind, MouseEventKind::Down(MouseButton::Left)) {
+                    let line = event.row.saturating_sub(bottom.y.saturating_add(1)) as usize;
+                    if let Some(start) = app.plugin_panel_line_start(PluginPanelLocation::Bottom) {
+                        if line >= start {
+                            match app.activate_plugin_panel_selection(
+                                PluginPanelLocation::Bottom,
+                                line.saturating_sub(start),
+                            ) {
+                                Ok(true) => return,
+                                Ok(false) => {}
+                                Err(error) => {
+                                    app.set_status_message(format!(
+                                        "Plugin bottom selection failed: {error}"
+                                    ));
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -566,14 +583,6 @@ pub fn handle_mouse(app: &mut App, event: MouseEvent, area: Rect) {
         }
         let column = event.column.saturating_sub(terminal.x.saturating_add(1));
         let row = event.row.saturating_sub(terminal.y.saturating_add(1));
-        if matches!(event.kind, MouseEventKind::Down(MouseButton::Left))
-            && !app.terminal_mouse_tracking()
-        {
-            if let Some(url) = app.terminal_link_at(column, row) {
-                app.open_terminal_link(&url);
-                return;
-            }
-        }
         if app.terminal_mouse_tracking() {
             if let Err(error) = app.send_terminal_mouse(column, row, event.kind, event.modifiers) {
                 app.set_status_message(format!("Terminal mouse error: {error}"));
@@ -581,6 +590,19 @@ pub fn handle_mouse(app: &mut App, event: MouseEvent, area: Rect) {
             return;
         }
         match event.kind {
+            MouseEventKind::Down(MouseButton::Left) => app.begin_terminal_selection(column, row),
+            MouseEventKind::Drag(MouseButton::Left) => app.update_terminal_selection(column, row),
+            MouseEventKind::Up(MouseButton::Left) => {
+                let is_empty = app
+                    .terminal_selection_text()
+                    .is_none_or(|text| text.is_empty());
+                app.finish_terminal_selection();
+                if is_empty {
+                    if let Some(url) = app.terminal_link_at(column, row) {
+                        app.open_terminal_link(&url);
+                    }
+                }
+            }
             MouseEventKind::ScrollUp => app.scroll_terminal(3),
             MouseEventKind::ScrollDown => app.scroll_terminal(-3),
             _ => {}
@@ -626,22 +648,28 @@ pub fn handle_mouse(app: &mut App, event: MouseEvent, area: Rect) {
         }
     }
     let position = editor_mouse_position(app, area, event.column, event.row);
+    if matches!(event.kind, MouseEventKind::Moved) {
+        app.update_editor_hover(
+            position,
+            event
+                .modifiers
+                .contains(crossterm::event::KeyModifiers::CONTROL),
+        );
+    }
     match event.kind {
         MouseEventKind::ScrollUp => {
-            if event
-                .modifiers
-                .contains(crossterm::event::KeyModifiers::SHIFT)
-            {
+            if event.modifiers.intersects(
+                crossterm::event::KeyModifiers::SHIFT | crossterm::event::KeyModifiers::ALT,
+            ) {
                 app.scroll_editor_horizontal(-4);
             } else {
                 app.scroll_editor(-3);
             }
         }
         MouseEventKind::ScrollDown => {
-            if event
-                .modifiers
-                .contains(crossterm::event::KeyModifiers::SHIFT)
-            {
+            if event.modifiers.intersects(
+                crossterm::event::KeyModifiers::SHIFT | crossterm::event::KeyModifiers::ALT,
+            ) {
                 app.scroll_editor_horizontal(4);
             } else {
                 app.scroll_editor(3);
@@ -649,6 +677,13 @@ pub fn handle_mouse(app: &mut App, event: MouseEvent, area: Rect) {
         }
         MouseEventKind::Down(MouseButton::Left) => {
             if let Some(position) = position {
+                if event
+                    .modifiers
+                    .contains(crossterm::event::KeyModifiers::CONTROL)
+                    && app.open_editor_link(position)
+                {
+                    return;
+                }
                 if app.column_selection_active()
                     || (event
                         .modifiers
@@ -1100,10 +1135,29 @@ fn draw_sidebar(frame: &mut Frame<'_>, area: Rect, app: &App) {
             let style = if index == app.explorer_index() {
                 Style::default().fg(theme.background).bg(theme.accent)
             } else {
-                Style::default().fg(theme.foreground)
+                match app.explorer_git_status(path) {
+                    Some(('?', '?')) | Some(('A', _)) | Some(('C', _)) => {
+                        Style::default().fg(theme.positive)
+                    }
+                    Some(('D', _)) | Some((_, 'D')) | Some(('U', _)) | Some((_, 'U')) => {
+                        Style::default().fg(theme.error)
+                    }
+                    Some(('M', _)) | Some((_, 'M')) => Style::default().fg(theme.warning),
+                    Some((index_status, worktree_status))
+                        if index_status != ' ' || worktree_status != ' ' =>
+                    {
+                        Style::default().fg(theme.accent)
+                    }
+                    _ => Style::default().fg(theme.foreground),
+                }
             };
+            let status = app
+                .explorer_git_status(path)
+                .map_or("  ".to_owned(), |(index_status, worktree_status)| {
+                    format!("{index_status}{worktree_status}")
+                });
             sidebar_text.lines.push(Line::from(Span::styled(
-                format!("{indent}{marker} {}", app.explorer_label(path)),
+                format!("{indent}{marker} {status} {}", app.explorer_label(path)),
                 style,
             )));
         }
@@ -1349,6 +1403,13 @@ fn draw_center(frame: &mut Frame<'_>, area: Rect, app: &App) {
                     .add_modifier(selection_modifier),
             )];
             let mut highlighted = highlight_line(&chunk, app.language(), foreground, background);
+            apply_search_highlights(
+                &mut highlighted,
+                &chunk,
+                app.search_query(),
+                app.search_regex(),
+            );
+            apply_link_highlight(&mut highlighted, &chunk, app.editor_hover_link(index));
             for span in &mut highlighted {
                 span.style = span.style.add_modifier(selection_modifier);
             }
@@ -1521,6 +1582,7 @@ fn draw_center(frame: &mut Frame<'_>, area: Rect, app: &App) {
     }
     let bottom = match app.bottom_tab() {
         BottomTab::Terminal => {
+            app.set_terminal_viewport_rows(3);
             let mut lines = app.terminal_screen_styled_lines();
             if lines.len() > 3 {
                 lines = lines.split_off(lines.len() - 3);
@@ -1658,11 +1720,21 @@ fn draw_center(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let bottom_title = if app.bottom_tab() == BottomTab::Terminal {
         let title = app.terminal_title();
         let terminal_name = if title.is_empty() {
-            format!(
-                "Terminal {}/{}",
-                app.active_terminal() + 1,
-                app.terminal_count()
-            )
+            if let Some(directory) = app.terminal_working_directory() {
+                let directory = directory.trim_end_matches('/');
+                let directory = directory.rsplit('/').next().unwrap_or(directory);
+                format!(
+                    "Terminal · {directory} ({}/{})",
+                    app.active_terminal() + 1,
+                    app.terminal_count()
+                )
+            } else {
+                format!(
+                    "Terminal {}/{}",
+                    app.active_terminal() + 1,
+                    app.terminal_count()
+                )
+            }
         } else {
             format!(
                 "{} ({}/{})",
@@ -1692,6 +1764,7 @@ fn draw_center(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
 fn draw_terminal_fullscreen(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let theme = active_theme();
+    app.set_terminal_viewport_rows(area.height.saturating_sub(2) as usize);
     let mut text = Text::default();
     for row in app.terminal_screen_styled_lines() {
         text.lines.push(Line::from(
@@ -1871,6 +1944,84 @@ fn highlight_line(
         spans.push(Span::styled(String::new(), Style::default().bg(background)));
     }
     spans
+}
+
+fn apply_search_highlights(spans: &mut [Span<'static>], text: &str, query: &str, use_regex: bool) {
+    if query.is_empty() || text.is_empty() {
+        return;
+    }
+    let ranges = if use_regex {
+        Regex::new(query)
+            .ok()
+            .map(|regex| regex.find_iter(text).map(|m| m.range()).collect::<Vec<_>>())
+            .unwrap_or_default()
+    } else if query.chars().any(char::is_uppercase) {
+        text.match_indices(query)
+            .map(|(start, value)| start..start + value.len())
+            .collect::<Vec<_>>()
+    } else {
+        let mut ranges = Vec::new();
+        let mut offset = 0;
+        while offset < text.len() {
+            let remaining = &text[offset..];
+            if remaining
+                .get(..query.len())
+                .is_some_and(|candidate| candidate.eq_ignore_ascii_case(query))
+            {
+                ranges.push(offset..offset + query.len());
+                offset += query.len();
+            } else if let Some(character) = remaining.chars().next() {
+                offset += character.len_utf8();
+            } else {
+                break;
+            }
+        }
+        ranges
+    };
+    if ranges.is_empty() {
+        return;
+    }
+    let theme = active_theme();
+    let mut byte_offset = 0;
+    for span in spans {
+        let span_text = span.content.as_ref();
+        let span_start = byte_offset;
+        byte_offset += span_text.len();
+        let span_end = byte_offset;
+        if ranges
+            .iter()
+            .any(|range| range.start < span_end && range.end > span_start)
+        {
+            span.style = span
+                .style
+                .fg(theme.background)
+                .bg(theme.warning)
+                .add_modifier(Modifier::BOLD);
+        }
+    }
+}
+
+fn apply_link_highlight(spans: &mut [Span<'static>], text: &str, link: Option<&str>) {
+    let Some(link) = link else {
+        return;
+    };
+    let Some(start) = text.find(link) else {
+        return;
+    };
+    let end = start + link.len();
+    let mut offset = 0;
+    for span in spans {
+        let span_text = span.content.as_ref();
+        let span_start = offset;
+        let span_end = span_start + span_text.len();
+        if span_start < end && span_end > start {
+            span.style = span
+                .style
+                .fg(active_theme().accent)
+                .add_modifier(Modifier::UNDERLINED);
+        }
+        offset = span_end;
+    }
 }
 
 fn comment_prefix(language: &str) -> Option<&'static str> {
@@ -2122,7 +2273,7 @@ fn draw_plugin_palette(frame: &mut Frame<'_>, area: Rect, app: &App) {
 fn draw_settings_overlay(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let theme = active_theme();
     let width = area.width.clamp(34, 64);
-    let height = area.height.clamp(8, 14);
+    let height = area.height.clamp(8, 20);
     let popup = Rect::new(
         area.x + area.width.saturating_sub(width) / 2,
         area.y + area.height.saturating_sub(height) / 3,
@@ -2153,15 +2304,89 @@ fn draw_settings_overlay(frame: &mut Frame<'_>, area: Rect, app: &App) {
 fn draw_quick_open(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let theme = active_theme();
     let width = area.width.clamp(32, 72);
+    let results = app.quick_open_results();
+    let command_mode = app.quick_open_title() == "Command Palette";
+    let help_mode = app.quick_open_title() == "Keyboard Help";
+    let commands = if command_mode {
+        app.command_palette_items_for_quick_open()
+    } else {
+        Vec::new()
+    };
+    let help_items = if help_mode {
+        app.quick_open_help_items()
+    } else {
+        Vec::new()
+    };
+    let row_count = if command_mode {
+        commands.len()
+    } else if help_mode {
+        help_items.len()
+    } else {
+        results.len()
+    };
+    let height = if app.quick_open_title() == "Save As" {
+        3
+    } else {
+        (3 + row_count.min(8) as u16).min(area.height.saturating_sub(2))
+    };
     let popup = Rect::new(
         area.x + area.width.saturating_sub(width) / 2,
         area.y + 2,
         width,
-        3.min(area.height.saturating_sub(2)),
+        height,
     );
     frame.render_widget(Clear, popup);
+    let mut lines = vec![format!("Path: {}", app.quick_open_query())];
+    if command_mode {
+        lines.extend(
+            commands
+                .iter()
+                .take(8)
+                .enumerate()
+                .map(|(index, (id, title))| {
+                    let marker = if index == app.quick_open_index() {
+                        "▶"
+                    } else {
+                        " "
+                    };
+                    format!("{marker} {title} · {id}")
+                }),
+        );
+    } else if help_mode {
+        lines.extend(
+            help_items
+                .iter()
+                .take(8)
+                .enumerate()
+                .map(|(index, (key, description))| {
+                    let marker = if index == app.quick_open_index() {
+                        "▶"
+                    } else {
+                        " "
+                    };
+                    format!("{marker} {key:<14} {description}")
+                }),
+        );
+    } else if app.quick_open_title() != "Save As" {
+        lines.extend(results.iter().take(8).enumerate().map(|(index, path)| {
+            let label = app
+                .workspace_roots()
+                .iter()
+                .find_map(|root| path.strip_prefix(root).ok())
+                .map_or_else(
+                    || path.display().to_string(),
+                    |relative| relative.display().to_string(),
+                );
+            let marker = if index == app.quick_open_index() {
+                "▶"
+            } else {
+                " "
+            };
+            format!("{marker} {label}")
+        }));
+    }
     frame.render_widget(
-        Paragraph::new(format!("Path: {}", app.quick_open_query()))
+        Paragraph::new(lines.join("\n"))
             .style(Style::default().fg(theme.foreground).bg(theme.panel))
             .block(panel(app.quick_open_title(), true)),
         popup,
@@ -2212,6 +2437,19 @@ fn draw_goto(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
 fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let theme = active_theme();
+    if let Some(echo) = app.plugin_echo() {
+        app.set_plugin_status_hits(Vec::new());
+        frame.render_widget(
+            Paragraph::new(format!(" {echo}"))
+                .style(Style::default().fg(theme.background).bg(theme.accent)),
+            area,
+        );
+        return;
+    }
+    let status_message = app
+        .plugin_notification()
+        .map(|(message, level)| format!("[{level}] {message}"))
+        .unwrap_or_else(|| app.status_message().to_owned());
     let cursor = app.cursor();
     let diagnostic = app
         .diagnostic_message(cursor.line)
@@ -2240,7 +2478,7 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
     };
     let text = format!(
         " {}{}{}   Ln {}, Col {}   UTF-8   {}   {}   {}   {}{}   Tab: focus · Ctrl+Q: quit",
-        app.status_message(),
+        status_message,
         diagnostic,
         plugin_left_suffix,
         cursor.line + 1,
@@ -2258,7 +2496,7 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
             .fold(0, u16::saturating_add)
     };
     let mut hits = Vec::new();
-    let left_prefix = format!(" {}{}", app.status_message(), diagnostic);
+    let left_prefix = format!(" {}{}", status_message, diagnostic);
     let mut position = width(&left_prefix);
     for (index, (runtime_index, id, item)) in plugin_left_items.iter().enumerate() {
         position = position.saturating_add(width(" · "));
@@ -2324,7 +2562,7 @@ fn panel<'a>(title: &'a str, focused: bool) -> Block<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
     use ratatui::{backend::TestBackend, Terminal};
 
     #[test]
@@ -2341,6 +2579,74 @@ mod tests {
     fn horizontal_viewport_uses_display_columns() {
         assert_eq!(visual_chunks("a你好b", None, 2, 4), vec!["你好b"]);
         assert_eq!(visual_cursor("a你好b", 2, None, 2), (0, 1));
+    }
+
+    #[test]
+    fn search_highlights_follow_smart_case_and_regex() {
+        let theme = active_theme();
+        let mut smart_case =
+            highlight_line("Needle needle", "txt", theme.foreground, theme.background);
+        apply_search_highlights(&mut smart_case, "Needle needle", "Needle", false);
+        assert_eq!(
+            smart_case
+                .iter()
+                .filter(|span| span.style.bg == Some(theme.warning))
+                .count(),
+            1
+        );
+
+        let mut regex = highlight_line("one 42 two", "txt", theme.foreground, theme.background);
+        apply_search_highlights(&mut regex, "one 42 two", r"\d+", true);
+        assert!(regex
+            .iter()
+            .any(|span| span.style.bg == Some(theme.warning)));
+    }
+
+    #[test]
+    fn ctrl_hover_link_highlight_marks_only_the_visible_link() {
+        let mut spans = vec![
+            Span::raw("see "),
+            Span::raw("https://example.com"),
+            Span::raw(" now"),
+        ];
+        apply_link_highlight(
+            &mut spans,
+            "see https://example.com now",
+            Some("https://example.com"),
+        );
+        assert_eq!(spans[0].style, Style::default());
+        assert_ne!(spans[1].style, Style::default());
+        assert_eq!(spans[2].style, Style::default());
+    }
+
+    #[test]
+    fn alt_mouse_wheel_scrolls_editor_horizontally() {
+        let mut app = App::new(&[]).expect("app");
+        app.set_focus(Focus::Editor);
+        let area = Rect::new(0, 0, 120, 40);
+        let editor = editor_content_area(&app, area).expect("editor area");
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: editor.x.saturating_add(8),
+                row: editor.y.saturating_add(1),
+                modifiers: KeyModifiers::ALT,
+            },
+            area,
+        );
+        assert_eq!(app.horizontal_scroll(), 4);
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: editor.x.saturating_add(8),
+                row: editor.y.saturating_add(1),
+                modifiers: KeyModifiers::ALT,
+            },
+            area,
+        );
+        assert_eq!(app.horizontal_scroll(), 0);
     }
 
     #[test]

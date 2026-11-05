@@ -259,7 +259,7 @@ pub fn conflict_blocks(lines: &[String]) -> Vec<ConflictBlock> {
 
 pub fn status(root: &Path) -> Vec<GitChange> {
     let output = Command::new("git")
-        .args(["status", "--short", "--untracked-files=all"])
+        .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
         .current_dir(root)
         .output();
     let Ok(output) = output else {
@@ -268,10 +268,7 @@ pub fn status(root: &Path) -> Vec<GitChange> {
     if !output.status.success() {
         return Vec::new();
     }
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(parse_status_line)
-        .collect()
+    parse_status_bytes(&output.stdout)
 }
 
 pub fn current_branch(root: &Path) -> Option<String> {
@@ -712,6 +709,7 @@ fn parse_diff(text: &str) -> Vec<DiffLine> {
         .collect()
 }
 
+#[cfg(test)]
 fn parse_status_line(line: &str) -> Option<GitChange> {
     let bytes = line.as_bytes();
     if bytes.len() < 4 {
@@ -722,6 +720,37 @@ fn parse_status_line(line: &str) -> Option<GitChange> {
         worktree: bytes[1] as char,
         path: line[3..].to_owned(),
     })
+}
+
+fn parse_status_bytes(bytes: &[u8]) -> Vec<GitChange> {
+    let records: Vec<&[u8]> = bytes
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+        .collect();
+    let mut changes = Vec::new();
+    let mut index = 0;
+    while let Some(record) = records.get(index) {
+        if record.len() < 4 {
+            index += 1;
+            continue;
+        }
+        let path = String::from_utf8_lossy(&record[3..]).into_owned();
+        let status = GitChange {
+            index: record[0] as char,
+            worktree: record[1] as char,
+            path,
+        };
+        if (matches!(status.index, 'R' | 'C') || matches!(status.worktree, 'R' | 'C'))
+            && records.get(index + 1).is_some()
+        {
+            changes.push(status);
+            index += 2;
+            continue;
+        }
+        changes.push(status);
+        index += 1;
+    }
+    changes
 }
 
 #[cfg(test)]
@@ -749,6 +778,65 @@ mod tests {
                 path: "src/app.rs".into()
             })
         );
+    }
+
+    #[test]
+    fn parses_porcelain_status_with_nul_separated_rename_and_special_paths() {
+        let changes = parse_status_bytes(
+            b"R  new name [draft].rs\0old name\0 M path with spaces.rs\0?? weird\nname\0",
+        );
+        assert_eq!(
+            changes,
+            vec![
+                GitChange {
+                    index: 'R',
+                    worktree: ' ',
+                    path: "new name [draft].rs".into(),
+                },
+                GitChange {
+                    index: ' ',
+                    worktree: 'M',
+                    path: "path with spaces.rs".into(),
+                },
+                GitChange {
+                    index: '?',
+                    worktree: '?',
+                    path: "weird\nname".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn reads_real_renamed_worktree_path_from_porcelain_status() {
+        let root = std::env::temp_dir().join(format!("mtide-git-status-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("directory");
+        let run = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .output()
+                .expect("git");
+            assert!(output.status.success(), "git {:?}: {:?}", args, output);
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "test@example.com"]);
+        run(&["config", "user.name", "Test"]);
+        fs::write(root.join("old name.txt"), "content\n").expect("file");
+        run(&["add", "--", "old name.txt"]);
+        run(&["commit", "-qm", "initial"]);
+        fs::rename(root.join("old name.txt"), root.join("new name.txt")).expect("rename");
+        run(&["add", "-A"]);
+        assert_eq!(
+            status(&root),
+            vec![GitChange {
+                index: 'R',
+                worktree: ' ',
+                path: "new name.txt".into(),
+            }]
+        );
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]

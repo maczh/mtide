@@ -33,6 +33,8 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 pub const SUPPORTED_API: u32 = 2;
 const PLUGIN_TERMINAL_OUTPUT_LIMIT: usize = 1_048_576;
 const PLUGIN_STORAGE_LIMIT: usize = 1 << 20;
+type PanelNodeMenus = Rc<RefCell<BTreeMap<String, Vec<(String, String)>>>>;
+type PanelTitleMenus = Rc<RefCell<BTreeMap<String, Vec<(String, String)>>>>;
 const PLUGIN_REGISTRY_RESPONSE_LIMIT: usize = 4 * 1024 * 1024;
 const PLUGIN_PACKAGE_RESPONSE_LIMIT: usize = 64 * 1024 * 1024;
 
@@ -798,6 +800,18 @@ struct PluginAutomationRequest {
 }
 
 type PluginBookmarks = BTreeMap<String, BTreeMap<usize, (String, String)>>;
+type PanelButtonActions = BTreeMap<String, Vec<(usize, RegistryKey)>>;
+
+#[derive(Debug, Clone)]
+struct PanelActionRegion {
+    line: usize,
+    start: usize,
+    end: usize,
+    command: String,
+    row: usize,
+}
+
+type PanelActionRegions = BTreeMap<String, Vec<PanelActionRegion>>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginFileHandler {
@@ -812,6 +826,8 @@ pub struct PluginRuntime {
     _lua: Lua,
     registration: Rc<RefCell<PluginRegistration>>,
     logs: Rc<RefCell<Vec<String>>>,
+    notification: Rc<RefCell<Option<(String, String)>>>,
+    echo_text: Rc<RefCell<String>>,
     command_callbacks: Rc<RefCell<BTreeMap<String, RegistryKey>>>,
     event_callbacks: Rc<RefCell<BTreeMap<String, Vec<RegistryKey>>>>,
     panel_callbacks: Rc<RefCell<BTreeMap<String, RegistryKey>>>,
@@ -848,13 +864,29 @@ pub struct PluginRuntime {
     timers: Rc<RefCell<BTreeMap<u64, PluginTimer>>>,
     automation_requests: Rc<RefCell<Vec<PluginAutomationRequest>>>,
     automation_callbacks: Rc<RefCell<BTreeMap<u64, RegistryKey>>>,
+    automation_cancelled: Rc<RefCell<BTreeSet<u64>>>,
     dialog_callbacks: Rc<RefCell<BTreeMap<u64, RegistryKey>>>,
     command_line_callbacks: Rc<RefCell<BTreeMap<u64, PluginCommandLineCallbacks>>>,
     command_line_active: Rc<RefCell<bool>>,
     custom_dialog_callbacks: Rc<RefCell<BTreeMap<u64, PluginCustomDialogCallbacks>>>,
     dialog_widgets: Rc<RefCell<BTreeMap<u64, PluginDialogWidgetState>>>,
     drawer_actions: Rc<RefCell<Vec<(usize, RegistryKey)>>>,
+    drawer_focused_button: Rc<RefCell<Option<usize>>>,
+    panel_button_actions: Rc<RefCell<PanelButtonActions>>,
+    panel_focused_button: Rc<RefCell<BTreeMap<String, usize>>>,
+    panel_action_regions: Rc<RefCell<PanelActionRegions>>,
     drawer_input: Rc<RefCell<Option<PluginDrawerInputState>>>,
+    panel_inputs: Rc<RefCell<BTreeMap<String, PluginDrawerInputState>>>,
+    panel_passwords: Rc<RefCell<BTreeMap<String, PluginDrawerInputState>>>,
+    panel_checkboxes: Rc<RefCell<BTreeMap<String, PluginDrawerCheckboxState>>>,
+    panel_dropdown_lines: Rc<RefCell<BTreeMap<String, usize>>>,
+    panel_focused_dropdown: Rc<RefCell<BTreeMap<String, usize>>>,
+    panel_radio_lines: Rc<RefCell<BTreeMap<String, usize>>>,
+    panel_focused_radio: Rc<RefCell<BTreeMap<String, usize>>>,
+    panel_tabs_lines: Rc<RefCell<BTreeMap<String, usize>>>,
+    panel_focused_tabs: Rc<RefCell<BTreeMap<String, usize>>>,
+    panel_scrollview_lines: Rc<RefCell<BTreeMap<String, usize>>>,
+    panel_focused_scrollview: Rc<RefCell<BTreeMap<String, usize>>>,
     drawer_checkbox: Rc<RefCell<Option<PluginDrawerCheckboxState>>>,
     drawer_dropdown: Rc<RefCell<Option<PluginDrawerDropdownState>>>,
     rpc_rx: Receiver<RpcEvent>,
@@ -866,6 +898,10 @@ pub struct PluginRuntime {
     panel_activation_callbacks: Rc<RefCell<BTreeMap<String, RegistryKey>>>,
     panel_command_callbacks: Rc<RefCell<BTreeMap<String, RegistryKey>>>,
     panel_key_commands: Rc<RefCell<BTreeMap<String, BTreeMap<String, String>>>>,
+    tree_navigation_callbacks: Rc<RefCell<BTreeMap<String, RegistryKey>>>,
+    panel_node_menus: PanelNodeMenus,
+    panel_title_menus: PanelTitleMenus,
+    panel_title_callbacks: Rc<RefCell<BTreeMap<String, RegistryKey>>>,
     status_callbacks: Rc<RefCell<BTreeMap<String, RegistryKey>>>,
     editor_context_callback: Rc<RefCell<Option<RegistryKey>>>,
     editor_context_items: Rc<RefCell<Vec<PluginContextMenuItem>>>,
@@ -965,10 +1001,17 @@ struct PluginCustomDialogCallbacks {
 #[derive(Debug, Default)]
 struct PluginDialogWidgetState {
     input_text: String,
+    input_prefix: String,
+    input_multiline: bool,
+    input_wrap: bool,
+    input_min_rows: usize,
+    input_max_rows: usize,
     input_initialized: bool,
     input_masked: bool,
     input_on_change: Option<RegistryKey>,
     input_on_submit: Option<RegistryKey>,
+    input_clear_on_submit: bool,
+    input_autofocus: bool,
     buttons: Vec<PluginDialogButtonState>,
     dropdown: Option<PluginDialogDropdownState>,
     checkbox: Option<PluginDialogCheckboxState>,
@@ -990,10 +1033,17 @@ struct PluginDialogButtonState {
 struct PluginDrawerInputState {
     line: usize,
     text: String,
+    prefix: String,
+    multiline: bool,
+    wrap: bool,
+    min_rows: usize,
+    max_rows: usize,
     initialized: bool,
     focused: bool,
     on_change: Option<RegistryKey>,
     on_submit: Option<RegistryKey>,
+    clear_on_submit: bool,
+    autofocus: bool,
 }
 
 #[derive(Debug, Default)]
@@ -1134,6 +1184,7 @@ struct SpawnRegistration {
     stdout_open: bool,
     stderr_open: bool,
     exited: bool,
+    exit_code: Option<i32>,
 }
 
 #[derive(Debug)]
@@ -1751,6 +1802,8 @@ impl PluginRuntime {
         let next_spawn_id = Rc::new(RefCell::new(0_u64));
         let panel_requests = Rc::new(RefCell::new(Vec::new()));
         let clipboard_text = Rc::new(RefCell::new(String::new()));
+        let notification = Rc::new(RefCell::new(None));
+        let echo_text = Rc::new(RefCell::new(String::new()));
         let editor_snapshot = Rc::new(RefCell::new(PluginEditorSnapshot::default()));
         let diff_snapshot: Rc<RefCell<Option<PluginDiffSnapshot>>> = Rc::new(RefCell::new(None));
         let panel_size = Rc::new(RefCell::new((0, 0)));
@@ -1765,6 +1818,7 @@ impl PluginRuntime {
         let automation_requests = Rc::new(RefCell::new(Vec::new()));
         let next_automation_id = Rc::new(RefCell::new(0_u64));
         let automation_callbacks = Rc::new(RefCell::new(BTreeMap::new()));
+        let automation_cancelled = Rc::new(RefCell::new(BTreeSet::new()));
         let dialog_callbacks = Rc::new(RefCell::new(BTreeMap::new()));
         let next_dialog_id = Rc::new(RefCell::new(0_u64));
         let command_line_callbacks = Rc::new(RefCell::new(BTreeMap::new()));
@@ -1772,7 +1826,22 @@ impl PluginRuntime {
         let custom_dialog_callbacks = Rc::new(RefCell::new(BTreeMap::new()));
         let dialog_widgets = Rc::new(RefCell::new(BTreeMap::new()));
         let drawer_actions = Rc::new(RefCell::new(Vec::new()));
+        let drawer_focused_button = Rc::new(RefCell::new(None));
+        let panel_button_actions = Rc::new(RefCell::new(BTreeMap::new()));
+        let panel_focused_button = Rc::new(RefCell::new(BTreeMap::new()));
+        let panel_action_regions = Rc::new(RefCell::new(BTreeMap::new()));
         let drawer_input = Rc::new(RefCell::new(None));
+        let panel_inputs = Rc::new(RefCell::new(BTreeMap::new()));
+        let panel_passwords = Rc::new(RefCell::new(BTreeMap::new()));
+        let panel_checkboxes = Rc::new(RefCell::new(BTreeMap::new()));
+        let panel_dropdown_lines = Rc::new(RefCell::new(BTreeMap::new()));
+        let panel_focused_dropdown = Rc::new(RefCell::new(BTreeMap::new()));
+        let panel_radio_lines = Rc::new(RefCell::new(BTreeMap::new()));
+        let panel_focused_radio = Rc::new(RefCell::new(BTreeMap::new()));
+        let panel_tabs_lines = Rc::new(RefCell::new(BTreeMap::new()));
+        let panel_focused_tabs = Rc::new(RefCell::new(BTreeMap::new()));
+        let panel_scrollview_lines = Rc::new(RefCell::new(BTreeMap::new()));
+        let panel_focused_scrollview = Rc::new(RefCell::new(BTreeMap::new()));
         let drawer_checkbox = Rc::new(RefCell::new(None));
         let drawer_dropdown = Rc::new(RefCell::new(None));
         let next_custom_dialog_id = Rc::new(RefCell::new(0_u64));
@@ -1788,6 +1857,10 @@ impl PluginRuntime {
         let panel_activation_callbacks = Rc::new(RefCell::new(BTreeMap::new()));
         let panel_command_callbacks = Rc::new(RefCell::new(BTreeMap::new()));
         let panel_key_commands = Rc::new(RefCell::new(BTreeMap::new()));
+        let tree_navigation_callbacks = Rc::new(RefCell::new(BTreeMap::new()));
+        let panel_node_menus = Rc::new(RefCell::new(BTreeMap::new()));
+        let panel_title_menus = Rc::new(RefCell::new(BTreeMap::new()));
+        let panel_title_callbacks = Rc::new(RefCell::new(BTreeMap::new()));
         let status_callbacks = Rc::new(RefCell::new(BTreeMap::new()));
         let module = lua.create_table().map_err(lua_error)?;
 
@@ -2020,14 +2093,39 @@ impl PluginRuntime {
             .map_err(lua_error)?;
 
         let notify_sink = Rc::clone(&logs);
+        let notification_sink = Rc::clone(&notification);
         module
             .set(
                 "notify",
                 lua.create_function(move |_lua, (message, level): (String, Option<String>)| {
-                    notify_sink.borrow_mut().push(format!(
-                        "[{}] {message}",
-                        level.unwrap_or_else(|| "info".to_owned())
-                    ));
+                    let level = level.unwrap_or_else(|| "info".to_owned());
+                    notify_sink
+                        .borrow_mut()
+                        .push(format!("[{level}] {message}"));
+                    *notification_sink.borrow_mut() = Some((message, level));
+                    Ok(())
+                })
+                .map_err(lua_error)?,
+            )
+            .map_err(lua_error)?;
+
+        let echo_sink = Rc::clone(&echo_text);
+        module
+            .set(
+                "set_echo",
+                lua.create_function(move |_, text: String| {
+                    *echo_sink.borrow_mut() = text;
+                    Ok(())
+                })
+                .map_err(lua_error)?,
+            )
+            .map_err(lua_error)?;
+        let clear_echo_sink = Rc::clone(&echo_text);
+        module
+            .set(
+                "clear_echo",
+                lua.create_function(move |_, ()| {
+                    clear_echo_sink.borrow_mut().clear();
                     Ok(())
                 })
                 .map_err(lua_error)?,
@@ -2372,11 +2470,19 @@ impl PluginRuntime {
                         .map(|callback| lua.create_registry_value(callback))
                         .transpose()?;
                     let focus = config.get::<Option<bool>>("focus")?.unwrap_or(true);
+                    let panel_id = format!("__tab:{id}");
+                    if let Some(previous) = tab_panel_sink.borrow_mut().remove(&panel_id) {
+                        let _ = lua.remove_registry_value(previous);
+                    }
                     tab_panel_sink
                         .borrow_mut()
-                        .insert(format!("__tab:{id}"), lua.create_registry_value(render)?);
+                        .insert(panel_id, lua.create_registry_value(render)?);
                     let tab_id = id.clone();
-                    open_tabs_sink.borrow_mut().insert(id.clone(), on_close);
+                    if let Some(Some(previous)) =
+                        open_tabs_sink.borrow_mut().insert(id.clone(), on_close)
+                    {
+                        let _ = lua.remove_registry_value(previous);
+                    }
                     if let Some(on_event) = on_event {
                         if let Some(previous) =
                             tab_event_sink.borrow_mut().insert(id.clone(), on_event)
@@ -3034,7 +3140,9 @@ impl PluginRuntime {
                     }
                     let path = resolve_fs_path(&snapshot_root, &path);
                     if !fs_path_allowed(&path, &screenshot_write_roots) {
-                        return Err(mlua::Error::external("screenshot path is outside fs.write scope"));
+                        return Err(mlua::Error::external(
+                            "screenshot path is outside fs.write scope",
+                        ));
                     }
                     fs::write(&path, text).map_err(mlua::Error::external)?;
                     Ok(LuaValue::Boolean(true))
@@ -3222,6 +3330,7 @@ impl PluginRuntime {
         let automation_module = lua.create_table().map_err(lua_error)?;
         let automation_sink = Rc::clone(&automation_requests);
         let automation_ids = Rc::clone(&next_automation_id);
+        let automation_cancelled_sink = Rc::clone(&automation_cancelled);
         automation_module
             .set(
                 "run",
@@ -3238,12 +3347,17 @@ impl PluginRuntime {
                             callback,
                         });
                         let cancel_sink = Rc::clone(&automation_sink);
+                        let cancel_marks = Rc::clone(&automation_cancelled_sink);
                         lua.create_function(move |_, ()| {
                             let before = cancel_sink.borrow().len();
                             cancel_sink
                                 .borrow_mut()
                                 .retain(|request| request.task.id != id);
-                            Ok(cancel_sink.borrow().len() != before)
+                            let removed = cancel_sink.borrow().len() != before;
+                            if !removed {
+                                cancel_marks.borrow_mut().insert(id);
+                            }
+                            Ok(removed)
                         })
                     },
                 )
@@ -3597,14 +3711,9 @@ impl PluginRuntime {
         crypto_module
             .set(
                 "base64_decode",
-                lua.create_function(|lua, value: String| {
-                    match base64_decode(&value) {
-                        Ok(decoded) => Ok((
-                            Some(lua.create_string(&decoded)?),
-                            Option::<String>::None,
-                        )),
-                        Err(error) => Ok((Option::<mlua::String>::None, Some(error))),
-                    }
+                lua.create_function(|lua, value: String| match base64_decode(&value) {
+                    Ok(decoded) => Ok((Some(lua.create_string(&decoded)?), Option::<String>::None)),
+                    Err(error) => Ok((Option::<mlua::String>::None, Some(error))),
                 })
                 .map_err(lua_error)?,
             )
@@ -3914,6 +4023,7 @@ impl PluginRuntime {
                             stdout_open,
                             stderr_open,
                             exited: false,
+                            exit_code: None,
                         },
                     );
                     if let Some(stdout) = stdout {
@@ -5121,7 +5231,7 @@ impl PluginRuntime {
         fs_module
             .set(
                 "read",
-                lua.create_function(move |_, relative: String| {
+                lua.create_function(move |lua, relative: String| {
                     if !can_read {
                         return Err(mlua::Error::external("permission denied: fs.read"));
                     }
@@ -5129,8 +5239,10 @@ impl PluginRuntime {
                     if !fs_path_allowed(&path, &read_scopes) {
                         return Ok((None, Some("access denied".to_owned())));
                     }
-                    match fs::read_to_string(path) {
-                        Ok(contents) => Ok((Some(contents), None)),
+                    match fs::read(path) {
+                        Ok(contents) => {
+                            Ok((Some(lua.create_string(&contents)?), Option::<String>::None))
+                        }
                         Err(error) => Ok((None, Some(error.to_string()))),
                     }
                 })
@@ -5200,7 +5312,7 @@ impl PluginRuntime {
         fs_module
             .set(
                 "write",
-                lua.create_function(move |_, (relative, contents): (String, String)| {
+                lua.create_function(move |_, (relative, contents): (String, mlua::String)| {
                     if !can_write {
                         return Err(mlua::Error::external("permission denied: fs.write"));
                     }
@@ -5208,7 +5320,7 @@ impl PluginRuntime {
                     if !fs_path_allowed(&path, &write_scopes) {
                         return Ok((None, Some("access denied".to_owned())));
                     }
-                    match fs::write(path, contents) {
+                    match fs::write(path, contents.as_bytes()) {
                         Ok(()) => Ok((Some(true), None)),
                         Err(error) => Ok((None, Some(error.to_string()))),
                     }
@@ -5720,6 +5832,8 @@ impl PluginRuntime {
             _lua: lua,
             registration,
             logs,
+            notification,
+            echo_text,
             command_callbacks,
             event_callbacks,
             panel_callbacks,
@@ -5755,13 +5869,29 @@ impl PluginRuntime {
             timers,
             automation_requests,
             automation_callbacks,
+            automation_cancelled,
             dialog_callbacks,
             command_line_callbacks,
             command_line_active,
             custom_dialog_callbacks,
             dialog_widgets,
             drawer_actions,
+            drawer_focused_button,
+            panel_button_actions,
+            panel_focused_button,
+            panel_action_regions,
             drawer_input,
+            panel_inputs,
+            panel_passwords,
+            panel_checkboxes,
+            panel_dropdown_lines,
+            panel_focused_dropdown,
+            panel_radio_lines,
+            panel_focused_radio,
+            panel_tabs_lines,
+            panel_focused_tabs,
+            panel_scrollview_lines,
+            panel_focused_scrollview,
             drawer_checkbox,
             drawer_dropdown,
             rpc_rx,
@@ -5773,6 +5903,10 @@ impl PluginRuntime {
             panel_activation_callbacks,
             panel_command_callbacks,
             panel_key_commands,
+            tree_navigation_callbacks,
+            panel_node_menus,
+            panel_title_menus,
+            panel_title_callbacks,
             status_callbacks,
             editor_context_callback,
             editor_context_items,
@@ -5783,6 +5917,12 @@ impl PluginRuntime {
     }
     pub fn logs(&self) -> Vec<String> {
         self.logs.borrow().clone()
+    }
+    pub fn echo_text(&self) -> String {
+        self.echo_text.borrow().clone()
+    }
+    pub fn notification(&self) -> Option<(String, String)> {
+        self.notification.borrow().clone()
     }
     pub fn drain_panel_requests(&self) -> Vec<PluginPanelRequest> {
         self.panel_requests.borrow_mut().drain(..).collect()
@@ -6048,7 +6188,7 @@ impl PluginRuntime {
     }
 
     pub fn dialog_submit(&self, id: u64) -> AppResult<bool> {
-        let callback = {
+        let (callback, clear_on_submit) = {
             let widgets = self.dialog_widgets.borrow();
             let Some(state) = widgets.get(&id) else {
                 return Ok(false);
@@ -6056,12 +6196,15 @@ impl PluginRuntime {
             if state.focus != PluginDialogFocus::Input {
                 return Ok(false);
             }
-            state
-                .input_on_submit
-                .as_ref()
-                .map(|key| self._lua.registry_value::<Function>(key))
-                .transpose()
-                .map_err(lua_error)?
+            (
+                state
+                    .input_on_submit
+                    .as_ref()
+                    .map(|key| self._lua.registry_value::<Function>(key))
+                    .transpose()
+                    .map_err(lua_error)?,
+                state.input_clear_on_submit,
+            )
         };
         let Some(callback) = callback else {
             return Ok(false);
@@ -6075,6 +6218,11 @@ impl PluginRuntime {
         callback
             .call::<()>(text)
             .map_err(|error| plugin_error(format!("dialog input submit failed: {error}")))?;
+        if clear_on_submit {
+            if let Some(state) = self.dialog_widgets.borrow_mut().get_mut(&id) {
+                state.input_text.clear();
+            }
+        }
         Ok(true)
     }
 
@@ -6351,6 +6499,102 @@ impl PluginRuntime {
             }
         }
     }
+    pub fn panel_context_menu(&self, panel_id: &str) -> Vec<String> {
+        let items = self
+            .panel_node_menus
+            .borrow()
+            .get(panel_id)
+            .cloned()
+            .or_else(|| self.panel_title_menus.borrow().get(panel_id).cloned())
+            .unwrap_or_default();
+        items.into_iter().map(|(label, _)| label).collect()
+    }
+    pub fn panel_selected_row(&self, panel_id: &str) -> usize {
+        let Some(selection_key) = self.panel_active_selection.borrow().get(panel_id).cloned()
+        else {
+            return 1;
+        };
+        self.panel_selection_state
+            .borrow()
+            .get(&selection_key)
+            .map(|(selected, _)| selected + 1)
+            .unwrap_or(1)
+    }
+    pub fn set_panel_selected_row(&self, panel_id: &str, row: usize) -> bool {
+        let Some(selection_key) = self.panel_active_selection.borrow().get(panel_id).cloned()
+        else {
+            return false;
+        };
+        let mut states = self.panel_selection_state.borrow_mut();
+        let Some((selected, count)) = states.get_mut(&selection_key) else {
+            return false;
+        };
+        if *count == 0 {
+            return false;
+        }
+        let next = row.min(*count - 1);
+        if *selected == next {
+            return false;
+        }
+        *selected = next;
+        self.panel_selection_dirty
+            .borrow_mut()
+            .insert(selection_key);
+        true
+    }
+    pub fn activate_panel_context_item(
+        &self,
+        panel_id: &str,
+        index: usize,
+        row: usize,
+    ) -> AppResult<bool> {
+        let node_command = self
+            .panel_node_menus
+            .borrow()
+            .get(panel_id)
+            .and_then(|items| items.get(index))
+            .map(|(_, command)| command.clone());
+        let (command, title_menu) = if let Some(command) = node_command {
+            (command, false)
+        } else if let Some(command) = self
+            .panel_title_menus
+            .borrow()
+            .get(panel_id)
+            .and_then(|items| items.get(index))
+            .map(|(_, command)| command.clone())
+        {
+            (command, true)
+        } else {
+            return Ok(false);
+        };
+        if command.is_empty() {
+            return Ok(false);
+        }
+        if title_menu {
+            let callback: Function = {
+                let callbacks = self.panel_title_callbacks.borrow();
+                let Some(callback_key) = callbacks.get(panel_id) else {
+                    return Ok(false);
+                };
+                self._lua.registry_value(callback_key).map_err(lua_error)?
+            };
+            callback
+                .call::<()>(command)
+                .map_err(|error| plugin_error(format!("panel title menu failed: {error}")))?;
+        } else {
+            let callback: Function = {
+                let callbacks = self.panel_command_callbacks.borrow();
+                let Some(callback_key) = callbacks.get(panel_id) else {
+                    return Ok(false);
+                };
+                self._lua.registry_value(callback_key).map_err(lua_error)?
+            };
+            callback
+                .call::<()>((command, row))
+                .map_err(|error| plugin_error(format!("panel context menu failed: {error}")))?;
+        }
+        Ok(true)
+    }
     pub fn diagnostic_severity(&self, path: &str, line: usize) -> Option<u8> {
         self.diagnostics.borrow().get(path).and_then(|items| {
             items
@@ -6396,6 +6640,7 @@ impl PluginRuntime {
         result: JsonValue,
         error: Option<String>,
     ) -> AppResult<bool> {
+        self.automation_cancelled.borrow_mut().remove(&id);
         let Some(callback) = self.automation_callbacks.borrow_mut().remove(&id) else {
             return Ok(false);
         };
@@ -6409,6 +6654,9 @@ impl PluginRuntime {
         });
         callback.call::<()>(values).map_err(lua_error)?;
         Ok(true)
+    }
+    pub fn take_cancelled_automation(&self, id: u64) -> bool {
+        self.automation_cancelled.borrow_mut().remove(&id)
     }
     pub fn execute_command(&self, id: &str) -> AppResult<bool> {
         let callbacks = self.command_callbacks.borrow();
@@ -6601,9 +6849,7 @@ impl PluginRuntime {
                     SpawnEventKind::Stderr(_) => callbacks
                         .get(&event.id)
                         .and_then(|registration| registration.on_stderr.as_ref()),
-                    SpawnEventKind::Exit(_) => callbacks
-                        .get(&event.id)
-                        .and_then(|registration| registration.on_exit.as_ref()),
+                    SpawnEventKind::Exit(_) => None,
                     SpawnEventKind::StreamClosed { .. } => None,
                 };
                 key.map(|key| self._lua.registry_value::<Function>(key))
@@ -6616,6 +6862,10 @@ impl PluginRuntime {
                 SpawnEventKind::StreamClosed { stderr } => Some(*stderr),
                 _ => None,
             };
+            let exit_code = match &event.kind {
+                SpawnEventKind::Exit(code) => *code,
+                _ => None,
+            };
             if let Some(callback) = callback {
                 match event.kind {
                     SpawnEventKind::Stdout(text) | SpawnEventKind::Stderr(text) => {
@@ -6623,39 +6873,77 @@ impl PluginRuntime {
                             plugin_error(format!("spawn output callback failed: {error}"))
                         })?;
                     }
-                    SpawnEventKind::Exit(code) => {
+                    SpawnEventKind::Exit(_) | SpawnEventKind::StreamClosed { .. } => {}
+                }
+            }
+            if is_stream_closed {
+                let should_emit_exit = {
+                    let mut callbacks = self.spawn_callbacks.borrow_mut();
+                    let Some(registration) = callbacks.get_mut(&event.id) else {
+                        continue;
+                    };
+                    if let Some(stderr) = stream_closed_stderr {
+                        if stderr {
+                            registration.stderr_open = false;
+                        } else {
+                            registration.stdout_open = false;
+                        }
+                    }
+                    registration.exited && !registration.stdout_open && !registration.stderr_open
+                };
+                if should_emit_exit {
+                    let callback = {
+                        let callbacks = self.spawn_callbacks.borrow();
+                        callbacks
+                            .get(&event.id)
+                            .and_then(|registration| registration.on_exit.as_ref())
+                            .map(|key| self._lua.registry_value::<Function>(key))
+                            .transpose()
+                            .map_err(lua_error)?
+                    };
+                    if let Some(callback) = callback {
+                        let code = self
+                            .spawn_callbacks
+                            .borrow()
+                            .get(&event.id)
+                            .and_then(|registration| registration.exit_code)
+                            .unwrap_or(-1);
                         callback
-                            .call::<()>((code.unwrap_or(-1), LuaValue::Nil))
+                            .call::<()>((code, LuaValue::Nil))
                             .map_err(|error| {
                                 plugin_error(format!("spawn exit callback failed: {error}"))
                             })?;
                     }
-                    SpawnEventKind::StreamClosed { .. } => {}
-                }
-            }
-            if is_stream_closed {
-                let mut callbacks = self.spawn_callbacks.borrow_mut();
-                let Some(registration) = callbacks.get_mut(&event.id) else {
-                    continue;
-                };
-                if let Some(stderr) = stream_closed_stderr {
-                    if stderr {
-                        registration.stderr_open = false;
-                    } else {
-                        registration.stdout_open = false;
-                    }
-                }
-                if registration.exited && !registration.stdout_open && !registration.stderr_open {
-                    callbacks.remove(&event.id);
+                    self.spawn_callbacks.borrow_mut().remove(&event.id);
                 }
             } else if is_exit {
-                let mut callbacks = self.spawn_callbacks.borrow_mut();
-                let Some(registration) = callbacks.get_mut(&event.id) else {
-                    continue;
+                let should_emit_exit = {
+                    let mut callbacks = self.spawn_callbacks.borrow_mut();
+                    let Some(registration) = callbacks.get_mut(&event.id) else {
+                        continue;
+                    };
+                    registration.exited = true;
+                    registration.exit_code = exit_code;
+                    !registration.stdout_open && !registration.stderr_open
                 };
-                registration.exited = true;
-                if !registration.stdout_open && !registration.stderr_open {
-                    callbacks.remove(&event.id);
+                if should_emit_exit {
+                    let callback = {
+                        let callbacks = self.spawn_callbacks.borrow();
+                        callbacks
+                            .get(&event.id)
+                            .and_then(|registration| registration.on_exit.as_ref())
+                            .map(|key| self._lua.registry_value::<Function>(key))
+                            .transpose()
+                            .map_err(lua_error)?
+                    };
+                    if let Some(callback) = callback {
+                        callback
+                            .call::<()>((exit_code.unwrap_or(-1), LuaValue::Nil))
+                            .map_err(|error| {
+                                plugin_error(format!("spawn exit callback failed: {error}"))
+                            })?;
+                    }
+                    self.spawn_callbacks.borrow_mut().remove(&event.id);
                 }
             }
             completed += 1;
@@ -6861,8 +7149,24 @@ impl PluginRuntime {
         if let Some(callback) = self.panel_command_callbacks.borrow_mut().remove(id) {
             let _ = self._lua.remove_registry_value(callback);
         }
+        if let Some(callback) = self.panel_title_callbacks.borrow_mut().remove(id) {
+            let _ = self._lua.remove_registry_value(callback);
+        }
+        self.panel_title_menus.borrow_mut().remove(id);
         self.panel_key_commands.borrow_mut().remove(id);
+        if let Some(actions) = self.panel_button_actions.borrow_mut().remove(id) {
+            for (_, callback) in actions {
+                let _ = self._lua.remove_registry_value(callback);
+            }
+        }
+        self.panel_focused_button.borrow_mut().remove(id);
+        self.panel_dropdown_lines.borrow_mut().remove(id);
+        self.panel_action_regions.borrow_mut().remove(id);
+        self.panel_radio_lines.borrow_mut().remove(id);
+        self.panel_tabs_lines.borrow_mut().remove(id);
+        self.panel_scrollview_lines.borrow_mut().remove(id);
         if id == "__drawer" {
+            *self.drawer_focused_button.borrow_mut() = None;
             for (_, callback) in self.drawer_actions.borrow_mut().drain(..) {
                 let _ = self._lua.remove_registry_value(callback);
             }
@@ -6974,10 +7278,9 @@ impl PluginRuntime {
                 )
                 .map_err(lua_error)?;
         }
-        for name in [
-            "label", "text", "markdown", "heading", "line", "status", "cell",
-        ] {
+        for name in ["label", "text", "heading", "line", "status", "cell"] {
             let sink = Rc::clone(&lines);
+            let is_label = name == "label";
             panel
                 .set(
                     name,
@@ -6985,6 +7288,15 @@ impl PluginRuntime {
                         .create_function(
                             move |lua, (_panel, values): (Table, Variadic<LuaValue>)| {
                                 let values = values.into_iter().collect::<Vec<_>>();
+                                if is_label && values.len() == 1 {
+                                    if let Some(LuaValue::Table(value)) = values.first() {
+                                        sink.borrow_mut().push(label_widget_text(
+                                            lua,
+                                            &LuaValue::Table(value.clone()),
+                                        )?);
+                                        return Ok(());
+                                    }
+                                }
                                 if values.len() >= 3 {
                                     let x = lua_value_usize(values.first());
                                     let y = lua_value_usize(values.get(1));
@@ -7010,6 +7322,22 @@ impl PluginRuntime {
                 )
                 .map_err(lua_error)?;
         }
+        let markdown_sink = Rc::clone(&lines);
+        panel
+            .set(
+                "markdown",
+                self._lua
+                    .create_function(move |lua, (_panel, value): (Table, Option<LuaValue>)| {
+                        if let Some(value) = value {
+                            markdown_sink
+                                .borrow_mut()
+                                .extend(markdown_widget_lines(lua, value)?);
+                        }
+                        Ok(())
+                    })
+                    .map_err(lua_error)?,
+            )
+            .map_err(lua_error)?;
         let tree_sink = Rc::clone(&lines);
         let tree_panel_id = id.to_owned();
         let tree_selection_callbacks = Rc::clone(&self.panel_selection_callbacks);
@@ -7018,6 +7346,10 @@ impl PluginRuntime {
         let tree_active_selection = Rc::clone(&self.panel_active_selection);
         let tree_command_callbacks = Rc::clone(&self.panel_command_callbacks);
         let tree_key_commands = Rc::clone(&self.panel_key_commands);
+        let tree_navigation_callbacks = Rc::clone(&self.tree_navigation_callbacks);
+        let tree_node_menus = Rc::clone(&self.panel_node_menus);
+        let tree_activation_callbacks = Rc::clone(&self.panel_activation_callbacks);
+        let tree_panel_size = Rc::clone(&self.panel_size);
         panel
             .set(
                 "tree",
@@ -7073,6 +7405,32 @@ impl PluginRuntime {
                                     let _ = lua.remove_registry_value(previous);
                                 }
                             }
+                            if let Some(callback) = value.get::<Option<Function>>("on_command")? {
+                                let tree_value = value.clone();
+                                let callback = lua.create_function(move |_, row: usize| {
+                                    let item = tree_visible_nodes(&tree_value)
+                                        .get(row.saturating_sub(1))
+                                        .cloned()
+                                        .unwrap_or(LuaValue::Nil);
+                                    let is_leaf = match &item {
+                                        LuaValue::Table(item) => {
+                                            item.get::<Option<Table>>("children")?.is_none()
+                                        }
+                                        _ => true,
+                                    };
+                                    if is_leaf {
+                                        callback.call::<()>(("activate", item))?;
+                                    }
+                                    Ok(())
+                                })?;
+                                let key = lua.create_registry_value(callback)?;
+                                if let Some(previous) = tree_activation_callbacks
+                                    .borrow_mut()
+                                    .insert(tree_panel_id.clone(), key)
+                                {
+                                    let _ = lua.remove_registry_value(previous);
+                                }
+                            }
                             let mut bindings = BTreeMap::new();
                             if let Some(commands) = value.get::<Option<Table>>("key_commands")? {
                                 for pair in commands.pairs::<String, String>() {
@@ -7083,8 +7441,18 @@ impl PluginRuntime {
                             tree_key_commands
                                 .borrow_mut()
                                 .insert(tree_panel_id.clone(), bindings);
+                            let node_menu = panel_node_menu_entries(lua, &value)?;
+                            if node_menu.is_empty() {
+                                tree_node_menus.borrow_mut().remove(&tree_panel_id);
+                            } else {
+                                tree_node_menus
+                                    .borrow_mut()
+                                    .insert(tree_panel_id.clone(), node_menu);
+                            }
                             if on_select.is_some() || on_expand.is_some() {
                                 let tree_value = value.clone();
+                                let selection_callback = on_select.clone();
+                                let expand_callback = on_expand.clone();
                                 let callback = lua.create_function(move |_, row: usize| {
                                     let item = tree_visible_nodes(&tree_value)
                                         .get(row.saturating_sub(1))
@@ -7095,21 +7463,22 @@ impl PluginRuntime {
                                         _ => None,
                                     };
                                     if let Some(item_table) = item_table {
-                                        let has_children = item_table
-                                            .get::<Option<Table>>("children")?
-                                            .is_some();
-                                        if has_children {
-                                            let expanded = item_table
+                                        let has_children =
+                                            item_table.get::<Option<Table>>("children")?.is_some();
+                                        if has_children
+                                            && !item_table
                                                 .get::<Option<bool>>("expanded")?
-                                                .unwrap_or(false);
-                                            item_table.set("expanded", !expanded)?;
-                                            if let Some(callback) = on_expand.as_ref() {
-                                                callback.call::<()>(item_table)?;
+                                                .unwrap_or(false)
+                                        {
+                                            item_table.set("expanded", true)?;
+                                            if let Some(callback) = expand_callback.as_ref() {
+                                                callback.call::<()>(item_table.clone())?;
                                             }
-                                        } else if let Some(callback) = on_select.as_ref() {
+                                        }
+                                        if let Some(callback) = selection_callback.as_ref() {
                                             callback.call::<()>(item_table)?;
                                         }
-                                    } else if let Some(callback) = on_select.as_ref() {
+                                    } else if let Some(callback) = selection_callback.as_ref() {
                                         callback.call::<()>(LuaValue::Nil)?;
                                     }
                                     Ok(())
@@ -7122,7 +7491,45 @@ impl PluginRuntime {
                                     let _ = lua.remove_registry_value(previous);
                                 }
                             }
-                            tree_sink.borrow_mut().push(tree_widget_text(lua, &value));
+                            if on_expand.is_some() {
+                                let tree_value = value.clone();
+                                let expand_callback = on_expand.clone();
+                                let callback =
+                                    lua.create_function(move |_, (row, expand): (usize, bool)| {
+                                        let Some(LuaValue::Table(item)) =
+                                            tree_visible_nodes(&tree_value)
+                                                .get(row.saturating_sub(1))
+                                                .cloned()
+                                        else {
+                                            return Ok(false);
+                                        };
+                                        if item.get::<Option<Table>>("children")?.is_none() {
+                                            return Ok(false);
+                                        }
+                                        let was_expanded =
+                                            item.get::<Option<bool>>("expanded")?.unwrap_or(false);
+                                        item.set("expanded", expand)?;
+                                        if expand && !was_expanded {
+                                            if let Some(callback) = expand_callback.as_ref() {
+                                                callback.call::<()>(item)?;
+                                            }
+                                        }
+                                        Ok(was_expanded != expand)
+                                    })?;
+                                let key = lua.create_registry_value(callback)?;
+                                if let Some(previous) = tree_navigation_callbacks
+                                    .borrow_mut()
+                                    .insert(tree_panel_id.clone(), key)
+                                {
+                                    let _ = lua.remove_registry_value(previous);
+                                }
+                            }
+                            let width = usize::from(tree_panel_size.borrow().0.saturating_sub(2));
+                            tree_sink.borrow_mut().push(tree_widget_text_with_width(
+                                lua,
+                                &value,
+                                Some(width),
+                            ));
                         }
                         Ok(())
                     })
@@ -7187,8 +7594,11 @@ impl PluginRuntime {
             )
             .map_err(lua_error)?;
         let input_sink = Rc::clone(&lines);
+        let input_panel_size = Rc::clone(&self.panel_size);
         let input_widgets = Rc::clone(&self.dialog_widgets);
         let drawer_input = Rc::clone(&self.drawer_input);
+        let panel_inputs = Rc::clone(&self.panel_inputs);
+        let panel_input_id = id.to_owned();
         panel
             .set(
                 "input",
@@ -7197,17 +7607,44 @@ impl PluginRuntime {
                         let Some(LuaValue::Table(value)) = value else {
                             return Ok(());
                         };
-                        let text = value
-                            .get::<Option<String>>("text")?
-                            .or_else(|| value.get::<Option<String>>("value").ok().flatten())
+                        let controlled_text = value
+                            .get::<Option<LuaValue>>("value")?
+                            .filter(|value| !matches!(value, LuaValue::Nil))
+                            .map(|value| lua_value_text(lua, value));
+                        let text = controlled_text
+                            .clone()
+                            .or(value.get::<Option<String>>("text")?)
                             .unwrap_or_default();
+                        let prefix = value.get::<Option<String>>("prefix")?.unwrap_or_default();
                         if let Some(dialog_id) = dialog_id {
                             let mut widgets = input_widgets.borrow_mut();
                             let state = widgets.entry(dialog_id).or_default();
-                            if !state.input_initialized {
+                            state.input_prefix = prefix.clone();
+                            state.input_multiline =
+                                value.get::<Option<bool>>("multiline")?.unwrap_or(false);
+                            state.input_wrap = value.get::<Option<bool>>("wrap")?.unwrap_or(false);
+                            state.input_min_rows = value
+                                .get::<Option<u64>>("min_rows")?
+                                .unwrap_or(1)
+                                .clamp(1, 64)
+                                as usize;
+                            state.input_max_rows = value
+                                .get::<Option<u64>>("max_rows")?
+                                .unwrap_or(if state.input_multiline { 5 } else { 1 })
+                                .clamp(1, 64)
+                                as usize;
+                            state.input_min_rows = state.input_min_rows.min(state.input_max_rows);
+                            if controlled_text.is_some() {
+                                state.input_text = text.clone();
+                            } else if !state.input_initialized {
                                 state.input_text = text.clone();
                                 state.input_initialized = true;
                             }
+                            state.input_clear_on_submit = value
+                                .get::<Option<bool>>("clear_on_submit")?
+                                .unwrap_or(false);
+                            state.input_autofocus =
+                                value.get::<Option<bool>>("autofocus")?.unwrap_or(false);
                             if let Some(callback) = value.get::<Option<Function>>("on_change")? {
                                 if let Some(existing) = state.input_on_change.take() {
                                     let _ = lua.remove_registry_value(existing);
@@ -7223,10 +7660,30 @@ impl PluginRuntime {
                         } else if is_drawer {
                             let mut state = drawer_input.borrow_mut();
                             let state = state.get_or_insert_with(PluginDrawerInputState::default);
-                            if !state.initialized {
+                            state.prefix = prefix.clone();
+                            state.multiline =
+                                value.get::<Option<bool>>("multiline")?.unwrap_or(false);
+                            state.wrap = value.get::<Option<bool>>("wrap")?.unwrap_or(false);
+                            state.min_rows = value
+                                .get::<Option<u64>>("min_rows")?
+                                .unwrap_or(1)
+                                .clamp(1, 64) as usize;
+                            state.max_rows = value
+                                .get::<Option<u64>>("max_rows")?
+                                .unwrap_or(if state.multiline { 5 } else { 1 })
+                                .clamp(1, 64) as usize;
+                            state.min_rows = state.min_rows.min(state.max_rows);
+                            if controlled_text.is_some() {
+                                state.text = text.clone();
+                            } else if !state.initialized {
                                 state.text = text.clone();
                                 state.initialized = true;
                             }
+                            state.clear_on_submit = value
+                                .get::<Option<bool>>("clear_on_submit")?
+                                .unwrap_or(false);
+                            state.autofocus =
+                                value.get::<Option<bool>>("autofocus")?.unwrap_or(false);
                             state.line = input_sink.borrow().len();
                             if let Some(callback) = value.get::<Option<Function>>("on_change")? {
                                 if let Some(existing) = state.on_change.take() {
@@ -7238,6 +7695,46 @@ impl PluginRuntime {
                                 if let Some(existing) = state.on_submit.take() {
                                     let _ = lua.remove_registry_value(existing);
                                 }
+                                state.on_submit = Some(lua.create_registry_value(callback)?);
+                            }
+                        } else {
+                            let mut states = panel_inputs.borrow_mut();
+                            let state = states.entry(panel_input_id.clone()).or_default();
+                            state.prefix = prefix.clone();
+                            state.multiline =
+                                value.get::<Option<bool>>("multiline")?.unwrap_or(false);
+                            state.wrap = value.get::<Option<bool>>("wrap")?.unwrap_or(false);
+                            state.min_rows = value
+                                .get::<Option<u64>>("min_rows")?
+                                .unwrap_or(1)
+                                .clamp(1, 64) as usize;
+                            state.max_rows = value
+                                .get::<Option<u64>>("max_rows")?
+                                .unwrap_or(if state.multiline { 5 } else { 1 })
+                                .clamp(1, 64) as usize;
+                            state.min_rows = state.min_rows.min(state.max_rows);
+                            if controlled_text.is_some() {
+                                state.text = text.clone();
+                            } else if !state.initialized {
+                                state.text = text.clone();
+                                state.initialized = true;
+                            }
+                            state.clear_on_submit = value
+                                .get::<Option<bool>>("clear_on_submit")?
+                                .unwrap_or(false);
+                            state.autofocus =
+                                value.get::<Option<bool>>("autofocus")?.unwrap_or(false);
+                            state.line = input_sink.borrow().len();
+                            if let Some(existing) = state.on_change.take() {
+                                let _ = lua.remove_registry_value(existing);
+                            }
+                            if let Some(callback) = value.get::<Option<Function>>("on_change")? {
+                                state.on_change = Some(lua.create_registry_value(callback)?);
+                            }
+                            if let Some(existing) = state.on_submit.take() {
+                                let _ = lua.remove_registry_value(existing);
+                            }
+                            if let Some(callback) = value.get::<Option<Function>>("on_submit")? {
                                 state.on_submit = Some(lua.create_registry_value(callback)?);
                             }
                         }
@@ -7263,21 +7760,119 @@ impl PluginRuntime {
                                 .map(|state| state.text.clone())
                                 .unwrap_or(text)
                         } else {
-                            text
+                            panel_inputs
+                                .borrow()
+                                .get(&panel_input_id)
+                                .map(|state| state.text.clone())
+                                .unwrap_or(text)
                         };
-                        let focused = is_drawer
-                            && dialog_id.is_none()
-                            && drawer_input
+                        let (prefix, input_focused) = if let Some(dialog_id) = dialog_id {
+                            let state = input_widgets.borrow();
+                            let prefix = state
+                                .get(&dialog_id)
+                                .map(|state| state.input_prefix.clone())
+                                .unwrap_or_default();
+                            let focused = state
+                                .get(&dialog_id)
+                                .is_some_and(|state| state.focus == PluginDialogFocus::Input);
+                            (prefix, focused)
+                        } else if is_drawer {
+                            let state = drawer_input.borrow();
+                            let prefix = state
+                                .as_ref()
+                                .map(|state| state.prefix.clone())
+                                .unwrap_or_default();
+                            let focused = state.as_ref().is_some_and(|state| state.focused);
+                            (prefix, focused)
+                        } else {
+                            let prefix = panel_inputs
+                                .borrow()
+                                .get(&panel_input_id)
+                                .map(|state| state.prefix.clone())
+                                .unwrap_or_default();
+                            (prefix, false)
+                        };
+                        let focused = is_drawer && dialog_id.is_none() && input_focused;
+                        let mut rendered = if displayed.is_empty() && !placeholder.is_empty() {
+                            format!("{prefix}[{placeholder}]")
+                        } else {
+                            format!("{prefix}{}❯ {displayed}", if focused { "▶" } else { "" })
+                        };
+                        let min_rows = if let Some(dialog_id) = dialog_id {
+                            1.max(
+                                input_widgets
+                                    .borrow()
+                                    .get(&dialog_id)
+                                    .map(|state| state.input_min_rows)
+                                    .unwrap_or(1),
+                            )
+                        } else if is_drawer {
+                            drawer_input
                                 .borrow()
                                 .as_ref()
-                                .is_some_and(|state| state.focused);
-                        input_sink.borrow_mut().push(
-                            if displayed.is_empty() && !placeholder.is_empty() {
-                                format!("[{}]", placeholder)
-                            } else {
-                                format!("{}❯ {displayed}", if focused { "▶" } else { "" })
-                            },
-                        );
+                                .map(|state| state.min_rows)
+                                .unwrap_or(1)
+                        } else {
+                            panel_inputs
+                                .borrow()
+                                .get(&panel_input_id)
+                                .map(|state| state.min_rows)
+                                .unwrap_or(1)
+                        };
+                        let max_rows = if let Some(dialog_id) = dialog_id {
+                            input_widgets
+                                .borrow()
+                                .get(&dialog_id)
+                                .map(|state| state.input_max_rows)
+                                .unwrap_or(1)
+                        } else if is_drawer {
+                            drawer_input
+                                .borrow()
+                                .as_ref()
+                                .map(|state| state.max_rows)
+                                .unwrap_or(1)
+                        } else {
+                            panel_inputs
+                                .borrow()
+                                .get(&panel_input_id)
+                                .map(|state| state.max_rows)
+                                .unwrap_or(1)
+                        };
+                        let wrap = if let Some(dialog_id) = dialog_id {
+                            input_widgets
+                                .borrow()
+                                .get(&dialog_id)
+                                .is_some_and(|state| state.input_wrap)
+                        } else if is_drawer {
+                            drawer_input
+                                .borrow()
+                                .as_ref()
+                                .is_some_and(|state| state.wrap)
+                        } else {
+                            panel_inputs
+                                .borrow()
+                                .get(&panel_input_id)
+                                .is_some_and(|state| state.wrap)
+                        };
+                        if wrap {
+                            let width = usize::from(input_panel_size.borrow().0).saturating_sub(2);
+                            if width > 0 {
+                                rendered = wrap_plain_text(&rendered, width);
+                            }
+                        }
+                        let rendered_rows = rendered.split('\n').count();
+                        if rendered_rows > max_rows {
+                            rendered = rendered
+                                .split('\n')
+                                .take(max_rows)
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                        }
+                        let rendered_rows = rendered.split('\n').count();
+                        if rendered_rows < min_rows {
+                            rendered.push_str(&"\n".repeat(min_rows - rendered_rows));
+                        }
+                        input_sink.borrow_mut().push(rendered);
                         Ok(())
                     })
                     .map_err(lua_error)?,
@@ -7286,6 +7881,9 @@ impl PluginRuntime {
         let button_sink = Rc::clone(&lines);
         let button_widgets = Rc::clone(&self.dialog_widgets);
         let drawer_actions = Rc::clone(&self.drawer_actions);
+        let drawer_focused_button = Rc::clone(&self.drawer_focused_button);
+        let panel_button_actions = Rc::clone(&self.panel_button_actions);
+        let button_panel_id = id.to_owned();
         panel
             .set(
                 "button",
@@ -7297,19 +7895,45 @@ impl PluginRuntime {
                         let label = value
                             .get::<Option<String>>("label")?
                             .unwrap_or_else(|| "Button".to_owned());
+                        let disabled = value.get::<Option<bool>>("disabled")?.unwrap_or(false);
                         if let Some(dialog_id) = dialog_id {
                             let mut widgets = button_widgets.borrow_mut();
                             let state = widgets.entry(dialog_id).or_default();
-                            let on_click = value
-                                .get::<Option<Function>>("on_click")?
+                            let on_click = (!disabled)
+                                .then(|| value.get::<Option<Function>>("on_click"))
+                                .transpose()?
+                                .flatten()
                                 .map(|callback| lua.create_registry_value(callback))
                                 .transpose()?;
                             state.buttons.push(PluginDialogButtonState { on_click });
                         } else if is_drawer {
-                            if let Some(callback) = value.get::<Option<Function>>("on_click")? {
+                            if !disabled {
+                                if let Some(callback) = value.get::<Option<Function>>("on_click")? {
                                 let key = lua.create_registry_value(callback)?;
                                 let line = button_sink.borrow().len();
-                                drawer_actions.borrow_mut().push((line, key));
+                                let mut actions = drawer_actions.borrow_mut();
+                                let index = actions.len();
+                                actions.push((line, key));
+                                let focused = drawer_focused_button
+                                    .borrow()
+                                    .is_some_and(|focused| focused == index);
+                                button_sink.borrow_mut().push(if focused {
+                                    format!("▶[ {label} ]")
+                                } else {
+                                    format!("[ {label} ]")
+                                });
+                                return Ok(());
+                                }
+                            }
+                        } else if !disabled {
+                            if let Some(callback) = value.get::<Option<Function>>("on_click")? {
+                            let key = lua.create_registry_value(callback)?;
+                            let line = button_sink.borrow().len();
+                            panel_button_actions
+                                .borrow_mut()
+                                .entry(button_panel_id.clone())
+                                .or_default()
+                                .push((line, key));
                             }
                         }
                         let focused = dialog_id.is_some_and(|dialog_id| {
@@ -7319,7 +7943,9 @@ impl PluginRuntime {
                             };
                             matches!(state.focus, PluginDialogFocus::Button(index) if index + 1 == state.buttons.len())
                         });
-                        button_sink.borrow_mut().push(if focused {
+                        button_sink.borrow_mut().push(if disabled {
+                            format!("[ {label} ]")
+                        } else if focused {
                             format!("▶[ {label} ]")
                         } else {
                             format!("[ {label} ]")
@@ -7329,8 +7955,14 @@ impl PluginRuntime {
                     .map_err(lua_error)?,
             )
             .map_err(lua_error)?;
-        for (name, table_mode) in [("list", false), ("table", true), ("radio", false)] {
+        for (name, table_mode) in [
+            ("list", false),
+            ("table", true),
+            ("radio", false),
+            ("scrollview", false),
+        ] {
             let is_radio = name == "radio";
+            let is_scrollview = name == "scrollview";
             let sink = Rc::clone(&lines);
             let panel_id = id.to_owned();
             let selection_callbacks = Rc::clone(&self.panel_selection_callbacks);
@@ -7338,8 +7970,15 @@ impl PluginRuntime {
             let selection_state = Rc::clone(&self.panel_selection_state);
             let selection_dirty = Rc::clone(&self.panel_selection_dirty);
             let active_selection = Rc::clone(&self.panel_active_selection);
+            let collection_panel_size = Rc::clone(&self.panel_size);
             let command_callbacks = Rc::clone(&self.panel_command_callbacks);
             let key_commands = Rc::clone(&self.panel_key_commands);
+            let node_menus = Rc::clone(&self.panel_node_menus);
+            let action_regions = Rc::clone(&self.panel_action_regions);
+            let radio_lines = Rc::clone(&self.panel_radio_lines);
+            let radio_focused = Rc::clone(&self.panel_focused_radio);
+            let scrollview_lines = Rc::clone(&self.panel_scrollview_lines);
+            let scrollview_focused = Rc::clone(&self.panel_focused_scrollview);
             let selection_key = format!("{panel_id}:{name}");
             panel
                 .set(
@@ -7449,7 +8088,9 @@ impl PluginRuntime {
                                         }
                                     }
                                 }
-                                if let Some(callback) = value.get::<Option<Function>>("on_command")? {
+                                if let Some(callback) =
+                                    value.get::<Option<Function>>("on_command")?
+                                {
                                     let callback = if table_mode {
                                         callback
                                     } else {
@@ -7462,25 +8103,53 @@ impl PluginRuntime {
                                             .or_else(|| {
                                                 value.get::<Option<Table>>("rows").ok().flatten()
                                             });
-                                        lua.create_function(move |_, (command, row): (String, usize)| {
-                                            let item = items
-                                                .as_ref()
-                                                .and_then(|items| {
-                                                    items
-                                                        .get::<Option<LuaValue>>(row)
-                                                        .ok()
-                                                        .flatten()
-                                                })
-                                                .unwrap_or(LuaValue::Nil);
-                                            callback.call::<()>((command, item))
-                                        })?
+                                        lua.create_function(
+                                            move |_, (command, row): (String, usize)| {
+                                                let item = items
+                                                    .as_ref()
+                                                    .and_then(|items| {
+                                                        items
+                                                            .get::<Option<LuaValue>>(row)
+                                                            .ok()
+                                                            .flatten()
+                                                    })
+                                                    .unwrap_or(LuaValue::Nil);
+                                                callback.call::<()>((command, item))
+                                            },
+                                        )?
                                     };
                                     let key = lua.create_registry_value(callback)?;
-                                    if let Some(previous) = command_callbacks
-                                        .borrow_mut()
-                                        .insert(panel_id.clone(), key)
+                                    if let Some(previous) =
+                                        command_callbacks.borrow_mut().insert(panel_id.clone(), key)
                                     {
                                         let _ = lua.remove_registry_value(previous);
+                                    }
+                                }
+                                if !is_radio && !table_mode {
+                                    if let Some(callback) =
+                                        value.get::<Option<Function>>("on_command")?
+                                    {
+                                        let items = value.get::<Option<Table>>("items")?;
+                                        let callback =
+                                            lua.create_function(move |_, row: usize| {
+                                                let item = items
+                                                    .as_ref()
+                                                    .and_then(|items| {
+                                                        items
+                                                            .get::<Option<LuaValue>>(row)
+                                                            .ok()
+                                                            .flatten()
+                                                    })
+                                                    .unwrap_or(LuaValue::Nil);
+                                                callback.call::<()>(("activate", item))
+                                            })?;
+                                        let key = lua.create_registry_value(callback)?;
+                                        if let Some(previous) = activation_callbacks
+                                            .borrow_mut()
+                                            .insert(panel_id.clone(), key)
+                                        {
+                                            let _ = lua.remove_registry_value(previous);
+                                        }
                                     }
                                 }
                                 if !is_radio {
@@ -7494,12 +8163,49 @@ impl PluginRuntime {
                                         }
                                     }
                                     key_commands.borrow_mut().insert(panel_id.clone(), bindings);
+                                    let node_menu = panel_node_menu_entries(lua, &value)?;
+                                    if node_menu.is_empty() {
+                                        node_menus.borrow_mut().remove(&panel_id);
+                                    } else {
+                                        node_menus.borrow_mut().insert(panel_id.clone(), node_menu);
+                                    }
                                 }
-                                sink.borrow_mut().push(if is_radio {
+                                let width =
+                                    usize::from(collection_panel_size.borrow().0.saturating_sub(2));
+                                let line = sink.borrow().len();
+                                if is_radio {
+                                    radio_lines.borrow_mut().insert(panel_id.clone(), line);
+                                } else if is_scrollview {
+                                    scrollview_lines.borrow_mut().insert(panel_id.clone(), line);
+                                }
+                                let rendered = if is_radio {
                                     radio_widget_text(lua, &value)
                                 } else {
-                                    collection_widget_text(lua, LuaValue::Table(value), table_mode)
-                                });
+                                    collection_widget_text_with_width(
+                                        lua,
+                                        LuaValue::Table(value.clone()),
+                                        table_mode,
+                                        Some(width),
+                                    )
+                                };
+                                if !is_radio {
+                                    register_panel_action_regions(
+                                        lua,
+                                        &value,
+                                        table_mode,
+                                        line,
+                                        &panel_id,
+                                        &action_regions,
+                                    );
+                                }
+                                if (is_radio && radio_focused.borrow().contains_key(&panel_id))
+                                    || (is_scrollview
+                                        && scrollview_focused.borrow().contains_key(&panel_id))
+                                {
+                                    sink.borrow_mut().push(format!("▶{rendered}"));
+                                } else {
+                                    sink.borrow_mut().push(rendered);
+                                }
                             }
                             Ok(())
                         })
@@ -7513,6 +8219,8 @@ impl PluginRuntime {
         let tabs_selection_state = Rc::clone(&self.panel_selection_state);
         let tabs_selection_dirty = Rc::clone(&self.panel_selection_dirty);
         let tabs_active_selection = Rc::clone(&self.panel_active_selection);
+        let tabs_lines = Rc::clone(&self.panel_tabs_lines);
+        let tabs_focused = Rc::clone(&self.panel_focused_tabs);
         panel
             .set(
                 "tabs",
@@ -7632,27 +8340,15 @@ impl PluginRuntime {
                                     let _ = lua.remove_registry_value(previous);
                                 }
                             }
-                            tabs_sink.borrow_mut().push(collection_widget_text(
-                                lua,
-                                LuaValue::Table(value),
-                                false,
-                            ));
-                        }
-                        Ok(())
-                    })
-                    .map_err(lua_error)?,
-            )
-            .map_err(lua_error)?;
-        let scrollview_sink = Rc::clone(&lines);
-        panel
-            .set(
-                "scrollview",
-                self._lua
-                    .create_function(move |lua, (_panel, value): (Table, Option<LuaValue>)| {
-                        if let Some(value) = value {
-                            scrollview_sink
-                                .borrow_mut()
-                                .push(collection_widget_text(lua, value, false));
+                            let line = tabs_sink.borrow().len();
+                            tabs_lines.borrow_mut().insert(tabs_panel_id.clone(), line);
+                            let rendered =
+                                collection_widget_text(lua, LuaValue::Table(value), false);
+                            if tabs_focused.borrow().contains_key(&tabs_panel_id) {
+                                tabs_sink.borrow_mut().push(format!("▶{rendered}"));
+                            } else {
+                                tabs_sink.borrow_mut().push(rendered);
+                            }
                         }
                         Ok(())
                     })
@@ -7747,15 +8443,19 @@ impl PluginRuntime {
             )
             .map_err(lua_error)?;
         let progress_sink = Rc::clone(&lines);
+        let progress_panel_size = Rc::clone(&self.panel_size);
         panel
             .set(
                 "progress",
                 self._lua
                     .create_function(move |lua, (_panel, value): (Table, Option<LuaValue>)| {
                         if let Some(value) = value {
+                            let width =
+                                usize::from(progress_panel_size.borrow().0.saturating_sub(2))
+                                    .max(1);
                             progress_sink
                                 .borrow_mut()
-                                .push(progress_widget_text(lua, value));
+                                .push(progress_widget_text(lua, value, width));
                         }
                         Ok(())
                     })
@@ -7779,6 +8479,7 @@ impl PluginRuntime {
         for name in [
             "badge",
             "border",
+            "box",
             "dialog",
             "hstack",
             "raw",
@@ -7787,12 +8488,41 @@ impl PluginRuntime {
             "vstack",
         ] {
             let sink = Rc::clone(&lines);
+            let is_title = name == "title";
+            let title_menus = Rc::clone(&self.panel_title_menus);
+            let title_callbacks = Rc::clone(&self.panel_title_callbacks);
+            let title_panel_id = id.to_owned();
             panel
                 .set(
                     name,
                     self._lua
                         .create_function(
                             move |lua, (panel, values): (Table, Variadic<LuaValue>)| {
+                                if is_title && values.len() == 1 {
+                                    if let Some(LuaValue::Table(value)) = values.first() {
+                                        let entries = panel_menu_entries(lua, value, "menu")?;
+                                        if entries.is_empty() {
+                                            title_menus.borrow_mut().remove(&title_panel_id);
+                                        } else {
+                                            title_menus
+                                                .borrow_mut()
+                                                .insert(title_panel_id.clone(), entries);
+                                        }
+                                        if let Some(callback) =
+                                            value.get::<Option<Function>>("on_menu")?
+                                        {
+                                            let key = lua.create_registry_value(callback)?;
+                                            if let Some(previous) = title_callbacks
+                                                .borrow_mut()
+                                                .insert(title_panel_id.clone(), key)
+                                            {
+                                                let _ = lua.remove_registry_value(previous);
+                                            }
+                                        }
+                                        sink.borrow_mut().push(title_widget_text(lua, value)?);
+                                        return Ok(());
+                                    }
+                                }
                                 if !values.is_empty() {
                                     let mut rendered_children = false;
                                     if let Some(LuaValue::Table(value)) = values.first() {
@@ -7823,6 +8553,8 @@ impl PluginRuntime {
         let checkbox_sink = Rc::clone(&lines);
         let checkbox_widgets = Rc::clone(&self.dialog_widgets);
         let drawer_checkbox = Rc::clone(&self.drawer_checkbox);
+        let panel_checkboxes = Rc::clone(&self.panel_checkboxes);
+        let panel_checkbox_id = id.to_owned();
         panel
             .set(
                 "checkbox",
@@ -7884,7 +8616,22 @@ impl PluginRuntime {
                                 }
                                 state.checked
                             } else {
-                                checked
+                                let mut states = panel_checkboxes.borrow_mut();
+                                let state = states.entry(panel_checkbox_id.clone()).or_default();
+                                if !state.initialized {
+                                    state.checked = checked;
+                                    state.initialized = true;
+                                }
+                                state.line = checkbox_sink.borrow().len();
+                                if let Some(existing) = state.on_change.take() {
+                                    let _ = lua.remove_registry_value(existing);
+                                }
+                                if let Some(callback) =
+                                    value.get::<Option<Function>>("on_change")?
+                                {
+                                    state.on_change = Some(lua.create_registry_value(callback)?);
+                                }
+                                state.checked
                             };
                             let focused = dialog_id.is_some_and(|id| {
                                 checkbox_widgets
@@ -7896,6 +8643,11 @@ impl PluginRuntime {
                                 && drawer_checkbox
                                     .borrow()
                                     .as_ref()
+                                    .is_some_and(|state| state.focused);
+                            let focused = focused
+                                || panel_checkboxes
+                                    .borrow()
+                                    .get(&panel_checkbox_id)
                                     .is_some_and(|state| state.focused);
                             checkbox_sink.borrow_mut().push(format!(
                                 "{}[{}] {}",
@@ -7911,6 +8663,8 @@ impl PluginRuntime {
             .map_err(lua_error)?;
         let password_sink = Rc::clone(&lines);
         let password_widgets = Rc::clone(&self.dialog_widgets);
+        let panel_passwords = Rc::clone(&self.panel_passwords);
+        let panel_password_id = id.to_owned();
         panel
             .set(
                 "password",
@@ -7948,6 +8702,40 @@ impl PluginRuntime {
                                 password_sink
                                     .borrow_mut()
                                     .push(password_widget_text(lua, LuaValue::Table(value)));
+                            } else {
+                                let text = value
+                                    .get::<Option<String>>("text")?
+                                    .or_else(|| value.get::<Option<String>>("value").ok().flatten())
+                                    .unwrap_or_default();
+                                let mut states = panel_passwords.borrow_mut();
+                                let state = states.entry(panel_password_id.clone()).or_default();
+                                if !state.initialized {
+                                    state.text = text;
+                                    state.initialized = true;
+                                }
+                                state.line = password_sink.borrow().len();
+                                if let Some(existing) = state.on_change.take() {
+                                    let _ = lua.remove_registry_value(existing);
+                                }
+                                if let Some(callback) =
+                                    value.get::<Option<Function>>("on_change")?
+                                {
+                                    state.on_change = Some(lua.create_registry_value(callback)?);
+                                }
+                                let placeholder = value
+                                    .get::<Option<String>>("placeholder")?
+                                    .unwrap_or_default();
+                                let displayed = if state.text.is_empty() && !placeholder.is_empty()
+                                {
+                                    format!("[{}]", placeholder)
+                                } else {
+                                    "•".repeat(state.text.chars().count())
+                                };
+                                password_sink.borrow_mut().push(format!(
+                                    "{}❯ {}",
+                                    if state.focused { "▶" } else { "" },
+                                    displayed
+                                ));
                             }
                         }
                         Ok(())
@@ -7962,6 +8750,8 @@ impl PluginRuntime {
         let dropdown_selection_dirty = Rc::clone(&self.panel_selection_dirty);
         let dropdown_active_selection = Rc::clone(&self.panel_active_selection);
         let dropdown_selection_callbacks = Rc::clone(&self.panel_selection_callbacks);
+        let dropdown_lines = Rc::clone(&self.panel_dropdown_lines);
+        let dropdown_focused = Rc::clone(&self.panel_focused_dropdown);
         let dropdown_panel_id = id.to_owned();
         panel
             .set(
@@ -8037,6 +8827,10 @@ impl PluginRuntime {
                                 }
                                 value.set("selected", (state.selected + 1) as u64)?;
                             } else {
+                                let line = dropdown_sink.borrow().len();
+                                dropdown_lines
+                                    .borrow_mut()
+                                    .insert(dropdown_panel_id.clone(), line);
                                 let option_values = value.get::<Option<Table>>("options")?;
                                 let selection_key = format!("{dropdown_panel_id}:dropdown");
                                 dropdown_active_selection
@@ -8044,7 +8838,9 @@ impl PluginRuntime {
                                     .insert(dropdown_panel_id.clone(), selection_key.clone());
                                 let option_count = option_values
                                     .as_ref()
-                                    .map(|items| items.sequence_values::<LuaValue>().flatten().count())
+                                    .map(|items| {
+                                        items.sequence_values::<LuaValue>().flatten().count()
+                                    })
                                     .unwrap_or(0);
                                 if option_count > 0 {
                                     let configured_index = value
@@ -8054,10 +8850,11 @@ impl PluginRuntime {
                                         as usize;
                                     let selected_index = {
                                         let mut states = dropdown_selection_state.borrow_mut();
-                                        let selected = states.entry(selection_key.clone()).or_insert((
-                                            configured_index.min(option_count - 1),
-                                            option_count,
-                                        ));
+                                        let selected =
+                                            states.entry(selection_key.clone()).or_insert((
+                                                configured_index.min(option_count - 1),
+                                                option_count,
+                                            ));
                                         if !dropdown_selection_dirty
                                             .borrow()
                                             .contains(&selection_key)
@@ -8074,27 +8871,36 @@ impl PluginRuntime {
                                 let on_menu = value.get::<Option<Function>>("on_menu")?;
                                 if on_change.is_some() || on_menu.is_some() {
                                     let options = option_values;
-                                    let callback = lua.create_function(move |lua, row: usize| {
-                                        let item = options
-                                            .as_ref()
-                                            .and_then(|items| {
-                                                items.get::<Option<LuaValue>>(row).ok().flatten()
-                                            })
-                                            .unwrap_or(LuaValue::Nil);
-                                        if let Some(callback) = on_menu.as_ref() {
-                                            let command = match &item {
-                                                LuaValue::Table(item) => item
-                                                    .get::<Option<String>>("command")?
-                                                    .unwrap_or_else(|| lua_value_text(lua, LuaValue::Table(item.clone()))),
-                                                _ => lua_value_text(lua, item.clone()),
-                                            };
-                                            callback.call::<()>(command)
-                                        } else if let Some(callback) = on_change.as_ref() {
-                                            callback.call::<()>(item)
-                                        } else {
-                                            Ok(())
-                                        }
-                                    })?;
+                                    let callback =
+                                        lua.create_function(move |lua, row: usize| {
+                                            let item = options
+                                                .as_ref()
+                                                .and_then(|items| {
+                                                    items
+                                                        .get::<Option<LuaValue>>(row)
+                                                        .ok()
+                                                        .flatten()
+                                                })
+                                                .unwrap_or(LuaValue::Nil);
+                                            if let Some(callback) = on_menu.as_ref() {
+                                                let command = match &item {
+                                                    LuaValue::Table(item) => item
+                                                        .get::<Option<String>>("command")?
+                                                        .unwrap_or_else(|| {
+                                                            lua_value_text(
+                                                                lua,
+                                                                LuaValue::Table(item.clone()),
+                                                            )
+                                                        }),
+                                                    _ => lua_value_text(lua, item.clone()),
+                                                };
+                                                callback.call::<()>(command)
+                                            } else if let Some(callback) = on_change.as_ref() {
+                                                callback.call::<()>(item)
+                                            } else {
+                                                Ok(())
+                                            }
+                                        })?;
                                     let key = lua.create_registry_value(callback)?;
                                     if let Some(previous) = dropdown_selection_callbacks
                                         .borrow_mut()
@@ -8104,9 +8910,12 @@ impl PluginRuntime {
                                     }
                                 }
                             }
-                            dropdown_sink
-                                .borrow_mut()
-                                .push(dropdown_widget_text(lua, value));
+                            let rendered = dropdown_widget_text(lua, value);
+                            if dropdown_focused.borrow().get(&dropdown_panel_id).is_some() {
+                                dropdown_sink.borrow_mut().push(format!("▶{rendered}"));
+                            } else {
+                                dropdown_sink.borrow_mut().push(rendered);
+                            }
                         }
                         Ok(())
                     })
@@ -8148,59 +8957,703 @@ impl PluginRuntime {
         result.map(|()| true)
     }
 
-    pub fn activate_drawer_line(&self, line: usize) -> AppResult<bool> {
-        let Some(index) = self
-            .drawer_actions
-            .borrow()
-            .iter()
-            .position(|(action_line, _)| *action_line == line)
-        else {
+    pub fn activate_panel_button(&self, id: &str, line: usize) -> AppResult<bool> {
+        let callback: Function = {
+            let actions = self.panel_button_actions.borrow();
+            let Some(callback_key) = actions.get(id).and_then(|actions| {
+                actions
+                    .iter()
+                    .find(|(action_line, _)| *action_line == line)
+                    .map(|(_, key)| key)
+            }) else {
+                return Ok(false);
+            };
+            self._lua.registry_value(callback_key).map_err(lua_error)?
+        };
+        self.clear_panel_focus(id);
+        self.panel_focused_button
+            .borrow_mut()
+            .insert(id.to_owned(), line);
+        callback
+            .call::<()>(())
+            .map_err(|error| plugin_error(format!("panel button callback failed: {error}")))?;
+        Ok(true)
+    }
+
+    pub fn panel_button_key(
+        &self,
+        id: &str,
+        key_name: &str,
+        rune: Option<char>,
+    ) -> AppResult<bool> {
+        let Some(focused) = self.panel_focused_button.borrow().get(id).copied() else {
             return Ok(false);
         };
-        let (_, callback_key) = self.drawer_actions.borrow_mut().remove(index);
-        let callback: Function = self._lua.registry_value(&callback_key).map_err(lua_error)?;
+        if key_name != "Enter" && rune != Some(' ') {
+            return Ok(false);
+        }
+        self.activate_panel_button(id, focused)
+    }
+
+    pub fn focus_panel_dropdown(&self, id: &str, line: usize) -> bool {
+        let matches = self
+            .panel_dropdown_lines
+            .borrow()
+            .get(id)
+            .is_some_and(|registered| *registered == line);
+        if !matches {
+            return false;
+        }
+        self.clear_panel_focus(id);
+        self.panel_focused_dropdown
+            .borrow_mut()
+            .insert(id.to_owned(), line);
+        true
+    }
+
+    pub fn panel_dropdown_key(&self, id: &str, key_name: &str) -> AppResult<bool> {
+        if !self.panel_focused_dropdown.borrow().contains_key(id) {
+            return Ok(false);
+        }
+        match key_name {
+            "Up" | "Left" => self.move_panel_selection(id, -1),
+            "Down" | "Right" => self.move_panel_selection(id, 1),
+            "Enter" => self.activate_panel_current_selection(id),
+            _ => Ok(false),
+        }
+    }
+
+    pub fn focus_panel_radio(&self, id: &str, line: usize) -> bool {
+        let matches = self
+            .panel_radio_lines
+            .borrow()
+            .get(id)
+            .is_some_and(|registered| *registered == line);
+        if !matches {
+            return false;
+        }
+        self.clear_panel_focus(id);
+        self.panel_focused_radio
+            .borrow_mut()
+            .insert(id.to_owned(), line);
+        true
+    }
+
+    pub fn panel_radio_key(&self, id: &str, key_name: &str) -> AppResult<bool> {
+        if !self.panel_focused_radio.borrow().contains_key(id) {
+            return Ok(false);
+        }
+        match key_name {
+            "Up" | "Left" => self.move_panel_selection(id, -1),
+            "Down" | "Right" => self.move_panel_selection(id, 1),
+            "Enter" => self.activate_panel_current_selection(id),
+            _ => Ok(false),
+        }
+    }
+
+    pub fn focus_panel_tabs(&self, id: &str, line: usize) -> bool {
+        let matches = self
+            .panel_tabs_lines
+            .borrow()
+            .get(id)
+            .is_some_and(|registered| *registered == line);
+        if !matches {
+            return false;
+        }
+        self.clear_panel_focus(id);
+        self.panel_focused_tabs
+            .borrow_mut()
+            .insert(id.to_owned(), line);
+        true
+    }
+
+    pub fn panel_tabs_key(&self, id: &str, key_name: &str) -> AppResult<bool> {
+        if !self.panel_focused_tabs.borrow().contains_key(id) {
+            return Ok(false);
+        }
+        match key_name {
+            "Up" | "Left" => self.move_panel_selection(id, -1),
+            "Down" | "Right" => self.move_panel_selection(id, 1),
+            "Enter" => self.activate_panel_current_selection(id),
+            _ => Ok(false),
+        }
+    }
+
+    pub fn focus_panel_scrollview(&self, id: &str, line: usize) -> bool {
+        let matches = self
+            .panel_scrollview_lines
+            .borrow()
+            .get(id)
+            .is_some_and(|registered| *registered == line);
+        if !matches {
+            return false;
+        }
+        self.clear_panel_focus(id);
+        self.panel_focused_scrollview
+            .borrow_mut()
+            .insert(id.to_owned(), line);
+        true
+    }
+
+    pub fn panel_scrollview_key(&self, id: &str, key_name: &str) -> AppResult<bool> {
+        if !self.panel_focused_scrollview.borrow().contains_key(id) {
+            return Ok(false);
+        }
+        match key_name {
+            "Up" | "Left" => self.move_panel_selection(id, -1),
+            "Down" | "Right" => self.move_panel_selection(id, 1),
+            "Enter" => self.activate_panel_current_selection(id),
+            _ => Ok(false),
+        }
+    }
+
+    pub fn cycle_panel_focus(&self, id: &str, backwards: bool) -> bool {
+        let mut controls = Vec::new();
+        if let Some(state) = self.panel_inputs.borrow().get(id) {
+            controls.push((state.line, 0_u8));
+        }
+        if let Some(state) = self.panel_passwords.borrow().get(id) {
+            controls.push((state.line, 1_u8));
+        }
+        if let Some(state) = self.panel_checkboxes.borrow().get(id) {
+            controls.push((state.line, 2_u8));
+        }
+        if let Some(line) = self.panel_dropdown_lines.borrow().get(id) {
+            controls.push((*line, 4_u8));
+        }
+        if let Some(line) = self.panel_radio_lines.borrow().get(id) {
+            controls.push((*line, 5_u8));
+        }
+        if let Some(line) = self.panel_tabs_lines.borrow().get(id) {
+            controls.push((*line, 6_u8));
+        }
+        if let Some(line) = self.panel_scrollview_lines.borrow().get(id) {
+            controls.push((*line, 7_u8));
+        }
+        if let Some(actions) = self.panel_button_actions.borrow().get(id) {
+            controls.extend(actions.iter().map(|(line, _)| (*line, 3_u8)));
+        }
+        if controls.is_empty() {
+            return false;
+        }
+        controls.sort_unstable();
+        controls.dedup();
+        let current = controls.iter().position(|(line, kind)| match kind {
+            0 => self
+                .panel_inputs
+                .borrow()
+                .get(id)
+                .is_some_and(|state| state.focused && state.line == *line),
+            1 => self
+                .panel_passwords
+                .borrow()
+                .get(id)
+                .is_some_and(|state| state.focused && state.line == *line),
+            2 => self
+                .panel_checkboxes
+                .borrow()
+                .get(id)
+                .is_some_and(|state| state.focused && state.line == *line),
+            3 => self
+                .panel_focused_button
+                .borrow()
+                .get(id)
+                .is_some_and(|focused| focused == line),
+            4 => self
+                .panel_focused_dropdown
+                .borrow()
+                .get(id)
+                .is_some_and(|focused| focused == line),
+            5 => self
+                .panel_focused_radio
+                .borrow()
+                .get(id)
+                .is_some_and(|focused| focused == line),
+            6 => self
+                .panel_focused_tabs
+                .borrow()
+                .get(id)
+                .is_some_and(|focused| focused == line),
+            7 => self
+                .panel_focused_scrollview
+                .borrow()
+                .get(id)
+                .is_some_and(|focused| focused == line),
+            _ => false,
+        });
+        let next = match (current, backwards) {
+            (Some(index), false) => (index + 1) % controls.len(),
+            (Some(index), true) => (index + controls.len() - 1) % controls.len(),
+            (None, false) => 0,
+            (None, true) => controls.len() - 1,
+        };
+        for state in self.panel_inputs.borrow_mut().values_mut() {
+            state.focused = false;
+        }
+        for state in self.panel_passwords.borrow_mut().values_mut() {
+            state.focused = false;
+        }
+        for state in self.panel_checkboxes.borrow_mut().values_mut() {
+            state.focused = false;
+        }
+        self.panel_focused_button.borrow_mut().remove(id);
+        self.panel_focused_dropdown.borrow_mut().remove(id);
+        self.panel_focused_radio.borrow_mut().remove(id);
+        self.panel_focused_tabs.borrow_mut().remove(id);
+        self.panel_focused_scrollview.borrow_mut().remove(id);
+        let (line, kind) = controls[next];
+        match kind {
+            0 => {
+                if let Some(state) = self.panel_inputs.borrow_mut().get_mut(id) {
+                    state.focused = true;
+                }
+            }
+            1 => {
+                if let Some(state) = self.panel_passwords.borrow_mut().get_mut(id) {
+                    state.focused = true;
+                }
+            }
+            2 => {
+                if let Some(state) = self.panel_checkboxes.borrow_mut().get_mut(id) {
+                    state.focused = true;
+                }
+            }
+            3 => {
+                self.panel_focused_button
+                    .borrow_mut()
+                    .insert(id.to_owned(), line);
+            }
+            4 => {
+                self.panel_focused_dropdown
+                    .borrow_mut()
+                    .insert(id.to_owned(), line);
+            }
+            5 => {
+                self.panel_focused_radio
+                    .borrow_mut()
+                    .insert(id.to_owned(), line);
+            }
+            6 => {
+                self.panel_focused_tabs
+                    .borrow_mut()
+                    .insert(id.to_owned(), line);
+            }
+            7 => {
+                self.panel_focused_scrollview
+                    .borrow_mut()
+                    .insert(id.to_owned(), line);
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    pub fn activate_panel_action(&self, id: &str, x: usize, y: usize) -> AppResult<bool> {
+        let action = {
+            let mut regions = self.panel_action_regions.borrow_mut();
+            let Some(actions) = regions.get_mut(id) else {
+                return Ok(false);
+            };
+            let Some(index) = actions
+                .iter()
+                .position(|action| action.line == y && action.start <= x && x < action.end)
+            else {
+                return Ok(false);
+            };
+            actions.remove(index)
+        };
+        let callback: Function = {
+            let callbacks = self.panel_command_callbacks.borrow();
+            let Some(key) = callbacks.get(id) else {
+                return Ok(false);
+            };
+            self._lua.registry_value(key).map_err(lua_error)?
+        };
+        callback
+            .call::<()>((action.command, action.row))
+            .map_err(|error| plugin_error(format!("panel action callback failed: {error}")))?;
+        Ok(true)
+    }
+
+    fn clear_panel_focus(&self, id: &str) {
+        if let Some(state) = self.panel_inputs.borrow_mut().get_mut(id) {
+            state.focused = false;
+        }
+        if let Some(state) = self.panel_passwords.borrow_mut().get_mut(id) {
+            state.focused = false;
+        }
+        if let Some(state) = self.panel_checkboxes.borrow_mut().get_mut(id) {
+            state.focused = false;
+        }
+        self.panel_focused_button.borrow_mut().remove(id);
+        self.panel_focused_dropdown.borrow_mut().remove(id);
+        self.panel_focused_radio.borrow_mut().remove(id);
+        self.panel_focused_tabs.borrow_mut().remove(id);
+        self.panel_focused_scrollview.borrow_mut().remove(id);
+    }
+
+    pub fn focus_panel_input(&self, id: &str, line: usize) -> bool {
+        let matches = self
+            .panel_inputs
+            .borrow()
+            .get(id)
+            .is_some_and(|state| state.line == line);
+        if !matches {
+            return false;
+        }
+        self.clear_panel_focus(id);
+        let mut inputs = self.panel_inputs.borrow_mut();
+        let state = inputs
+            .get_mut(id)
+            .expect("panel input exists after focus check");
+        state.focused = true;
+        true
+    }
+
+    pub fn focus_autofocus_input(&self, id: &str) -> bool {
+        let line = self
+            .panel_inputs
+            .borrow()
+            .get(id)
+            .filter(|state| state.autofocus)
+            .map(|state| state.line);
+        line.is_some_and(|line| self.focus_panel_input(id, line))
+    }
+
+    pub fn panel_input_key(
+        &self,
+        id: &str,
+        key_name: &str,
+        rune: Option<char>,
+        modifier: &str,
+    ) -> AppResult<bool> {
+        let (text, change, submit, clear_on_submit) = {
+            let mut inputs = self.panel_inputs.borrow_mut();
+            let Some(state) = inputs.get_mut(id) else {
+                return Ok(false);
+            };
+            if !state.focused || (!modifier.is_empty() && key_name != "Backspace") {
+                return Ok(false);
+            }
+            if key_name == "Enter" && !state.multiline {
+                let submit = state
+                    .on_submit
+                    .as_ref()
+                    .map(|key| self._lua.registry_value::<Function>(key))
+                    .transpose()
+                    .map_err(lua_error)?;
+                (state.text.clone(), None, submit, state.clear_on_submit)
+            } else {
+                match key_name {
+                    "Enter" if state.multiline => {
+                        state.text.push('\n');
+                    }
+                    "Backspace" => {
+                        state.text.pop();
+                    }
+                    _ => {
+                        let Some(rune) = rune else {
+                            return Ok(false);
+                        };
+                        state.text.push(rune);
+                    }
+                }
+                let change = state
+                    .on_change
+                    .as_ref()
+                    .map(|key| self._lua.registry_value::<Function>(key))
+                    .transpose()
+                    .map_err(lua_error)?;
+                (state.text.clone(), change, None, false)
+            }
+        };
+        if let Some(callback) = submit {
+            callback
+                .call::<()>(text)
+                .map_err(|error| plugin_error(format!("panel input submit failed: {error}")))?;
+            if clear_on_submit {
+                if let Some(state) = self.panel_inputs.borrow_mut().get_mut(id) {
+                    state.text.clear();
+                }
+            }
+        } else if let Some(callback) = change {
+            callback
+                .call::<()>(text)
+                .map_err(|error| plugin_error(format!("panel input change failed: {error}")))?;
+        }
+        Ok(true)
+    }
+
+    pub fn focus_panel_password(&self, id: &str, line: usize) -> bool {
+        let matches = self
+            .panel_passwords
+            .borrow()
+            .get(id)
+            .is_some_and(|state| state.line == line);
+        if !matches {
+            return false;
+        }
+        self.clear_panel_focus(id);
+        let mut passwords = self.panel_passwords.borrow_mut();
+        let state = passwords
+            .get_mut(id)
+            .expect("panel password exists after focus check");
+        state.focused = true;
+        true
+    }
+
+    pub fn panel_password_key(
+        &self,
+        id: &str,
+        key_name: &str,
+        rune: Option<char>,
+        modifier: &str,
+    ) -> AppResult<bool> {
+        let (text, callback) = {
+            let mut passwords = self.panel_passwords.borrow_mut();
+            let Some(state) = passwords.get_mut(id) else {
+                return Ok(false);
+            };
+            if !state.focused || (!modifier.is_empty() && key_name != "Backspace") {
+                return Ok(false);
+            }
+            match key_name {
+                "Backspace" => state.text.pop(),
+                "Enter" => None,
+                _ => {
+                    let Some(rune) = rune else {
+                        return Ok(false);
+                    };
+                    state.text.push(rune);
+                    None
+                }
+            };
+            let callback = state
+                .on_change
+                .as_ref()
+                .map(|key| self._lua.registry_value::<Function>(key))
+                .transpose()
+                .map_err(lua_error)?;
+            (state.text.clone(), callback)
+        };
+        if let Some(callback) = callback {
+            callback
+                .call::<()>(text)
+                .map_err(|error| plugin_error(format!("panel password change failed: {error}")))?;
+        }
+        Ok(true)
+    }
+
+    pub fn focus_panel_checkbox(&self, id: &str, line: usize) -> bool {
+        let matches = self
+            .panel_checkboxes
+            .borrow()
+            .get(id)
+            .is_some_and(|state| state.line == line);
+        if !matches {
+            return false;
+        }
+        self.clear_panel_focus(id);
+        let mut checkboxes = self.panel_checkboxes.borrow_mut();
+        let state = checkboxes
+            .get_mut(id)
+            .expect("panel checkbox exists after focus check");
+        state.focused = true;
+        true
+    }
+
+    pub fn activate_panel_checkbox(&self, id: &str, line: usize) -> AppResult<bool> {
+        if !self.focus_panel_checkbox(id, line) {
+            return Ok(false);
+        }
+        self.toggle_panel_checkbox(id)
+    }
+
+    pub fn panel_checkbox_key(
+        &self,
+        id: &str,
+        key_name: &str,
+        rune: Option<char>,
+    ) -> AppResult<bool> {
+        let should_toggle = self
+            .panel_checkboxes
+            .borrow()
+            .get(id)
+            .is_some_and(|state| state.focused)
+            && (key_name == "Enter" || rune == Some(' '));
+        if !should_toggle {
+            return Ok(false);
+        }
+        self.toggle_panel_checkbox(id)
+    }
+
+    fn toggle_panel_checkbox(&self, id: &str) -> AppResult<bool> {
+        let (checked, callback) = {
+            let mut checkboxes = self.panel_checkboxes.borrow_mut();
+            let Some(state) = checkboxes.get_mut(id) else {
+                return Ok(false);
+            };
+            state.checked = !state.checked;
+            let callback = state
+                .on_change
+                .as_ref()
+                .map(|key| self._lua.registry_value::<Function>(key))
+                .transpose()
+                .map_err(lua_error)?;
+            (state.checked, callback)
+        };
+        if let Some(callback) = callback {
+            callback.call::<()>(checked).map_err(|error| {
+                plugin_error(format!("panel checkbox callback failed: {error}"))
+            })?;
+        }
+        Ok(true)
+    }
+
+    pub fn activate_drawer_line(&self, line: usize) -> AppResult<bool> {
+        let (index, callback): (usize, Function) = {
+            let actions = self.drawer_actions.borrow();
+            let Some((index, (_, callback_key))) = actions
+                .iter()
+                .enumerate()
+                .find(|(_, (action_line, _))| *action_line == line)
+            else {
+                return Ok(false);
+            };
+            (
+                index,
+                self._lua.registry_value(callback_key).map_err(lua_error)?,
+            )
+        };
+        *self.drawer_focused_button.borrow_mut() = Some(index);
         let result = callback
             .call::<()>(())
             .map_err(|error| plugin_error(format!("drawer button callback failed: {error}")));
-        let _ = self._lua.remove_registry_value(callback_key);
         result.map(|()| true)
     }
 
-    pub fn focus_drawer_line(&self, line: usize) -> bool {
+    fn clear_drawer_focus(&self) {
         if let Some(state) = self.drawer_input.borrow_mut().as_mut() {
-            if state.line == line {
-                state.focused = true;
-                if let Some(checkbox) = self.drawer_checkbox.borrow_mut().as_mut() {
-                    checkbox.focused = false;
-                }
-                return true;
-            }
+            state.focused = false;
         }
         if let Some(state) = self.drawer_checkbox.borrow_mut().as_mut() {
-            if state.line == line {
-                state.focused = true;
-                if let Some(input) = self.drawer_input.borrow_mut().as_mut() {
-                    input.focused = false;
-                }
-                return true;
-            }
+            state.focused = false;
         }
         if let Some(state) = self.drawer_dropdown.borrow_mut().as_mut() {
-            if state.line == line {
-                state.focused = true;
-                if let Some(input) = self.drawer_input.borrow_mut().as_mut() {
-                    input.focused = false;
-                }
-                if let Some(checkbox) = self.drawer_checkbox.borrow_mut().as_mut() {
-                    checkbox.focused = false;
-                }
-                return true;
-            }
+            state.focused = false;
         }
-        false
+        *self.drawer_focused_button.borrow_mut() = None;
+    }
+
+    pub fn focus_drawer_line(&self, line: usize) -> bool {
+        let input = self
+            .drawer_input
+            .borrow()
+            .as_ref()
+            .is_some_and(|state| state.line == line);
+        let checkbox = self
+            .drawer_checkbox
+            .borrow()
+            .as_ref()
+            .is_some_and(|state| state.line == line);
+        let dropdown = self
+            .drawer_dropdown
+            .borrow()
+            .as_ref()
+            .is_some_and(|state| state.line == line);
+        let button = self
+            .drawer_actions
+            .borrow()
+            .iter()
+            .position(|(action_line, _)| *action_line == line);
+        if !(input || checkbox || dropdown || button.is_some()) {
+            return false;
+        }
+        self.clear_drawer_focus();
+        if input {
+            if let Some(state) = self.drawer_input.borrow_mut().as_mut() {
+                state.focused = true;
+            }
+        } else if checkbox {
+            if let Some(state) = self.drawer_checkbox.borrow_mut().as_mut() {
+                state.focused = true;
+            }
+        } else if dropdown {
+            if let Some(state) = self.drawer_dropdown.borrow_mut().as_mut() {
+                state.focused = true;
+            }
+        } else if let Some(index) = button {
+            *self.drawer_focused_button.borrow_mut() = Some(index);
+        }
+        true
+    }
+
+    pub fn cycle_drawer_focus(&self, backwards: bool) -> bool {
+        let mut controls = Vec::new();
+        if let Some(state) = self.drawer_input.borrow().as_ref() {
+            controls.push((state.line, 0_u8, 0_usize));
+        }
+        if let Some(state) = self.drawer_checkbox.borrow().as_ref() {
+            controls.push((state.line, 1_u8, 0));
+        }
+        if let Some(state) = self.drawer_dropdown.borrow().as_ref() {
+            controls.push((state.line, 2_u8, 0));
+        }
+        controls.extend(
+            self.drawer_actions
+                .borrow()
+                .iter()
+                .enumerate()
+                .map(|(index, (line, _))| (*line, 3_u8, index)),
+        );
+        if controls.is_empty() {
+            return false;
+        }
+        controls.sort_unstable();
+        let current = controls.iter().position(|(_, kind, index)| match kind {
+            0 => self
+                .drawer_input
+                .borrow()
+                .as_ref()
+                .is_some_and(|state| state.focused && *kind == 0 && *index == 0),
+            1 => self
+                .drawer_checkbox
+                .borrow()
+                .as_ref()
+                .is_some_and(|state| state.focused && *kind == 1),
+            2 => self
+                .drawer_dropdown
+                .borrow()
+                .as_ref()
+                .is_some_and(|state| state.focused && *kind == 2),
+            3 => self
+                .drawer_focused_button
+                .borrow()
+                .is_some_and(|focused| focused == *index),
+            _ => false,
+        });
+        let next = match (current, backwards) {
+            (Some(index), false) => (index + 1) % controls.len(),
+            (Some(index), true) => (index + controls.len() - 1) % controls.len(),
+            (None, false) => 0,
+            (None, true) => controls.len() - 1,
+        };
+        self.clear_drawer_focus();
+        let (line, kind, index) = controls[next];
+        match kind {
+            0 => self.focus_drawer_line(line),
+            1 => self.focus_drawer_line(line),
+            2 => self.focus_drawer_line(line),
+            3 => {
+                *self.drawer_focused_button.borrow_mut() = Some(index);
+                true
+            }
+            _ => false,
+        }
     }
 
     pub fn clear_drawer_state(&self) {
+        *self.drawer_focused_button.borrow_mut() = None;
         for (_, callback) in self.drawer_actions.borrow_mut().drain(..) {
             let _ = self._lua.remove_registry_value(callback);
         }
@@ -8230,6 +9683,21 @@ impl PluginRuntime {
         rune: Option<char>,
         modifier: &str,
     ) -> AppResult<bool> {
+        let focused_button = self.drawer_focused_button.borrow().as_ref().copied();
+        if let Some(index) = focused_button {
+            if key_name != "Enter" && rune != Some(' ') {
+                return Ok(false);
+            }
+            let line = self
+                .drawer_actions
+                .borrow()
+                .get(index)
+                .map(|(line, _)| *line);
+            let Some(line) = line else {
+                return Ok(false);
+            };
+            return self.activate_drawer_line(line);
+        }
         if self
             .drawer_dropdown
             .borrow()
@@ -8296,7 +9764,7 @@ impl PluginRuntime {
             }
             return Ok(true);
         }
-        let (text, callback) = {
+        let (text, callback, submit, clear_on_submit) = {
             let mut input = self.drawer_input.borrow_mut();
             let Some(state) = input.as_mut() else {
                 return Ok(false);
@@ -8304,45 +9772,53 @@ impl PluginRuntime {
             if !state.focused || !modifier.is_empty() && key_name != "Backspace" {
                 return Ok(false);
             }
-            match key_name {
-                "Backspace" => {
-                    state.text.pop();
-                }
-                "Enter" => {
-                    let callback = state
-                        .on_submit
-                        .as_ref()
-                        .map(|key| self._lua.registry_value::<Function>(key))
-                        .transpose()
-                        .map_err(lua_error)?;
-                    return if let Some(callback) = callback {
-                        callback.call::<()>(state.text.clone()).map_err(|error| {
-                            plugin_error(format!("drawer input submit failed: {error}"))
-                        })?;
-                        Ok(true)
-                    } else {
-                        Ok(true)
-                    };
-                }
-                _ => {
-                    let Some(rune) = rune else {
-                        return Ok(false);
-                    };
-                    state.text.push(rune);
-                }
+            let submit = key_name == "Enter" && !state.multiline;
+            if !submit {
+                match key_name {
+                    "Enter" if state.multiline => {
+                        state.text.push('\n');
+                    }
+                    "Backspace" => {
+                        state.text.pop();
+                    }
+                    _ => {
+                        let Some(rune) = rune else {
+                            return Ok(false);
+                        };
+                        state.text.push(rune);
+                    }
+                };
             }
-            let callback = state
-                .on_change
-                .as_ref()
-                .map(|key| self._lua.registry_value::<Function>(key))
-                .transpose()
-                .map_err(lua_error)?;
-            (state.text.clone(), callback)
+            let callback = if submit {
+                state
+                    .on_submit
+                    .as_ref()
+                    .map(|key| self._lua.registry_value::<Function>(key))
+                    .transpose()
+                    .map_err(lua_error)?
+            } else {
+                state
+                    .on_change
+                    .as_ref()
+                    .map(|key| self._lua.registry_value::<Function>(key))
+                    .transpose()
+                    .map_err(lua_error)?
+            };
+            (state.text.clone(), callback, submit, state.clear_on_submit)
         };
         if let Some(callback) = callback {
-            callback
-                .call::<()>(text)
-                .map_err(|error| plugin_error(format!("drawer input change failed: {error}")))?;
+            callback.call::<()>(text).map_err(|error| {
+                plugin_error(if submit {
+                    format!("drawer input submit failed: {error}")
+                } else {
+                    format!("drawer input change failed: {error}")
+                })
+            })?;
+        }
+        if submit && clear_on_submit {
+            if let Some(state) = self.drawer_input.borrow_mut().as_mut() {
+                state.text.clear();
+            }
         }
         Ok(true)
     }
@@ -8527,8 +10003,8 @@ impl PluginRuntime {
             .set(
                 "label",
                 self._lua
-                    .create_function(move |_, (_panel, value): (Table, String)| {
-                        sink.borrow_mut().push(value);
+                    .create_function(move |lua, (_panel, value): (Table, LuaValue)| {
+                        sink.borrow_mut().push(label_widget_text(lua, &value)?);
                         Ok(())
                     })
                     .map_err(lua_error)?,
@@ -8539,6 +10015,22 @@ impl PluginRuntime {
                 "text",
                 self._lua
                     .create_function(|_, (_panel, _value): (Table, String)| Ok(()))
+                    .map_err(lua_error)?,
+            )
+            .map_err(lua_error)?;
+        let markdown_sink = Rc::clone(&lines);
+        panel
+            .set(
+                "markdown",
+                self._lua
+                    .create_function(move |lua, (_panel, value): (Table, Option<LuaValue>)| {
+                        if let Some(value) = value {
+                            markdown_sink
+                                .borrow_mut()
+                                .extend(markdown_widget_lines(lua, value)?);
+                        }
+                        Ok(())
+                    })
                     .map_err(lua_error)?,
             )
             .map_err(lua_error)?;
@@ -8617,15 +10109,19 @@ impl PluginRuntime {
                 .map_err(lua_error)?;
         }
         let progress_sink = Rc::clone(&lines);
+        let progress_panel_size = Rc::clone(&self.panel_size);
         panel
             .set(
                 "progress",
                 self._lua
                     .create_function(move |lua, (_panel, value): (Table, Option<LuaValue>)| {
                         if let Some(value) = value {
+                            let width =
+                                usize::from(progress_panel_size.borrow().0.saturating_sub(2))
+                                    .max(1);
                             progress_sink
                                 .borrow_mut()
-                                .push(progress_widget_text(lua, value));
+                                .push(progress_widget_text(lua, value, width));
                         }
                         Ok(())
                     })
@@ -8635,6 +10131,7 @@ impl PluginRuntime {
         for name in [
             "badge",
             "border",
+            "box",
             "dialog",
             "hstack",
             "raw",
@@ -8643,20 +10140,60 @@ impl PluginRuntime {
             "vstack",
         ] {
             let sink = Rc::clone(&lines);
+            let is_title = name == "title";
+            let title_menus = Rc::clone(&self.panel_title_menus);
+            let title_callbacks = Rc::clone(&self.panel_title_callbacks);
+            let title_panel_id = format!("__file:{file_id}");
             panel
                 .set(
                     name,
                     self._lua
                         .create_function(
-                            move |lua, (_panel, values): (Table, Variadic<LuaValue>)| {
+                            move |lua, (panel, values): (Table, Variadic<LuaValue>)| {
+                                if is_title && values.len() == 1 {
+                                    if let Some(LuaValue::Table(value)) = values.first() {
+                                        let entries = panel_menu_entries(lua, value, "menu")?;
+                                        if entries.is_empty() {
+                                            title_menus.borrow_mut().remove(&title_panel_id);
+                                        } else {
+                                            title_menus
+                                                .borrow_mut()
+                                                .insert(title_panel_id.clone(), entries);
+                                        }
+                                        if let Some(callback) =
+                                            value.get::<Option<Function>>("on_menu")?
+                                        {
+                                            let key = lua.create_registry_value(callback)?;
+                                            if let Some(previous) = title_callbacks
+                                                .borrow_mut()
+                                                .insert(title_panel_id.clone(), key)
+                                            {
+                                                let _ = lua.remove_registry_value(previous);
+                                            }
+                                        }
+                                        sink.borrow_mut().push(title_widget_text(lua, value)?);
+                                        return Ok(());
+                                    }
+                                }
                                 if !values.is_empty() {
-                                    sink.borrow_mut().push(
-                                        values
-                                            .into_iter()
-                                            .map(|value| lua_value_text(lua, value))
-                                            .collect::<Vec<_>>()
-                                            .join(" "),
-                                    );
+                                    let mut rendered_children = false;
+                                    if let Some(LuaValue::Table(value)) = values.first() {
+                                        if let Some(render) =
+                                            value.get::<Option<Function>>("render")?
+                                        {
+                                            render.call::<()>(panel.clone())?;
+                                            rendered_children = true;
+                                        }
+                                    }
+                                    if !rendered_children {
+                                        sink.borrow_mut().push(
+                                            values
+                                                .into_iter()
+                                                .map(|value| lua_value_text(lua, value))
+                                                .collect::<Vec<_>>()
+                                                .join(" "),
+                                        );
+                                    }
                                 }
                                 Ok(())
                             },
@@ -8963,6 +10500,37 @@ impl PluginRuntime {
         self.move_panel_selection(id, delta)
     }
 
+    pub fn move_tree_horizontal_selection(&self, id: &str, expand: bool) -> AppResult<bool> {
+        let Some(selection_key) = self.panel_active_selection.borrow().get(id).cloned() else {
+            return Ok(false);
+        };
+        if !selection_key.ends_with(":tree") {
+            return Ok(false);
+        }
+        let Some(row) = self
+            .panel_selection_state
+            .borrow()
+            .get(&selection_key)
+            .map(|(selected, _)| selected + 1)
+        else {
+            return Ok(false);
+        };
+        let callbacks = self.tree_navigation_callbacks.borrow();
+        let Some(callback_key) = callbacks.get(id) else {
+            return Ok(false);
+        };
+        let callback: Function = self._lua.registry_value(callback_key).map_err(lua_error)?;
+        let changed = callback
+            .call::<bool>((row, expand))
+            .map_err(|error| plugin_error(format!("tree navigation callback failed: {error}")))?;
+        if changed {
+            self.panel_selection_dirty
+                .borrow_mut()
+                .insert(selection_key);
+        }
+        Ok(changed)
+    }
+
     pub fn activate_panel_current_selection(&self, id: &str) -> AppResult<bool> {
         let Some(selection_key) = self.panel_active_selection.borrow().get(id).cloned() else {
             return Ok(false);
@@ -8975,11 +10543,14 @@ impl PluginRuntime {
         else {
             return Ok(false);
         };
-        if self.panel_activation_callbacks.borrow().contains_key(id) {
-            self.activate_panel_row(id, selected)
-        } else {
-            self.activate_panel_selection(id, selected)
+        let mut activated = false;
+        if self.panel_selection_callbacks.borrow().contains_key(id) {
+            activated |= self.activate_panel_selection(id, selected)?;
         }
+        if self.panel_activation_callbacks.borrow().contains_key(id) {
+            activated |= self.activate_panel_row(id, selected)?;
+        }
+        Ok(activated)
     }
 
     pub fn activate_panel_command(&self, id: &str, key: &str) -> AppResult<bool> {
@@ -9019,6 +10590,56 @@ impl PluginRuntime {
     pub fn close_tab(&self, id: &str) -> AppResult<bool> {
         let callback = self.open_tabs.borrow_mut().remove(id);
         let tab_exists = callback.is_some();
+        for callbacks in [
+            &self.panel_selection_callbacks,
+            &self.panel_activation_callbacks,
+            &self.panel_command_callbacks,
+            &self.panel_title_callbacks,
+        ] {
+            if let Some(callback) = callbacks.borrow_mut().remove(id) {
+                let _ = self._lua.remove_registry_value(callback);
+            }
+        }
+        if let Some(actions) = self.panel_button_actions.borrow_mut().remove(id) {
+            for (_, callback) in actions {
+                let _ = self._lua.remove_registry_value(callback);
+            }
+        }
+        if let Some(selection_key) = self.panel_active_selection.borrow_mut().remove(id) {
+            self.panel_selection_state
+                .borrow_mut()
+                .remove(&selection_key);
+        }
+        self.panel_title_menus.borrow_mut().remove(id);
+        self.panel_key_commands.borrow_mut().remove(id);
+        self.panel_focused_button.borrow_mut().remove(id);
+        self.panel_dropdown_lines.borrow_mut().remove(id);
+        self.panel_action_regions.borrow_mut().remove(id);
+        self.panel_radio_lines.borrow_mut().remove(id);
+        self.panel_tabs_lines.borrow_mut().remove(id);
+        self.panel_scrollview_lines.borrow_mut().remove(id);
+        for states in [&self.panel_inputs, &self.panel_passwords] {
+            if let Some(mut state) = states.borrow_mut().remove(id) {
+                for callback in [state.on_change.take(), state.on_submit.take()]
+                    .into_iter()
+                    .flatten()
+                {
+                    let _ = self._lua.remove_registry_value(callback);
+                }
+            }
+        }
+        if let Some(state) = self.panel_checkboxes.borrow_mut().remove(id) {
+            if let Some(callback) = state.on_change {
+                let _ = self._lua.remove_registry_value(callback);
+            }
+        }
+        if let Some(render_key) = self
+            .panel_callbacks
+            .borrow_mut()
+            .remove(&format!("__tab:{id}"))
+        {
+            let _ = self._lua.remove_registry_value(render_key);
+        }
         if let Some(event_key) = self.tab_event_callbacks.borrow_mut().remove(id) {
             let _ = self._lua.remove_registry_value(event_key);
         }
@@ -9674,6 +11295,41 @@ fn clear_panel_region(lines: &mut Vec<String>, x: usize, y: usize, width: usize,
     }
 }
 
+fn panel_node_menu_entries(_lua: &Lua, value: &Table) -> mlua::Result<Vec<(String, String)>> {
+    panel_menu_entries(_lua, value, "node_menu")
+}
+
+fn panel_menu_entries(
+    _lua: &Lua,
+    value: &Table,
+    field: &str,
+) -> mlua::Result<Vec<(String, String)>> {
+    let Some(entries) = value.get::<Option<Table>>(field)? else {
+        return Ok(Vec::new());
+    };
+    let mut result = Vec::new();
+    for item in entries.sequence_values::<Table>() {
+        let item = item?;
+        if item.get::<Option<bool>>("separator")?.unwrap_or(false) {
+            result.push(("────────".to_owned(), String::new()));
+            continue;
+        }
+        let Some(label) = item.get::<Option<String>>("label")? else {
+            continue;
+        };
+        let command = item
+            .get::<Option<String>>("command")?
+            .unwrap_or_else(|| label.clone());
+        let label = match item.get::<Option<bool>>("checked")? {
+            Some(true) => format!("✓ {label}"),
+            Some(false) => format!("  {label}"),
+            None => label,
+        };
+        result.push((label, command));
+    }
+    Ok(result)
+}
+
 fn tree_visible_nodes(table: &Table) -> Vec<LuaValue> {
     let mut nodes = Vec::new();
     let Some(items) = table.get::<Option<Table>>("items").ok().flatten() else {
@@ -9728,8 +11384,9 @@ fn tree_visible_nodes_with_depth_from_items(
     }
 }
 
-fn tree_widget_text(lua: &Lua, table: &Table) -> String {
-    if table.get::<Option<bool>>("loading").ok().flatten() == Some(true) {
+fn tree_widget_text_with_width(lua: &Lua, table: &Table, width: Option<usize>) -> String {
+    let loading = table.get::<Option<bool>>("loading").ok().flatten() == Some(true);
+    if loading {
         return "⏳ loading".to_owned();
     }
     let nodes = tree_visible_nodes_with_depth(table);
@@ -9746,6 +11403,18 @@ fn tree_widget_text(lua: &Lua, table: &Table) -> String {
         .flatten()
         .and_then(|value| value.checked_sub(1))
         .map(|value| value as usize);
+    let indent = table
+        .get::<Option<u64>>("indent")
+        .ok()
+        .flatten()
+        .unwrap_or(2)
+        .min(16) as usize;
+    let inset = table
+        .get::<Option<u64>>("inset")
+        .ok()
+        .flatten()
+        .unwrap_or(0)
+        .min(64) as usize;
     nodes
         .into_iter()
         .enumerate()
@@ -9769,23 +11438,61 @@ fn tree_widget_text(lua: &Lua, table: &Table) -> String {
             } else {
                 " "
             };
-            let text = collection_item_text(lua, value, false);
+            let badge_right = table.get::<Option<bool>>("badge_right").ok().flatten() == Some(true);
+            let text = if badge_right {
+                collection_item_text_with_badge(lua, value.clone(), false, false)
+            } else {
+                collection_item_text(lua, value.clone(), false)
+            };
+            let text = if badge_right {
+                let badge = match value {
+                    LuaValue::Table(item) => item
+                        .get::<Option<String>>("badge")
+                        .ok()
+                        .flatten()
+                        .filter(|badge| !badge.is_empty()),
+                    _ => None,
+                };
+                right_badge_text(text, badge.as_deref(), width)
+            } else {
+                text
+            };
             let marker = if selected == Some(index) {
                 "▶"
             } else {
                 branch
             };
-            format!("{}{} {}", "  ".repeat(depth), marker, text)
+            let prefix = format!("{}{} ", " ".repeat(inset + depth * indent), marker);
+            let text = if table.get::<Option<bool>>("truncate_left").ok().flatten() == Some(true) {
+                width
+                    .map(|width| {
+                        truncate_left_text(&text, width.saturating_sub(prefix.chars().count()))
+                    })
+                    .unwrap_or(text)
+            } else {
+                text
+            };
+            format!("{prefix}{text}")
         })
         .collect::<Vec<_>>()
         .join("\n")
 }
 
 fn collection_widget_text(lua: &Lua, value: LuaValue, table_mode: bool) -> String {
+    collection_widget_text_with_width(lua, value, table_mode, None)
+}
+
+fn collection_widget_text_with_width(
+    lua: &Lua,
+    value: LuaValue,
+    table_mode: bool,
+    width: Option<usize>,
+) -> String {
     let LuaValue::Table(table) = value else {
         return lua_value_text(lua, value);
     };
-    if table.get::<Option<bool>>("loading").ok().flatten() == Some(true) {
+    let loading = table.get::<Option<bool>>("loading").ok().flatten() == Some(true);
+    if loading && !table_mode {
         return "⏳ loading".to_owned();
     }
     let key = if table_mode { "rows" } else { "items" };
@@ -9793,6 +11500,9 @@ fn collection_widget_text(lua: &Lua, value: LuaValue, table_mode: bool) -> Strin
         return lua_value_text(lua, LuaValue::Table(table));
     };
     let Some(items) = items else {
+        if loading {
+            return "⏳ loading".to_owned();
+        }
         return table
             .get::<Option<String>>("empty")
             .ok()
@@ -9805,19 +11515,75 @@ fn collection_widget_text(lua: &Lua, value: LuaValue, table_mode: bool) -> Strin
         .flatten()
         .and_then(|value| value.checked_sub(1))
         .map(|value| value as usize);
+    let inset = table
+        .get::<Option<u64>>("inset")
+        .ok()
+        .flatten()
+        .unwrap_or(0)
+        .min(64) as usize;
     let values: Vec<_> = items.sequence_values::<LuaValue>().flatten().collect();
     if values.is_empty() {
+        if loading {
+            return "⏳ loading".to_owned();
+        }
         return table
             .get::<Option<String>>("empty")
             .ok()
             .flatten()
             .unwrap_or_default();
     }
+    if table_mode
+        && table
+            .get::<Option<Table>>("columns")
+            .ok()
+            .flatten()
+            .is_some()
+    {
+        let rendered = table_widget_text_with_columns(lua, &table, &values, selected, width);
+        if loading {
+            let mut lines = rendered.lines();
+            let header = lines.next().unwrap_or_default();
+            return std::iter::once(format!("{header}  ⏳ loading"))
+                .chain(lines.map(str::to_owned))
+                .collect::<Vec<_>>()
+                .join("\n");
+        }
+        return rendered;
+    }
     values
         .into_iter()
         .enumerate()
         .map(|(index, value)| {
-            let text = collection_item_text(lua, value, table_mode);
+            let badge_right = !table_mode
+                && table.get::<Option<bool>>("badge_right").ok().flatten() == Some(true);
+            let text = if badge_right {
+                collection_item_text_with_badge(lua, value.clone(), table_mode, false)
+            } else {
+                collection_item_text(lua, value.clone(), table_mode)
+            };
+            let text = if badge_right {
+                let badge = match value {
+                    LuaValue::Table(item) => item
+                        .get::<Option<String>>("badge")
+                        .ok()
+                        .flatten()
+                        .filter(|badge| !badge.is_empty()),
+                    _ => None,
+                };
+                right_badge_text(text, badge.as_deref(), width)
+            } else {
+                text
+            };
+            let text = format!("{}{}", " ".repeat(inset), text);
+            let text = if !table_mode
+                && table.get::<Option<bool>>("truncate_left").ok().flatten() == Some(true)
+            {
+                width
+                    .map(|width| truncate_left_text(&text, width.saturating_sub(2)))
+                    .unwrap_or(text)
+            } else {
+                text
+            };
             let text = if table_mode {
                 horizontal_table_slice(&table, &text)
             } else {
@@ -9831,6 +11597,292 @@ fn collection_widget_text(lua: &Lua, value: LuaValue, table_mode: bool) -> Strin
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[derive(Clone)]
+struct TableColumnSpec {
+    label: String,
+    width: usize,
+    fixed: bool,
+    align: String,
+    actions: Option<String>,
+}
+
+fn table_widget_text_with_columns(
+    lua: &Lua,
+    table: &Table,
+    rows: &[LuaValue],
+    selected: Option<usize>,
+    width: Option<usize>,
+) -> String {
+    let Some(columns) = table.get::<Option<Table>>("columns").ok().flatten() else {
+        return String::new();
+    };
+    let mut specs = columns
+        .sequence_values::<Table>()
+        .flatten()
+        .map(|column| {
+            let label = column
+                .get::<Option<String>>("label")
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            let fixed = column.get::<Option<u64>>("width").ok().flatten();
+            let min_width = column
+                .get::<Option<u64>>("min_width")
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| UnicodeWidthStr::width(label.as_str()) as u64);
+            let label_width = UnicodeWidthStr::width(label.as_str());
+            let actions = column
+                .get::<Option<Table>>("actions")
+                .ok()
+                .flatten()
+                .map(|actions| {
+                    actions
+                        .sequence_values::<LuaValue>()
+                        .flatten()
+                        .filter_map(|action| match action {
+                            LuaValue::String(label) => {
+                                label.to_str().ok().map(|text| text.to_owned())
+                            }
+                            LuaValue::Table(action) => action
+                                .get::<Option<String>>("label")
+                                .ok()
+                                .flatten()
+                                .or_else(|| {
+                                    action
+                                        .get::<Option<bool>>("menu")
+                                        .ok()
+                                        .flatten()
+                                        .filter(|menu| *menu)
+                                        .map(|_| "⋮".to_owned())
+                                }),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" | ")
+                })
+                .filter(|text| !text.is_empty());
+            let action_width = actions.as_deref().map(UnicodeWidthStr::width).unwrap_or(0);
+            let fixed_width = fixed.map(|value| value as usize);
+            TableColumnSpec {
+                label,
+                width: fixed_width
+                    .unwrap_or_else(|| (min_width as usize).max(label_width).max(action_width))
+                    .max(1),
+                fixed: fixed_width.is_some(),
+                align: column
+                    .get::<Option<String>>("align")
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| "left".to_owned()),
+                actions,
+            }
+        })
+        .collect::<Vec<_>>();
+    if specs.is_empty() {
+        return rows
+            .iter()
+            .enumerate()
+            .map(|(index, row)| table_row_line(lua, row, selected == Some(index)))
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+    // The closure above needs the column index while retaining a compact parser.
+    // Recompute auto widths with the actual index; this also handles short rows.
+    for (index, spec) in specs.iter_mut().enumerate() {
+        if spec.fixed {
+            continue;
+        }
+        let natural = rows
+            .iter()
+            .filter_map(|row| table_row_cells(lua, row).get(index).cloned())
+            .map(|cell| UnicodeWidthStr::width(cell.as_str()))
+            .max()
+            .unwrap_or(0);
+        spec.width = spec.width.max(natural);
+    }
+    let gap = 2 * specs.len().saturating_sub(1);
+    let pinned_action_width = specs
+        .last()
+        .and_then(|spec| spec.actions.as_ref().map(|_| spec.width));
+    let lines = std::iter::once(format_table_row(
+        &specs,
+        &specs.iter().map(|c| c.label.clone()).collect::<Vec<_>>(),
+        false,
+    ))
+    .chain(rows.iter().enumerate().map(|(index, row)| {
+        let mut cells = table_row_cells(lua, row);
+        for (column, spec) in specs.iter().enumerate() {
+            if column >= cells.len() {
+                cells.push(String::new());
+            }
+            if let Some(actions) = &spec.actions {
+                cells[column] = actions.clone();
+            }
+        }
+        format_table_row(&specs, &cells, selected == Some(index))
+    }))
+    .collect::<Vec<_>>();
+    lines
+        .into_iter()
+        .map(|line| {
+            if let Some(available) = width.filter(|available| *available > 0) {
+                if UnicodeWidthStr::width(line.as_str()) + gap > available {
+                    if let Some(action_width) = pinned_action_width {
+                        return horizontal_table_slice_with_pinned_action(
+                            table,
+                            &line,
+                            available,
+                            action_width,
+                        );
+                    }
+                    return horizontal_table_slice(table, &line);
+                }
+            }
+            line
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+// Kept separate from the parser so array rows and `{cells = ...}` rows share semantics.
+fn table_row_cells(lua: &Lua, row: &LuaValue) -> Vec<String> {
+    let LuaValue::Table(row) = row else {
+        return vec![lua_value_text(lua, row.clone())];
+    };
+    row.get::<Option<Table>>("cells")
+        .ok()
+        .flatten()
+        .map(|cells| {
+            cells
+                .sequence_values::<LuaValue>()
+                .flatten()
+                .map(|cell| lua_value_text(lua, cell))
+                .collect()
+        })
+        .unwrap_or_else(|| {
+            row.sequence_values::<LuaValue>()
+                .flatten()
+                .map(|cell| lua_value_text(lua, cell))
+                .collect()
+        })
+}
+
+fn format_table_row(specs: &[TableColumnSpec], cells: &[String], selected: bool) -> String {
+    let body = specs
+        .iter()
+        .enumerate()
+        .map(|(index, spec)| {
+            let cell = cells.get(index).map(String::as_str).unwrap_or("");
+            let truncated = truncate_right_text(cell, spec.width);
+            let padding = spec
+                .width
+                .saturating_sub(UnicodeWidthStr::width(truncated.as_str()));
+            match spec.align.as_str() {
+                "right" => format!("{}{}", " ".repeat(padding), truncated),
+                "center" => {
+                    let left = padding / 2;
+                    format!(
+                        "{}{}{}",
+                        " ".repeat(left),
+                        truncated,
+                        " ".repeat(padding - left)
+                    )
+                }
+                _ => format!("{}{}", truncated, " ".repeat(padding)),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("  ");
+    if selected {
+        format!("▶ {body}")
+    } else {
+        format!("  {body}")
+    }
+}
+
+fn table_row_line(lua: &Lua, row: &LuaValue, selected: bool) -> String {
+    let text = table_row_cells(lua, row).join("  ");
+    if selected {
+        format!("▶ {text}")
+    } else {
+        format!("  {text}")
+    }
+}
+
+fn right_badge_text(text: String, badge: Option<&str>, width: Option<usize>) -> String {
+    let Some(badge) = badge else {
+        return text;
+    };
+    let Some(width) = width else {
+        return format!("{text}  {badge}");
+    };
+    let available = width.saturating_sub(2);
+    let text_width = UnicodeWidthStr::width(text.as_str());
+    let badge_width = UnicodeWidthStr::width(badge);
+    if text_width + 2 + badge_width <= available {
+        return format!(
+            "{text}{}{}",
+            " ".repeat(available - text_width - badge_width),
+            badge
+        );
+    }
+    let remaining = available.saturating_sub(text_width + 2);
+    if remaining < 3 {
+        text
+    } else {
+        format!("{text}  {}", truncate_right_text(badge, remaining))
+    }
+}
+
+fn truncate_right_text(text: &str, width: usize) -> String {
+    if UnicodeWidthStr::width(text) <= width {
+        return text.to_owned();
+    }
+    if width <= UnicodeWidthStr::width("…") {
+        return "…".chars().take(width).collect();
+    }
+    let keep_width = width - UnicodeWidthStr::width("…");
+    let mut used = 0;
+    let prefix = text
+        .chars()
+        .take_while(|character| {
+            let character_width = UnicodeWidthChar::width(*character).unwrap_or(0);
+            if used + character_width > keep_width {
+                return false;
+            }
+            used += character_width;
+            true
+        })
+        .collect::<String>();
+    format!("{prefix}…")
+}
+
+fn truncate_left_text(text: &str, width: usize) -> String {
+    if UnicodeWidthStr::width(text) <= width {
+        return text.to_owned();
+    }
+    if width <= UnicodeWidthStr::width("…") {
+        return "…".chars().take(width).collect();
+    }
+    let keep_width = width - UnicodeWidthStr::width("…");
+    let mut used = 0;
+    let mut tail = text
+        .chars()
+        .rev()
+        .take_while(|character| {
+            let character_width = UnicodeWidthChar::width(*character).unwrap_or(0);
+            if used + character_width > keep_width {
+                return false;
+            }
+            used += character_width;
+            true
+        })
+        .collect::<Vec<_>>();
+    tail.reverse();
+    format!("…{}", tail.into_iter().collect::<String>())
 }
 
 fn radio_selected_index(table: &Table) -> mlua::Result<Option<usize>> {
@@ -9930,6 +11982,49 @@ fn horizontal_table_slice(table: &Table, text: &str) -> String {
     chars[start..end].iter().collect()
 }
 
+fn horizontal_table_slice_with_pinned_action(
+    table: &Table,
+    text: &str,
+    width: usize,
+    action_width: usize,
+) -> String {
+    let suffix_width = action_width.saturating_add(2);
+    if width <= suffix_width {
+        return display_suffix(text, width);
+    }
+    let suffix = display_suffix(text, suffix_width);
+    let prefix = &text[..text.len().saturating_sub(suffix.len())];
+    let visible_prefix = horizontal_table_slice_to_width(table, prefix, width - suffix_width);
+    format!("{visible_prefix}{suffix}")
+}
+
+fn horizontal_table_slice_to_width(table: &Table, text: &str, width: usize) -> String {
+    let offset = table
+        .get::<Option<u64>>("scroll_x")
+        .ok()
+        .flatten()
+        .or_else(|| table.get::<Option<u64>>("horizontal_scroll").ok().flatten())
+        .unwrap_or(0) as usize;
+    let chars: Vec<char> = text.chars().collect();
+    let start = offset.min(chars.len());
+    let end = start.saturating_add(width).min(chars.len());
+    chars[start..end].iter().collect()
+}
+
+fn display_suffix(text: &str, width: usize) -> String {
+    let mut consumed = 0;
+    let mut start = text.len();
+    for (index, character) in text.char_indices().rev() {
+        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if consumed + character_width > width {
+            break;
+        }
+        consumed += character_width;
+        start = index;
+    }
+    text[start..].to_owned()
+}
+
 fn dropdown_widget_text(lua: &Lua, table: Table) -> String {
     let selected = table
         .get::<Option<u64>>("selected")
@@ -9999,6 +12094,115 @@ fn markdown_to_lua(lua: &Lua, markdown: &str) -> mlua::Result<Table> {
         result.set(line_index + 1, spans)?;
     }
     Ok(result)
+}
+
+fn markdown_widget_lines(lua: &Lua, value: LuaValue) -> mlua::Result<Vec<String>> {
+    let (markdown, wrap_width) = match value {
+        LuaValue::String(value) => (value.to_str()?.to_owned(), None),
+        LuaValue::Table(value) => (
+            value
+                .get::<Option<LuaValue>>("text")?
+                .map(|text| lua_value_text(lua, text))
+                .unwrap_or_default(),
+            value.get::<Option<u64>>("wrap_width")?,
+        ),
+        value => (lua_value_text(lua, value), None),
+    };
+    let wrap_width = wrap_width.map(|width| width as usize);
+    if wrap_width == Some(0) {
+        return Err(mlua::Error::external("wrap_width must be positive"));
+    }
+    Ok(markdown
+        .lines()
+        .flat_map(|line| {
+            let rendered = markdown_widget_line(line);
+            wrap_markdown_line(&rendered, wrap_width)
+        })
+        .collect())
+}
+
+fn wrap_markdown_line(line: &str, width: Option<usize>) -> Vec<String> {
+    let Some(width) = width.filter(|width| *width > 0) else {
+        return vec![line.to_owned()];
+    };
+    if UnicodeWidthStr::width(line) <= width {
+        return vec![line.to_owned()];
+    }
+    let mut result = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0;
+    for word in line.split_whitespace() {
+        let word_width = UnicodeWidthStr::width(word);
+        let separator_width = usize::from(!current.is_empty());
+        if !current.is_empty() && current_width + separator_width + word_width > width {
+            result.push(std::mem::take(&mut current));
+            current_width = 0;
+        }
+        if !current.is_empty() {
+            current.push(' ');
+            current_width += 1;
+        }
+        current.push_str(word);
+        current_width += word_width;
+    }
+    if !current.is_empty() {
+        result.push(current);
+    }
+    if result.is_empty() {
+        vec![line.to_owned()]
+    } else {
+        result
+    }
+}
+
+fn wrap_plain_text(text: &str, width: usize) -> String {
+    text.lines()
+        .flat_map(|line| wrap_markdown_line(line, Some(width)))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn label_widget_text(lua: &Lua, value: &LuaValue) -> mlua::Result<String> {
+    let LuaValue::Table(value) = value else {
+        return Ok(lua_value_text(lua, value.clone()));
+    };
+    let text = value
+        .get::<Option<LuaValue>>("text")?
+        .map(|text| lua_value_text(lua, text))
+        .unwrap_or_default();
+    let badge = value
+        .get::<Option<LuaValue>>("badge")?
+        .map(|badge| lua_value_text(lua, badge))
+        .filter(|badge| !badge.is_empty());
+    Ok(badge.map_or(text.clone(), |badge| format!("{text}  {badge}")))
+}
+
+fn title_widget_text(lua: &Lua, value: &Table) -> mlua::Result<String> {
+    label_widget_text(lua, &LuaValue::Table(value.clone()))
+}
+
+fn markdown_widget_line(line: &str) -> String {
+    let content = line
+        .strip_prefix("### ")
+        .or_else(|| line.strip_prefix("## "))
+        .or_else(|| line.strip_prefix("# "))
+        .unwrap_or(line);
+    let mut rendered = markdown_inline_spans(content)
+        .into_iter()
+        .map(|(text, _style)| text)
+        .collect::<String>();
+    if let Some(start) = rendered.find('[') {
+        if let Some(label_end) = rendered[start + 1..].find("](") {
+            let label_end = start + 1 + label_end;
+            if let Some(url_end) = rendered[label_end + 2..].find(')') {
+                let prefix = rendered[..start].to_owned();
+                let label = rendered[start + 1..label_end].to_owned();
+                let suffix = rendered[label_end + 3 + url_end..].to_owned();
+                rendered = format!("{prefix}{label}{suffix}");
+            }
+        }
+    }
+    rendered
 }
 
 fn markdown_inline_spans(line: &str) -> Vec<(String, String)> {
@@ -10075,7 +12279,7 @@ fn password_widget_text(lua: &Lua, value: LuaValue) -> String {
     }
 }
 
-fn progress_widget_text(lua: &Lua, value: LuaValue) -> String {
+fn progress_widget_text(lua: &Lua, value: LuaValue, width: usize) -> String {
     let (ratio, label, fill, empty) = match value {
         LuaValue::Table(table) => (
             table
@@ -10089,18 +12293,17 @@ fn progress_widget_text(lua: &Lua, value: LuaValue) -> String {
                 .ok()
                 .flatten()
                 .and_then(|text| text.chars().next())
-                .unwrap_or('█'),
+                .unwrap_or('▄'),
             '░',
         ),
         other => (
             lua_value_text(lua, other).parse().unwrap_or(0.0),
             None,
-            '█',
+            '▄',
             '░',
         ),
     };
     let ratio = ratio.clamp(0.0, 1.0);
-    let width = 20usize;
     let filled = (ratio * width as f64).round() as usize;
     let bar = format!(
         "{}{}",
@@ -10174,6 +12377,15 @@ fn checkbox_widget_text(table: Table) -> String {
 }
 
 fn collection_item_text(lua: &Lua, value: LuaValue, table_mode: bool) -> String {
+    collection_item_text_with_badge(lua, value, table_mode, true)
+}
+
+fn collection_item_text_with_badge(
+    lua: &Lua,
+    value: LuaValue,
+    table_mode: bool,
+    include_badge: bool,
+) -> String {
     let LuaValue::Table(item) = value else {
         return lua_value_text(lua, value);
     };
@@ -10210,12 +12422,28 @@ fn collection_item_text(lua: &Lua, value: LuaValue, table_mode: bool) -> String 
         .ok()
         .flatten()
         .map_or(text.clone(), |right| format!("{text}  {right}"));
+    let text = if include_badge {
+        let text = item
+            .get::<Option<String>>("badge_right")
+            .ok()
+            .flatten()
+            .filter(|badge| !badge.is_empty())
+            .map_or(text.clone(), |badge| format!("{text}  {badge}"));
+        item.get::<Option<String>>("badge")
+            .ok()
+            .flatten()
+            .filter(|badge| !badge.is_empty())
+            .map_or(text.clone(), |badge| format!("{text}  {badge}"))
+    } else {
+        text
+    };
     let text = item
-        .get::<Option<String>>("badge")
+        .get::<Option<u64>>("inset")
         .ok()
         .flatten()
-        .filter(|badge| !badge.is_empty())
-        .map_or(text.clone(), |badge| format!("{text}  {badge}"));
+        .map_or(text.clone(), |inset| {
+            format!("{}{}", " ".repeat(inset.min(64) as usize), text)
+        });
     item.get::<Option<Table>>("actions")
         .ok()
         .flatten()
@@ -10240,6 +12468,165 @@ fn collection_item_text(lua: &Lua, value: LuaValue, table_mode: bool) -> String 
             }
         })
         .unwrap_or(text)
+}
+
+fn register_panel_action_regions(
+    lua: &Lua,
+    table: &Table,
+    table_mode: bool,
+    line: usize,
+    panel_id: &str,
+    regions: &Rc<RefCell<PanelActionRegions>>,
+) {
+    let key = if table_mode { "rows" } else { "items" };
+    let Some(items) = table.get::<Option<Table>>(key).ok().flatten() else {
+        return;
+    };
+    let mut output = regions.borrow_mut();
+    let entries = output.entry(panel_id.to_owned()).or_default();
+    for (index, value) in items.sequence_values::<LuaValue>().flatten().enumerate() {
+        let LuaValue::Table(item) = value.clone() else {
+            continue;
+        };
+        let Some(actions) = item.get::<Option<Table>>("actions").ok().flatten() else {
+            continue;
+        };
+        let actions = actions
+            .sequence_values::<LuaValue>()
+            .flatten()
+            .filter_map(|action| match action {
+                LuaValue::String(label) => label
+                    .to_str()
+                    .ok()
+                    .map(|label| (label.to_owned(), label.to_owned())),
+                LuaValue::Table(action) => {
+                    let command = action
+                        .get::<Option<String>>("command")
+                        .ok()
+                        .flatten()
+                        .or_else(|| action.get::<Option<String>>("id").ok().flatten());
+                    let label = action
+                        .get::<Option<String>>("label")
+                        .ok()
+                        .flatten()
+                        .or_else(|| command.clone())
+                        .or_else(|| {
+                            action
+                                .get::<Option<bool>>("menu")
+                                .ok()
+                                .flatten()
+                                .filter(|menu| *menu)
+                                .map(|_| "⋮".to_owned())
+                        })?;
+                    Some((label, command.unwrap_or_default()))
+                }
+                _ => None,
+            })
+            .filter(|(_, command)| !command.is_empty())
+            .collect::<Vec<_>>();
+        if actions.is_empty() {
+            continue;
+        }
+        let text =
+            collection_item_text_with_badge(lua, LuaValue::Table(item.clone()), table_mode, true);
+        let labels = actions
+            .iter()
+            .map(|(label, _)| label.as_str())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        let block = format!("[{labels}]");
+        let block_start = 2 + UnicodeWidthStr::width(text.as_str())
+            .saturating_sub(UnicodeWidthStr::width(block.as_str()));
+        let mut cursor = block_start + 1;
+        for (label, command) in actions {
+            let end = cursor + UnicodeWidthStr::width(label.as_str());
+            entries.push(PanelActionRegion {
+                line,
+                start: cursor,
+                end,
+                command,
+                row: index + 1,
+            });
+            cursor = end + 3;
+        }
+    }
+    if table_mode {
+        let Some(columns) = table.get::<Option<Table>>("columns").ok().flatten() else {
+            return;
+        };
+        let rendered = collection_widget_text(lua, LuaValue::Table(table.clone()), true);
+        for (column_index, column) in columns.sequence_values::<Table>().flatten().enumerate() {
+            let Some(actions) = column.get::<Option<Table>>("actions").ok().flatten() else {
+                continue;
+            };
+            let actions = actions
+                .sequence_values::<LuaValue>()
+                .flatten()
+                .filter_map(|action| match action {
+                    LuaValue::String(label) => label
+                        .to_str()
+                        .ok()
+                        .map(|label| (label.to_owned(), label.to_owned())),
+                    LuaValue::Table(action) => {
+                        let command = action
+                            .get::<Option<String>>("command")
+                            .ok()
+                            .flatten()
+                            .or_else(|| action.get::<Option<String>>("id").ok().flatten());
+                        let label = action
+                            .get::<Option<String>>("label")
+                            .ok()
+                            .flatten()
+                            .or_else(|| command.clone())
+                            .or_else(|| {
+                                action
+                                    .get::<Option<bool>>("menu")
+                                    .ok()
+                                    .flatten()
+                                    .filter(|menu| *menu)
+                                    .map(|_| "⋮".to_owned())
+                            })?;
+                        Some((label, command.unwrap_or_default()))
+                    }
+                    _ => None,
+                })
+                .filter(|(_, command)| !command.is_empty())
+                .collect::<Vec<_>>();
+            if actions.is_empty() {
+                continue;
+            }
+            let labels = actions
+                .iter()
+                .map(|(label, _)| label.as_str())
+                .collect::<Vec<_>>()
+                .join(" | ");
+            for (row, row_text) in rendered.lines().skip(1).take(items.raw_len()).enumerate() {
+                let cells = table_row_cells(
+                    lua,
+                    &items.get::<LuaValue>(row + 1).unwrap_or(LuaValue::Nil),
+                );
+                if column_index > cells.len() {
+                    continue;
+                }
+                let Some(byte_start) = row_text.find(&labels) else {
+                    continue;
+                };
+                let start = UnicodeWidthStr::width(&row_text[..byte_start]) + 1;
+                let mut cursor = start;
+                for (label, command) in &actions {
+                    let end = cursor + UnicodeWidthStr::width(label.as_str());
+                    entries.push(PanelActionRegion {
+                        line: line + row + 1,
+                        start: cursor,
+                        end,
+                        command: command.clone(),
+                        row: row + 1,
+                    });
+                    cursor = end + 3;
+                }
+            }
+        }
+    }
 }
 
 fn lua_error(error: mlua::Error) -> crate::error::AppError {
@@ -10318,15 +12705,32 @@ fn safe_os_date(format: &str) -> String {
     };
     let meridiem = if hour < 12 { "AM" } else { "PM" };
     let weekday = ((days + 4).rem_euclid(7)) as usize;
-    let weekdays = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+    let weekdays = [
+        "Sunday",
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday",
+        "Saturday",
+    ];
     let short_weekdays = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
     let months = [
-        "January", "February", "March", "April", "May", "June", "July", "August",
-        "September", "October", "November", "December",
+        "January",
+        "February",
+        "March",
+        "April",
+        "May",
+        "June",
+        "July",
+        "August",
+        "September",
+        "October",
+        "November",
+        "December",
     ];
     let short_months = [
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov",
-        "Dec",
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ];
     let month_index = (month - 1) as usize;
     let mut output = String::new();
@@ -10375,7 +12779,8 @@ fn civil_date_from_days(days: i64) -> (i64, i64, i64) {
         (shifted - 146_096) / 146_097
     };
     let day_of_era = shifted - era * 146_097;
-    let year_of_era = (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
     let year = year_of_era + era * 400;
     let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
     let month = (5 * day_of_year + 2) / 153;
@@ -10407,8 +12812,7 @@ fn format_uuid(bytes: &[u8; 16]) -> String {
 }
 
 fn base64_encode(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut output = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
         let first = chunk[0] as u32;
@@ -10450,8 +12854,16 @@ fn base64_decode(value: &str) -> Result<Vec<u8>, String> {
         let last = index + 1 == bytes.len() / 4;
         let first = base64_value(chunk[0])?;
         let second = base64_value(chunk[1])?;
-        let third = if chunk[2] == b'=' { 0 } else { base64_value(chunk[2])? };
-        let fourth = if chunk[3] == b'=' { 0 } else { base64_value(chunk[3])? };
+        let third = if chunk[2] == b'=' {
+            0
+        } else {
+            base64_value(chunk[2])?
+        };
+        let fourth = if chunk[3] == b'=' {
+            0
+        } else {
+            base64_value(chunk[3])?
+        };
         if !last && (chunk[2] == b'=' || chunk[3] == b'=') {
             return Err("base64 padding is only allowed in the final quartet".to_owned());
         }
@@ -10895,14 +13307,25 @@ mod tests {
         table.set("value", 1.5_f64).expect("value");
         table.set("label", "Build").expect("label");
         table.set("char", "#").expect("char");
-        let text = progress_widget_text(&lua, LuaValue::Table(table));
+        let text = progress_widget_text(&lua, LuaValue::Table(table), 20);
         assert!(text.starts_with("Build [####################] 100%"));
 
         let empty = lua.create_table().expect("empty");
         empty.set("value", -1.0_f64).expect("value");
         assert_eq!(
-            progress_widget_text(&lua, LuaValue::Table(empty)),
+            progress_widget_text(&lua, LuaValue::Table(empty), 20),
             "[░░░░░░░░░░░░░░░░░░░░] 0%"
+        );
+    }
+
+    #[test]
+    fn progress_widget_uses_panel_width() {
+        let lua = Lua::new();
+        let table = lua.create_table().expect("table");
+        table.set("value", 0.5_f64).expect("value");
+        assert_eq!(
+            progress_widget_text(&lua, LuaValue::Table(table), 10),
+            "[▄▄▄▄▄░░░░░] 50%"
         );
     }
 
@@ -10981,6 +13404,36 @@ mod tests {
     }
 
     #[test]
+    fn collection_rows_render_badge_right_and_inset() {
+        let lua = Lua::new();
+        let row = lua.create_table().expect("row");
+        row.set("label", "child").expect("label");
+        row.set("badge_right", "new").expect("badge");
+        row.set("inset", 2_u64).expect("inset");
+        assert_eq!(
+            collection_item_text(&lua, LuaValue::Table(row), false),
+            "  child  new"
+        );
+    }
+
+    #[test]
+    fn list_widget_aligns_badges_to_the_right_edge() {
+        let lua = Lua::new();
+        let list = lua.create_table().expect("list");
+        let items = lua.create_table().expect("items");
+        let item = lua.create_table().expect("item");
+        item.set("label", "server").expect("label");
+        item.set("badge", "up").expect("badge");
+        items.set(1, item).expect("item");
+        list.set("items", items).expect("items");
+        list.set("badge_right", true).expect("badge_right");
+        assert_eq!(
+            collection_widget_text_with_width(&lua, LuaValue::Table(list), false, Some(16)),
+            "  server      up"
+        );
+    }
+
+    #[test]
     fn tree_widget_renders_expanded_children_and_selection() {
         let lua = Lua::new();
         let tree = lua.create_table().expect("tree");
@@ -10996,7 +13449,48 @@ mod tests {
         items.set(1, root).expect("root");
         tree.set("items", items).expect("items");
         tree.set("selected", 2_u64).expect("selected");
-        assert_eq!(tree_widget_text(&lua, &tree), "▾ src\n  ▶ main.rs");
+        assert_eq!(
+            tree_widget_text_with_width(&lua, &tree, None),
+            "▾ src\n  ▶ main.rs"
+        );
+    }
+
+    #[test]
+    fn tree_widget_honors_configured_indent() {
+        let lua = Lua::new();
+        let tree = lua.create_table().expect("tree");
+        let items = lua.create_table().expect("items");
+        let root = lua.create_table().expect("root");
+        root.set("label", "root").expect("label");
+        root.set("expanded", true).expect("expanded");
+        let children = lua.create_table().expect("children");
+        let child = lua.create_table().expect("child");
+        child.set("label", "child").expect("label");
+        children.set(1, child).expect("child");
+        root.set("children", children).expect("children");
+        items.set(1, root).expect("root");
+        tree.set("items", items).expect("items");
+        tree.set("indent", 4_u64).expect("indent");
+        assert_eq!(
+            tree_widget_text_with_width(&lua, &tree, None),
+            "▾ root\n      child"
+        );
+    }
+
+    #[test]
+    fn tree_widget_truncates_labels_from_left_using_unicode_width() {
+        let lua = Lua::new();
+        let tree = lua.create_table().expect("tree");
+        let items = lua.create_table().expect("items");
+        let item = lua.create_table().expect("item");
+        item.set("label", "目录/配置/设置.toml").expect("label");
+        items.set(1, item).expect("item");
+        tree.set("items", items).expect("items");
+        tree.set("truncate_left", true).expect("truncate");
+        assert_eq!(
+            tree_widget_text_with_width(&lua, &tree, Some(12)),
+            "  …设置.toml"
+        );
     }
 
     #[test]
@@ -11235,6 +13729,42 @@ ttt.show_info("Info", {{key = "a", value = "b"}})
         );
         runtime.resolve_dialog(id, true).expect("resolve");
         assert!(runtime.logs().iter().any(|line| line == "[info] confirmed"));
+    }
+
+    #[test]
+    fn echo_api_takes_over_and_clears_status_text() {
+        let root = std::env::temp_dir().join(format!("mtide-echo-api-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("directory");
+        fs::write(
+            root.join("plugin.ttt.json"),
+            r#"{"name":"echo-api","entry":"init.lua","api":2}"#,
+        )
+        .expect("manifest");
+        fs::write(
+            root.join("init.lua"),
+            r#"
+local ttt = require("ttt")
+ttt.set_echo("building")
+ttt.notify("failed", "error")
+assert(type(ttt.clear_echo) == "function")
+"#,
+        )
+        .expect("script");
+        let package = PluginPackage::load(&root).expect("package");
+        let runtime = PluginRuntime::load(&package).expect("runtime");
+        assert_eq!(runtime.echo_text(), "building");
+        assert_eq!(
+            runtime.notification(),
+            Some(("failed".to_owned(), "error".to_owned()))
+        );
+        runtime
+            ._lua
+            .load("require(\"ttt\").clear_echo()")
+            .exec()
+            .expect("clear echo");
+        assert!(runtime.echo_text().is_empty());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -11533,7 +14063,7 @@ assert(ttt.open_dialog({title = "Review", width = 40, height = 8, render = funct
             root.join("init.lua"),
             r#"local ttt = require("ttt")
 ttt.open_dialog({title = "Submit", render = function(panel)
-  panel:input({text = "initial", on_submit = function(text) ttt.log("submitted:" .. text) end})
+  panel:input({text = "initial", clear_on_submit = true, on_submit = function(text) ttt.log("submitted:" .. text) end})
 end})
 "#,
         )
@@ -11550,6 +14080,10 @@ end})
             .logs()
             .iter()
             .any(|line| line == "[info] submitted:updated"));
+        assert_eq!(
+            runtime.render_panel("__dialog:1").expect("cleared render"),
+            Some("❯ ".into())
+        );
         assert!(runtime.close_custom_dialog(1).expect("close"));
         fs::remove_dir_all(root).expect("cleanup");
     }
@@ -11787,6 +14321,173 @@ run("latest")
     }
 
     #[test]
+    fn markdown_widget_accepts_string_and_table_forms() {
+        let lua = Lua::new();
+        let string = lua.create_string("# Title\nSome **bold** and [link](https://example.com)");
+        assert_eq!(
+            markdown_widget_lines(&lua, LuaValue::String(string.expect("string")))
+                .expect("string markdown"),
+            vec!["Title", "Some bold and link"]
+        );
+        let table = lua.create_table().expect("table");
+        table.set("text", "- item").expect("text");
+        assert_eq!(
+            markdown_widget_lines(&lua, LuaValue::Table(table)).expect("table markdown"),
+            vec!["- item"]
+        );
+    }
+
+    #[test]
+    fn markdown_widget_wraps_table_text_by_unicode_width() {
+        let lua = Lua::new();
+        let table = lua.create_table().expect("table");
+        table.set("text", "alpha beta 中文").expect("text");
+        table.set("wrap_width", 9_u64).expect("width");
+        assert_eq!(
+            markdown_widget_lines(&lua, LuaValue::Table(table)).expect("wrapped markdown"),
+            vec!["alpha", "beta 中文"]
+        );
+    }
+
+    #[test]
+    fn label_widget_accepts_string_and_configuration_table_forms() {
+        let lua = Lua::new();
+        let string = lua.create_string("Status").expect("string");
+        assert_eq!(
+            label_widget_text(&lua, &LuaValue::String(string)).expect("string label"),
+            "Status"
+        );
+        let table = lua.create_table().expect("table");
+        table.set("text", "Containers").expect("text");
+        table.set("badge", 3).expect("badge");
+        assert_eq!(
+            label_widget_text(&lua, &LuaValue::Table(table)).expect("table label"),
+            "Containers  3"
+        );
+        let title = lua.create_table().expect("title");
+        title.set("text", "CONTAINERS").expect("title text");
+        title.set("badge", "3").expect("title badge");
+        assert_eq!(
+            title_widget_text(&lua, &title).expect("table title"),
+            "CONTAINERS  3"
+        );
+    }
+
+    #[test]
+    fn title_menu_renders_and_dispatches_command_callback() {
+        let root = std::env::temp_dir().join(format!("mtide-title-menu-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("directory");
+        fs::write(
+            root.join("plugin.ttt.json"),
+            r#"{"name":"title-menu","entry":"init.lua","api":2,"permissions":{"panel.sidebar":true}}"#,
+        )
+        .expect("manifest");
+        fs::write(
+            root.join("init.lua"),
+            r#"local ttt = require("ttt")
+ttt.register({sidebar = {id = "menu", render = function(panel)
+  panel:title({text = "Deploy", badge = "3", menu = {{label = "Refresh", command = "refresh"}}, on_menu = function(command) ttt.log("menu:" .. command) end})
+end}})
+"#,
+        )
+        .expect("entry");
+        let package = PluginPackage::load(&root).expect("package");
+        let runtime = PluginRuntime::load(&package).expect("runtime");
+        assert_eq!(
+            runtime.render_panel("menu").expect("render"),
+            Some("Deploy  3".into())
+        );
+        assert_eq!(runtime.panel_context_menu("menu"), vec!["Refresh"]);
+        assert!(runtime
+            .activate_panel_context_item("menu", 0, 1)
+            .expect("activate menu"));
+        assert!(runtime
+            .logs()
+            .iter()
+            .any(|line| line == "[info] menu:refresh"));
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn box_widget_renders_child_panel_content() {
+        let root = std::env::temp_dir().join(format!("mtide-box-widget-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("directory");
+        fs::write(
+            root.join("plugin.ttt.json"),
+            r#"{"name":"box-widget","entry":"init.lua","api":2,"permissions":{"panel.sidebar":true,"editor.file_handlers":true}}"#,
+        )
+        .expect("manifest");
+        fs::write(
+            root.join("init.lua"),
+            r#"local ttt = require("ttt")
+ttt.register({sidebar = {id = "box", render = function(panel)
+  panel:box({title = "Details", render = function(child) child:label("inside") end})
+end}, file_handlers = {{id = "box.file", extensions = {"box"}, open = function(_path, tab)
+  tab.render = function(panel)
+    panel:box({title = "File", render = function(child) child:label("file-inside") end})
+  end
+end}}})
+"#,
+        )
+        .expect("entry");
+        let package = PluginPackage::load(&root).expect("package");
+        let runtime = PluginRuntime::load(&package).expect("runtime");
+        assert_eq!(
+            runtime.render_panel("box").expect("render"),
+            Some("inside".into())
+        );
+        let file = root.join("sample.box");
+        fs::write(&file, b"content").expect("file");
+        assert_eq!(
+            runtime.open_file(&file).expect("file render"),
+            Some("file-inside".into())
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn multiline_panel_input_preserves_newlines_and_minimum_rows() {
+        let root = std::env::temp_dir().join(format!(
+            "mtide-panel-multiline-input-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("directory");
+        fs::write(
+            root.join("plugin.ttt.json"),
+            r#"{"name":"panel-multiline-input","entry":"init.lua","api":2,"permissions":{"panel.sidebar":true}}"#,
+        )
+        .expect("manifest");
+        fs::write(
+            root.join("init.lua"),
+            r#"local ttt = require("ttt")
+ttt.register({sidebar = {id = "input", render = function(panel) panel:input({multiline = true, wrap = true, min_rows = 3, max_rows = 3, text = "one two three four", autofocus = true, on_change = function(text) ttt.log("changed") end, on_submit = function() ttt.log("submitted") end}) end}})"#,
+        )
+        .expect("entry");
+        let package = PluginPackage::load(&root).expect("package");
+        let runtime = PluginRuntime::load(&package).expect("runtime");
+        runtime.set_panel_size(10, 10);
+        let rendered = runtime
+            .render_panel("input")
+            .expect("render")
+            .expect("text");
+        assert_eq!(rendered.split('\n').count(), 3);
+        assert!(!rendered.contains("one two three four"));
+        assert!(runtime.focus_autofocus_input("input"));
+        assert!(runtime
+            .panel_input_key("input", "Enter", None, "")
+            .expect("newline"));
+        assert!(runtime
+            .panel_input_key("input", "Char", Some('t'), "")
+            .expect("character"));
+        assert!(runtime.logs().iter().any(|line| line == "[info] changed"));
+        assert!(runtime.logs().iter().all(|line| line != "[info] submitted"));
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
     fn drawer_compat_widgets_render_keyvalues_dividers_and_raw_cells() {
         let root = std::env::temp_dir().join(format!(
             "mtide-drawer-compat-widgets-{}",
@@ -11826,6 +14527,11 @@ end})
                     .into()
             )
         );
+        assert!(runtime.cycle_drawer_focus(false));
+        assert!(runtime
+            .drawer_input_key("Enter", None, "")
+            .expect("focused drawer button"));
+        assert!(runtime.logs().iter().any(|line| line == "[info] drawer-go"));
         assert!(runtime.activate_drawer_line(3).expect("button"));
         assert!(runtime.logs().iter().any(|line| line == "[info] drawer-go"));
         assert!(runtime.focus_drawer_line(4));
@@ -11905,6 +14611,45 @@ end}})
     }
 
     #[test]
+    fn panel_scrollview_supports_selection_navigation() {
+        let root =
+            std::env::temp_dir().join(format!("mtide-panel-scrollview-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("directory");
+        fs::write(
+            root.join("plugin.ttt.json"),
+            r#"{"name":"panel-scrollview","entry":"init.lua","api":2,"permissions":{"panel.sidebar":true}}"#,
+        )
+        .expect("manifest");
+        fs::write(
+            root.join("init.lua"),
+            r#"local ttt = require("ttt")
+ttt.register({sidebar = {id = "scroll", render = function(panel)
+  panel:scrollview({items = {"one", "two"}, selected = 1, on_select = function(item)
+    ttt.log("scroll:" .. item)
+  end})
+end}})
+"#,
+        )
+        .expect("entry");
+        let package = PluginPackage::load(&root).expect("package");
+        let runtime = PluginRuntime::load(&package).expect("runtime");
+        assert_eq!(
+            runtime.render_panel("scroll").expect("render"),
+            Some("▶ one\n  two".into())
+        );
+        assert!(runtime.focus_panel_scrollview("scroll", 0));
+        assert!(runtime
+            .panel_scrollview_key("scroll", "Down")
+            .expect("move"));
+        assert!(runtime
+            .logs()
+            .iter()
+            .any(|line| line == "[info] scroll:two"));
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
     fn panel_radio_preserves_selection_and_calls_on_change() {
         let root = std::env::temp_dir().join(format!("mtide-panel-radio-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
@@ -11931,13 +14676,13 @@ end}})
             .expect("render")
             .unwrap()
             .contains("◉ one"));
-        assert!(runtime.move_panel_selection("radio", 1).expect("move"));
+        assert!(runtime.cycle_panel_focus("radio", false));
+        assert!(runtime.panel_radio_key("radio", "Down").expect("move"));
         assert!(runtime.logs().iter().any(|line| line == "[info] radio:two"));
-        assert!(runtime
-            .render_panel("radio")
-            .expect("render")
-            .unwrap()
-            .contains("◉ two"));
+        let focused = runtime.render_panel("radio").expect("render").unwrap();
+        assert!(focused.starts_with("▶"));
+        assert!(focused.contains("◉ two"));
+        assert!(runtime.panel_radio_key("radio", "Enter").expect("activate"));
         fs::remove_dir_all(root).expect("cleanup");
     }
 
@@ -12039,17 +14784,19 @@ end}})
             runtime.render_panel("tabs").expect("first render"),
             Some("▶ Details\n  Keys".into())
         );
-        assert!(runtime
-            .move_panel_selection("tabs", 1)
-            .expect("select keys"));
+        assert!(runtime.cycle_panel_focus("tabs", false));
+        assert!(runtime.panel_tabs_key("tabs", "Down").expect("select keys"));
         assert!(runtime
             .logs()
             .iter()
             .any(|line| line == "[info] active:keys"));
-        assert_eq!(
-            runtime.render_panel("tabs").expect("second render"),
-            Some("  Details\n▶ Keys".into())
-        );
+        let focused = runtime
+            .render_panel("tabs")
+            .expect("second render")
+            .unwrap();
+        assert!(focused.starts_with("▶"));
+        assert!(focused.contains("▶ Keys"));
+        assert!(runtime.panel_tabs_key("tabs", "Enter").expect("activate"));
         fs::remove_dir_all(root).expect("cleanup");
     }
 
@@ -12095,7 +14842,8 @@ end}})
 
     #[test]
     fn panel_dropdown_dispatches_on_change_from_selection_state() {
-        let root = std::env::temp_dir().join(format!("mtide-panel-dropdown-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("mtide-panel-dropdown-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).expect("directory");
         fs::write(
@@ -12117,16 +14865,67 @@ end}})
         let package = PluginPackage::load(&root).expect("package");
         let runtime = PluginRuntime::load(&package).expect("runtime");
         runtime.render_panel("dropdown").expect("render");
+        assert!(runtime.move_panel_selection("dropdown", 1).expect("move"));
         assert!(runtime
-            .move_panel_selection("dropdown", 1)
+            .logs()
+            .iter()
+            .any(|line| line == "[info] changed:two"));
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn regular_panel_dropdown_participates_in_focus_cycle() {
+        let root =
+            std::env::temp_dir().join(format!("mtide-panel-dropdown-focus-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("directory");
+        fs::write(
+            root.join("plugin.ttt.json"),
+            r#"{"name":"panel-dropdown-focus","entry":"init.lua","api":2,"permissions":{"panel.sidebar":true}}"#,
+        )
+        .expect("manifest");
+        fs::write(
+            root.join("init.lua"),
+            r#"local ttt = require("ttt")
+ttt.register({sidebar = {id = "dropdown-focus", render = function(panel)
+  panel:dropdown({options = {"one", "two"}, selected = 1, on_change = function(value)
+    ttt.log("dropdown:" .. tostring(value))
+  end})
+end}})
+"#,
+        )
+        .expect("entry");
+        let package = PluginPackage::load(&root).expect("package");
+        let runtime = PluginRuntime::load(&package).expect("runtime");
+        assert_eq!(
+            runtime.render_panel("dropdown-focus").expect("render"),
+            Some("▼ one\n  two".into())
+        );
+        assert!(runtime.cycle_panel_focus("dropdown-focus", false));
+        assert!(runtime
+            .panel_dropdown_key("dropdown-focus", "Down")
             .expect("move"));
-        assert!(runtime.logs().iter().any(|line| line == "[info] changed:two"));
+        runtime.render_panel("dropdown-focus").expect("rerender");
+        assert!(runtime
+            .panel_dropdown_key("dropdown-focus", "Enter")
+            .expect("activate"));
+        let focused_render = runtime
+            .render_panel("dropdown-focus")
+            .expect("focused render")
+            .expect("focused text");
+        assert!(focused_render.starts_with("▶"), "{focused_render:?}");
+        assert!(focused_render.contains("two"), "{focused_render:?}");
+        assert!(runtime
+            .logs()
+            .iter()
+            .any(|line| line == "[info] dropdown:two"));
         fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
     fn list_key_commands_dispatch_selected_node_to_on_command() {
-        let root = std::env::temp_dir().join(format!("mtide-list-key-command-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("mtide-list-key-command-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).expect("directory");
         fs::write(
@@ -12185,6 +14984,469 @@ end}})
             .activate_panel_command("table", "r")
             .expect("command"));
         assert!(runtime.logs().iter().any(|line| line == "[info] restart:2"));
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn table_columns_render_header_width_and_alignment() {
+        let root = std::env::temp_dir().join(format!("mtide-table-columns-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("directory");
+        fs::write(
+            root.join("plugin.ttt.json"),
+            r#"{"name":"table-columns","entry":"init.lua","api":2,"permissions":{"panel.sidebar":true}}"#,
+        )
+        .expect("manifest");
+        fs::write(
+            root.join("init.lua"),
+            r#"local ttt = require("ttt")
+ttt.register({sidebar = {id = "table", render = function(panel)
+  panel:table({columns = {{label = "Name"}, {label = "Status"}, {label = "Port", width = 6, align = "right"}, {label = "", actions = {{label = "Open", command = "open"}}}}, rows = {{"web-app", "running", "8080"}, {"database", "stopped", "5432"}}, on_command = function(command, row) ttt.log(command .. ":" .. row) end})
+end}})
+"#,
+        )
+        .expect("entry");
+        let package = PluginPackage::load(&root).expect("package");
+        let runtime = PluginRuntime::load(&package).expect("runtime");
+        let rendered = runtime
+            .render_panel("table")
+            .expect("render")
+            .expect("table output");
+        assert!(rendered
+            .lines()
+            .next()
+            .is_some_and(|line| line.contains("Name")
+                && line.contains("Status")
+                && line.contains("Port")));
+        assert!(rendered.contains("web-app"));
+        assert!(rendered.contains("running"));
+        assert!(rendered.contains("Open"), "{rendered:?}");
+        assert!(rendered.lines().any(|line| line.contains("  8080  Open")));
+        let action_x = rendered
+            .lines()
+            .nth(1)
+            .and_then(|line| line.find("Open"))
+            .expect("action position")
+            + 1;
+        assert!(runtime
+            .activate_panel_action("table", action_x, 1)
+            .expect("action"));
+        assert!(runtime.logs().iter().any(|line| line == "[info] open:1"));
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn table_loading_keeps_existing_rows_and_marks_the_header() {
+        let lua = Lua::new();
+        let table = lua.create_table().expect("table");
+        let columns = lua.create_table().expect("columns");
+        let column = lua.create_table().expect("column");
+        column.set("label", "Name").expect("label");
+        columns.set(1, column).expect("column");
+        let rows = lua.create_table().expect("rows");
+        let row = lua.create_table().expect("row");
+        row.set(1, "still visible").expect("cell");
+        rows.set(1, row).expect("row");
+        table.set("columns", columns).expect("columns");
+        table.set("rows", rows).expect("rows");
+        table.set("loading", true).expect("loading");
+        let rendered =
+            collection_widget_text_with_width(&lua, LuaValue::Table(table), true, Some(80));
+        assert!(rendered
+            .lines()
+            .next()
+            .is_some_and(|line| line.contains("loading")));
+        assert!(rendered.contains("still visible"));
+    }
+
+    #[test]
+    fn table_horizontal_scroll_pins_action_column() {
+        let lua = Lua::new();
+        let table = lua.create_table().expect("table");
+        table.set("scroll_x", 4_u64).expect("scroll");
+        let rendered =
+            horizontal_table_slice_with_pinned_action(&table, "  Name      Status     Open", 16, 4);
+        assert!(rendered.ends_with("  Open"), "{rendered:?}");
+        assert_eq!(UnicodeWidthStr::width(rendered.as_str()), 16);
+    }
+
+    #[test]
+    fn table_fixed_column_width_is_not_expanded_by_long_cells() {
+        let lua = Lua::new();
+        let table = lua.create_table().expect("table");
+        let columns = lua.create_table().expect("columns");
+        let column = lua.create_table().expect("column");
+        column.set("label", "Name").expect("label");
+        column.set("width", 4_u64).expect("width");
+        columns.set(1, column).expect("column");
+        let rows = lua.create_table().expect("rows");
+        let row = lua.create_table().expect("row");
+        row.set(1, "long value").expect("cell");
+        rows.set(1, row).expect("row");
+        table.set("columns", columns).expect("columns");
+        table.set("rows", rows).expect("rows");
+        let rendered =
+            collection_widget_text_with_width(&lua, LuaValue::Table(table), true, Some(80));
+        assert!(rendered.contains("lon…"), "{rendered:?}");
+        assert!(!rendered.contains("long value"), "{rendered:?}");
+    }
+
+    #[test]
+    fn regular_panel_button_click_invokes_on_click_repeatedly() {
+        let root = std::env::temp_dir().join(format!("mtide-panel-button-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("directory");
+        fs::write(
+            root.join("plugin.ttt.json"),
+            r#"{"name":"panel-button","entry":"init.lua","api":2,"permissions":{"panel.sidebar":true}}"#,
+        )
+        .expect("manifest");
+        fs::write(
+            root.join("init.lua"),
+            r#"local ttt = require("ttt")
+ttt.register({sidebar = {id = "buttons", render = function(panel)
+  panel:button({label = "Run", on_click = function() ttt.log("clicked") end})
+end}})
+"#,
+        )
+        .expect("entry");
+        let package = PluginPackage::load(&root).expect("package");
+        let runtime = PluginRuntime::load(&package).expect("runtime");
+        assert_eq!(
+            runtime.render_panel("buttons").expect("render"),
+            Some("[ Run ]".into())
+        );
+        assert!(runtime.activate_panel_button("buttons", 0).expect("click"));
+        assert!(runtime
+            .activate_panel_button("buttons", 0)
+            .expect("second click"));
+        assert!(runtime
+            .panel_button_key("buttons", "Enter", None)
+            .expect("keyboard click"));
+        assert_eq!(
+            runtime
+                .logs()
+                .iter()
+                .filter(|line| *line == "[info] clicked")
+                .count(),
+            3
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn disabled_panel_button_is_rendered_but_not_focusable_or_activatable() {
+        let root = std::env::temp_dir().join(format!(
+            "mtide-panel-disabled-button-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("directory");
+        fs::write(
+            root.join("plugin.ttt.json"),
+            r#"{"name":"panel-disabled-button","entry":"init.lua","api":2,"permissions":{"panel.sidebar":true}}"#,
+        )
+        .expect("manifest");
+        fs::write(
+            root.join("init.lua"),
+            r#"local ttt = require("ttt")
+ttt.register({sidebar = {id = "buttons", render = function(panel)
+  panel:button({label = "Busy", disabled = true, on_click = function() ttt.log("clicked") end})
+end}})
+"#,
+        )
+        .expect("entry");
+        let package = PluginPackage::load(&root).expect("package");
+        let runtime = PluginRuntime::load(&package).expect("runtime");
+        assert_eq!(
+            runtime.render_panel("buttons").expect("render"),
+            Some("[ Busy ]".into())
+        );
+        assert!(!runtime
+            .activate_panel_button("buttons", 0)
+            .expect("disabled click"));
+        assert!(!runtime.cycle_panel_focus("buttons", false));
+        assert!(runtime.logs().iter().all(|line| !line.contains("clicked")));
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn regular_panel_input_preserves_text_and_dispatches_callbacks() {
+        let root = std::env::temp_dir().join(format!("mtide-panel-input-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("directory");
+        fs::write(
+            root.join("plugin.ttt.json"),
+            r#"{"name":"panel-input","entry":"init.lua","api":2,"permissions":{"panel.sidebar":true}}"#,
+        )
+        .expect("manifest");
+        fs::write(
+            root.join("init.lua"),
+            r#"local ttt = require("ttt")
+ttt.register({sidebar = {id = "input", render = function(panel)
+  panel:input({text = "old", prefix = "$ ", autofocus = true, on_change = function(text) ttt.log("change:" .. text) end, on_submit = function(text) ttt.log("submit:" .. text) end})
+end}})
+"#,
+        )
+        .expect("entry");
+        let package = PluginPackage::load(&root).expect("package");
+        let runtime = PluginRuntime::load(&package).expect("runtime");
+        assert_eq!(
+            runtime.render_panel("input").expect("render"),
+            Some("$ ❯ old".into())
+        );
+        assert!(runtime.focus_autofocus_input("input"));
+        assert!(runtime
+            .panel_input_key("input", "Char", Some('!'), "")
+            .expect("change"));
+        assert!(runtime
+            .panel_input_key("input", "Enter", None, "")
+            .expect("submit"));
+        assert!(runtime
+            .logs()
+            .iter()
+            .any(|line| line == "[info] change:old!"));
+        assert!(runtime
+            .logs()
+            .iter()
+            .any(|line| line == "[info] submit:old!"));
+        assert_eq!(
+            runtime.render_panel("input").expect("rerender"),
+            Some("$ ❯ old!".into())
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn controlled_panel_input_uses_value_from_each_render() {
+        let root = std::env::temp_dir().join(format!(
+            "mtide-panel-controlled-input-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("directory");
+        fs::write(
+            root.join("plugin.ttt.json"),
+            r#"{"name":"panel-controlled-input","entry":"init.lua","api":2,"permissions":{"panel.sidebar":true}}"#,
+        )
+        .expect("manifest");
+        fs::write(
+            root.join("init.lua"),
+            r#"local ttt = require("ttt")
+local value = "one"
+ttt.register({sidebar = {id = "input", render = function(panel)
+  panel:input({text = "stale", value = value, on_change = function(text) value = text end})
+end}})
+"#,
+        )
+        .expect("entry");
+        let package = PluginPackage::load(&root).expect("package");
+        let runtime = PluginRuntime::load(&package).expect("runtime");
+        assert_eq!(
+            runtime.render_panel("input").expect("initial render"),
+            Some("❯ one".into())
+        );
+        assert!(runtime.focus_panel_input("input", 0));
+        assert!(runtime
+            .panel_input_key("input", "Char", Some('!'), "")
+            .expect("controlled change"));
+        assert_eq!(
+            runtime.render_panel("input").expect("controlled rerender"),
+            Some("❯ one!".into())
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn regular_panel_password_masks_text_and_dispatches_changes() {
+        let root =
+            std::env::temp_dir().join(format!("mtide-panel-password-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("directory");
+        fs::write(
+            root.join("plugin.ttt.json"),
+            r#"{"name":"panel-password","entry":"init.lua","api":2,"permissions":{"panel.sidebar":true}}"#,
+        )
+        .expect("manifest");
+        fs::write(
+            root.join("init.lua"),
+            r#"local ttt = require("ttt")
+ttt.register({sidebar = {id = "password", render = function(panel)
+  panel:password({text = "old", on_change = function(text) ttt.log("change:" .. text) end})
+end}})
+"#,
+        )
+        .expect("entry");
+        let package = PluginPackage::load(&root).expect("package");
+        let runtime = PluginRuntime::load(&package).expect("runtime");
+        assert_eq!(
+            runtime.render_panel("password").expect("render"),
+            Some("❯ •••".into())
+        );
+        assert!(runtime.focus_panel_password("password", 0));
+        assert!(runtime
+            .panel_password_key("password", "Char", Some('!'), "")
+            .expect("change"));
+        assert!(runtime
+            .logs()
+            .iter()
+            .any(|line| line == "[info] change:old!"));
+        assert_eq!(
+            runtime.render_panel("password").expect("rerender"),
+            Some("▶❯ ••••".into())
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn regular_panel_controls_cycle_focus_with_tab() {
+        let root = std::env::temp_dir().join(format!("mtide-panel-focus-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("directory");
+        fs::write(
+            root.join("plugin.ttt.json"),
+            r#"{"name":"panel-focus","entry":"init.lua","api":2,"permissions":{"panel.sidebar":true}}"#,
+        )
+        .expect("manifest");
+        fs::write(
+            root.join("init.lua"),
+            r#"local ttt = require("ttt")
+ttt.register({sidebar = {id = "focus", render = function(panel)
+  panel:input({text = "input"})
+  panel:checkbox({label = "check"})
+  panel:button({label = "run", on_click = function() ttt.log("clicked") end})
+end}})
+"#,
+        )
+        .expect("entry");
+        let package = PluginPackage::load(&root).expect("package");
+        let runtime = PluginRuntime::load(&package).expect("runtime");
+        runtime.render_panel("focus").expect("render");
+        assert!(runtime.cycle_panel_focus("focus", false));
+        assert!(runtime
+            .panel_input_key("focus", "Char", Some('!'), "")
+            .is_ok());
+        assert!(runtime.cycle_panel_focus("focus", false));
+        assert!(runtime
+            .panel_checkbox_key("focus", "Enter", None)
+            .expect("checkbox"));
+        assert!(runtime.cycle_panel_focus("focus", false));
+        assert!(runtime
+            .panel_button_key("focus", "Enter", None)
+            .expect("button"));
+        assert!(runtime.cycle_panel_focus("focus", true));
+        assert!(runtime
+            .panel_checkbox_key("focus", "Enter", None)
+            .expect("reverse checkbox"));
+        assert!(runtime.logs().iter().any(|line| line == "[info] clicked"));
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn regular_panel_mouse_focus_is_mutually_exclusive() {
+        let root = std::env::temp_dir().join(format!(
+            "mtide-panel-focus-exclusive-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("directory");
+        fs::write(
+            root.join("plugin.ttt.json"),
+            r#"{"name":"panel-focus-exclusive","entry":"init.lua","api":2,"permissions":{"panel.sidebar":true}}"#,
+        )
+        .expect("manifest");
+        fs::write(
+            root.join("init.lua"),
+            r#"local ttt = require("ttt")
+ttt.register({sidebar = {id = "exclusive", render = function(panel)
+  panel:input({text = "input"})
+  panel:checkbox({label = "check"})
+end}})
+"#,
+        )
+        .expect("entry");
+        let package = PluginPackage::load(&root).expect("package");
+        let runtime = PluginRuntime::load(&package).expect("runtime");
+        runtime.render_panel("exclusive").expect("render");
+        assert!(runtime.focus_panel_input("exclusive", 0));
+        assert!(runtime.focus_panel_checkbox("exclusive", 1));
+        assert!(!runtime
+            .panel_input_key("exclusive", "Char", Some('!'), "")
+            .expect("input should not consume after losing focus"));
+        assert!(runtime
+            .panel_checkbox_key("exclusive", "Enter", None)
+            .expect("checkbox should retain focus"));
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn list_row_action_click_dispatches_command() {
+        let root = std::env::temp_dir().join(format!("mtide-row-action-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("directory");
+        fs::write(
+            root.join("plugin.ttt.json"),
+            r#"{"name":"row-action","entry":"init.lua","api":2,"permissions":{"panel.sidebar":true}}"#,
+        )
+        .expect("manifest");
+        fs::write(
+            root.join("init.lua"),
+            r#"local ttt = require("ttt")
+ttt.register({sidebar = {id = "actions", render = function(panel)
+  panel:list({items = {{label = "one", actions = {{label = "Open", command = "open"}}}}, on_command = function(command, node)
+    ttt.log(command .. ":" .. node.label)
+  end})
+end}})
+"#,
+        )
+        .expect("entry");
+        let package = PluginPackage::load(&root).expect("package");
+        let runtime = PluginRuntime::load(&package).expect("runtime");
+        assert_eq!(
+            runtime.render_panel("actions").expect("render"),
+            Some("  one  [Open]".into())
+        );
+        assert!(runtime
+            .activate_panel_action("actions", 10, 0)
+            .expect("action"));
+        assert!(runtime.logs().iter().any(|line| line == "[info] open:one"));
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn regular_panel_checkbox_toggles_and_calls_on_change() {
+        let root =
+            std::env::temp_dir().join(format!("mtide-panel-checkbox-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("directory");
+        fs::write(
+            root.join("plugin.ttt.json"),
+            r#"{"name":"panel-checkbox","entry":"init.lua","api":2,"permissions":{"panel.sidebar":true}}"#,
+        )
+        .expect("manifest");
+        fs::write(
+            root.join("init.lua"),
+            r#"local ttt = require("ttt")
+ttt.register({sidebar = {id = "checkbox", render = function(panel)
+  panel:checkbox({label = "Enabled", checked = false, on_change = function(value) ttt.log(tostring(value)) end})
+end}})
+"#,
+        )
+        .expect("entry");
+        let package = PluginPackage::load(&root).expect("package");
+        let runtime = PluginRuntime::load(&package).expect("runtime");
+        assert_eq!(
+            runtime.render_panel("checkbox").expect("render"),
+            Some("[ ] Enabled".into())
+        );
+        assert!(runtime
+            .activate_panel_checkbox("checkbox", 0)
+            .expect("click"));
+        assert!(runtime
+            .panel_checkbox_key("checkbox", "Enter", None)
+            .expect("keyboard"));
+        assert!(runtime.logs().iter().any(|line| line == "[info] true"));
+        assert!(runtime.logs().iter().any(|line| line == "[info] false"));
         fs::remove_dir_all(root).expect("cleanup");
     }
 
@@ -12414,6 +15676,13 @@ end})
             .iter()
             .any(|line| line.contains("tab on_event failed")));
         assert!(runtime.close_tab("events").expect("close"));
+        assert_eq!(
+            runtime.render_panel("__tab:events").expect("closed render"),
+            None
+        );
+        assert!(!runtime
+            .emit_tab_key_event("events", "x", Some('x'), "")
+            .expect("closed event"));
         assert!(!runtime.close_tab("events").expect("close missing"));
         fs::remove_dir_all(root).expect("cleanup");
     }
@@ -12813,7 +16082,7 @@ end}})
             root.join("init.lua"),
             r#"local ttt = require("ttt")
 ttt.register({sidebar = {id = "tree", render = function(panel)
-  panel:tree({items = {{id = "src", label = "src"}, {id = "main", label = "main.rs"}}, key_commands = {x = "open"}, on_command = function(command, node)
+  panel:tree({items = {{id = "src", label = "src"}, {id = "main", label = "main.rs"}}, node_menu = {{label = "Open", command = "open", checked = true}, {separator = true}}, key_commands = {x = "open"}, on_command = function(command, node)
     ttt.log(command .. ":" .. node.id)
   end, on_select = function(node)
     ttt.log("node:" .. node.id)
@@ -12828,10 +16097,32 @@ end}})
             runtime.render_panel("tree").expect("render"),
             Some("  src\n  main.rs".into())
         );
+        assert_eq!(
+            runtime.panel_context_menu("tree"),
+            vec!["✓ Open", "────────"]
+        );
+        assert!(runtime
+            .activate_panel_context_item("tree", 0, 1)
+            .expect("context menu"));
+        assert!(runtime.logs().iter().any(|line| line == "[info] open:src"));
         assert!(runtime
             .activate_panel_selection("tree", 1)
             .expect("activate"));
         assert!(runtime.logs().iter().any(|line| line == "[info] node:main"));
+        runtime
+            .render_panel("tree")
+            .expect("rerender for leaf activation");
+        assert!(runtime.set_panel_selected_row("tree", 1));
+        runtime
+            .render_panel("tree")
+            .expect("rerender selected leaf");
+        assert!(runtime
+            .activate_panel_current_selection("tree")
+            .expect("leaf activate"));
+        assert!(runtime
+            .logs()
+            .iter()
+            .any(|line| line == "[info] activate:main"));
         assert!(runtime
             .activate_panel_command("tree", "x")
             .expect("command"));
@@ -12840,8 +16131,9 @@ end}})
     }
 
     #[test]
-    fn panel_tree_enter_toggles_expand_and_dispatches_on_expand() {
-        let root = std::env::temp_dir().join(format!("mtide-panel-tree-expand-{}", std::process::id()));
+    fn panel_tree_enter_selects_and_expands_and_left_right_navigates() {
+        let root =
+            std::env::temp_dir().join(format!("mtide-panel-tree-expand-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).expect("directory");
         fs::write(
@@ -12872,6 +16164,16 @@ end}})
             .logs()
             .iter()
             .any(|line| line == "[info] expanded:src:true"));
+        assert!(runtime
+            .logs()
+            .iter()
+            .any(|line| line == "[info] selected:src"));
+        assert!(runtime
+            .move_tree_horizontal_selection("tree", false)
+            .expect("collapse"));
+        assert!(runtime
+            .move_tree_horizontal_selection("tree", true)
+            .expect("expand"));
         fs::remove_dir_all(root).expect("cleanup");
     }
 
@@ -13030,6 +16332,21 @@ assert(input_proc:close_stdin() == true)
             .any(|line| line == "[info] err:warning"));
         assert!(runtime.logs().iter().any(|line| line == "[info] in:typed"));
         assert!(runtime.logs().iter().any(|line| line == "[info] exit:0"));
+        let logs = runtime.logs();
+        let stdout_index = logs
+            .iter()
+            .position(|line| line == "[info] out:spawned")
+            .expect("stdout log position");
+        let stderr_index = logs
+            .iter()
+            .position(|line| line == "[info] err:warning")
+            .expect("stderr log position");
+        let exit_index = logs
+            .iter()
+            .position(|line| line == "[info] exit:0")
+            .expect("exit log position");
+        assert!(exit_index > stdout_index);
+        assert!(exit_index > stderr_index);
         assert!(runtime
             .logs()
             .iter()
@@ -13525,6 +16842,9 @@ end)
 assert(cancel_handle:cancel() == true)
 fs.write("cache.txt", "ok")
 assert(fs.read("cache.txt") == "ok")
+local binary = string.char(0, 255, 128)
+assert(fs.write("binary.dat", binary) == true)
+assert(fs.read("binary.dat") == binary)
 assert(fs.write("cache.txt", "ok") == true)
 local missing, missing_err = fs.read("missing.txt")
 assert(missing == nil and type(missing_err) == "string")
@@ -13742,12 +17062,12 @@ ttt.register({sidebar = {title = "Demo", render = function(panel) panel:label("p
             String::from_utf8(base64_decode(&encoded).expect("decode")).expect("utf8"),
             "你好, mtide"
         );
-        assert_eq!(
-            base64_decode("  YWJj\n").expect("unpadded decode"),
-            b"abc"
-        );
+        assert_eq!(base64_decode("  YWJj\n").expect("unpadded decode"), b"abc");
         assert!(base64_decode("a===").is_err());
-        assert_eq!(base64_decode("AP+A").expect("binary decode"), vec![0, 255, 128]);
+        assert_eq!(
+            base64_decode("AP+A").expect("binary decode"),
+            vec![0, 255, 128]
+        );
 
         let bytes = hex_encode(&[0, 1, 15, 16, 255]);
         assert_eq!(bytes, "00010f10ff");

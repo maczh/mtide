@@ -125,6 +125,10 @@ pub struct Settings {
     pub sidebar_width: u16,
     pub agent_width: u16,
     pub theme: Option<String>,
+    #[serde(rename = "quickOpen", alias = "quick_open")]
+    pub quick_open: QuickOpenSettings,
+    #[serde(rename = "explorer")]
+    pub explorer: ExplorerSettings,
     pub editor: EditorSettings,
     pub search: SearchSettings,
     pub lsp: LspSettings,
@@ -132,6 +136,26 @@ pub struct Settings {
     #[serde(default, rename = "agents")]
     pub legacy_agents: BTreeMap<String, AgentProviderConfig>,
     pub terminal: TerminalSettings,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct QuickOpenSettings {
+    #[serde(rename = "showHidden", alias = "show_hidden")]
+    pub show_hidden: bool,
+    #[serde(rename = "showGitIgnored", alias = "show_git_ignored")]
+    pub show_git_ignored: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ExplorerSettings {
+    #[serde(rename = "showHidden", alias = "show_hidden")]
+    pub show_hidden: bool,
+    #[serde(rename = "showGitIgnored", alias = "show_git_ignored")]
+    pub show_git_ignored: bool,
+    #[serde(rename = "autoReveal", alias = "auto_reveal")]
+    pub auto_reveal: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -233,6 +257,8 @@ pub struct AgentSettings {
     pub active: Option<String>,
     pub providers: BTreeMap<String, AgentProviderConfig>,
     pub tools: Vec<String>,
+    #[serde(alias = "persistent", alias = "persist_session")]
+    pub persist: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -244,6 +270,8 @@ pub struct AgentProviderConfig {
     pub cwd: Option<String>,
     pub install: Option<String>,
     pub tools: Vec<String>,
+    #[serde(alias = "persistent", alias = "persist_session")]
+    pub persist: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -265,6 +293,8 @@ struct RawAgentProviderConfig {
     cwd: Option<String>,
     install: Option<String>,
     tools: Vec<String>,
+    #[serde(alias = "persistent", alias = "persist_session")]
+    persist: bool,
 }
 
 impl<'de> serde::Deserialize<'de> for AgentProviderConfig {
@@ -297,6 +327,7 @@ impl<'de> serde::Deserialize<'de> for AgentProviderConfig {
             cwd: raw.cwd,
             install: raw.install,
             tools: raw.tools,
+            persist: raw.persist,
         })
     }
 }
@@ -330,6 +361,8 @@ impl Default for Settings {
             sidebar_width: 25,
             agent_width: 29,
             theme: None,
+            quick_open: QuickOpenSettings::default(),
+            explorer: ExplorerSettings::default(),
             editor: EditorSettings::default(),
             search: SearchSettings::default(),
             lsp: LspSettings::default(),
@@ -362,6 +395,7 @@ impl Default for AgentSettings {
             active: None,
             providers: BTreeMap::new(),
             tools: Vec::new(),
+            persist: false,
         }
     }
 }
@@ -644,6 +678,16 @@ mod tests {
     }
 
     #[test]
+    fn parses_agent_persistence_aliases() {
+        let settings: Settings = serde_json::from_str(
+            r#"{"agent":{"persistent":true,"providers":{"local":{"command":["codex"],"persist_session":true}}}}"#,
+        )
+        .expect("settings");
+        assert!(settings.agent.persist);
+        assert!(settings.agent.providers["local"].persist);
+    }
+
+    #[test]
     fn parses_ttt_agents_schema_and_normalizes_it() {
         let mut settings: Settings = serde_json::from_str(
             r#"{"agents":{"codex":{"cli":"codex","args":"--interactive","install":"npm install -g @openai/codex"},"claude":{"cli":"claude","args":["--print"]}}}"#,
@@ -680,6 +724,24 @@ mod tests {
         .expect("settings");
         assert_eq!(settings.search.include, vec!["**/*.rs"]);
         assert_eq!(settings.search.exclude, vec!["generated/**", "*.snap"]);
+    }
+
+    #[test]
+    fn parses_quick_open_visibility_settings() {
+        let settings: Settings = serde_json::from_str(
+            r#"{"quickOpen":{"showHidden":true,"showGitIgnored":true},"explorer":{"showHidden":true,"showGitIgnored":true,"autoReveal":true}}"#,
+        )
+                .expect("quick open settings");
+        assert!(settings.quick_open.show_hidden);
+        assert!(settings.quick_open.show_git_ignored);
+        assert!(settings.explorer.show_hidden);
+        assert!(settings.explorer.show_git_ignored);
+        assert!(settings.explorer.auto_reveal);
+        assert!(!Settings::default().quick_open.show_hidden);
+        assert!(!Settings::default().quick_open.show_git_ignored);
+        assert!(!Settings::default().explorer.show_hidden);
+        assert!(!Settings::default().explorer.show_git_ignored);
+        assert!(!Settings::default().explorer.auto_reveal);
     }
 
     #[test]
