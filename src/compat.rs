@@ -24,6 +24,32 @@ pub struct FixtureLog {
     pub events: Vec<FixtureEvent>,
 }
 
+pub trait ClockPort {
+    fn now_ms(&self) -> u64;
+    fn advance(&mut self, duration: Duration);
+}
+
+pub trait SchedulerPort {
+    fn schedule(&mut self, clock: &dyn ClockPort, delay: Duration) -> u64;
+    fn cancel(&mut self, id: u64) -> bool;
+}
+
+pub trait FileSystemPort {
+    fn write_file(&mut self, path: &Path, contents: &str) -> Result<(), String>;
+    fn read_file(&self, path: &Path) -> Result<String, String>;
+    fn rename_file(&mut self, from: &Path, to: &Path) -> Result<(), String>;
+}
+
+pub trait ProcessPort {
+    fn stdout(&self) -> &str;
+    fn cancel(&mut self);
+    fn is_cancelled(&self) -> bool;
+}
+
+pub trait ClipboardPort {
+    fn read_text(&mut self) -> Result<String, String>;
+}
+
 impl FixtureLog {
     pub fn record(&mut self, kind: impl Into<String>, value: serde_json::Value) {
         self.events.push(FixtureEvent {
@@ -53,6 +79,15 @@ impl ManualClock {
         self.now_ms = self.now_ms.saturating_add(duration.as_millis() as u64);
         self.log
             .record("clock.advance", serde_json::json!({"now_ms": self.now_ms}));
+    }
+}
+
+impl ClockPort for ManualClock {
+    fn now_ms(&self) -> u64 {
+        self.now_ms()
+    }
+    fn advance(&mut self, duration: Duration) {
+        self.advance(duration);
     }
 }
 
@@ -93,6 +128,21 @@ impl ManualScheduler {
     }
     pub fn cancel(&mut self, id: u64) -> bool {
         self.timers.remove(&id).is_some()
+    }
+}
+
+impl SchedulerPort for ManualScheduler {
+    fn schedule(&mut self, clock: &dyn ClockPort, delay: Duration) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.timers
+            .insert(id, clock.now_ms().saturating_add(delay.as_millis() as u64));
+        self.log
+            .record("timer.schedule", serde_json::json!({"id": id}));
+        id
+    }
+    fn cancel(&mut self, id: u64) -> bool {
+        self.cancel(id)
     }
 }
 
@@ -156,6 +206,18 @@ impl FileFixture {
     }
 }
 
+impl FileSystemPort for FileFixture {
+    fn write_file(&mut self, path: &Path, contents: &str) -> Result<(), String> {
+        self.write(path, contents)
+    }
+    fn read_file(&self, path: &Path) -> Result<String, String> {
+        self.read(path).map(str::to_owned)
+    }
+    fn rename_file(&mut self, from: &Path, to: &Path) -> Result<(), String> {
+        self.rename(from, to)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProcessFixture {
     pub stdout: String,
@@ -191,6 +253,18 @@ impl ProcessFixture {
     }
 }
 
+impl ProcessPort for ProcessFixture {
+    fn stdout(&self) -> &str {
+        &self.stdout
+    }
+    fn cancel(&mut self) {
+        self.cancel();
+    }
+    fn is_cancelled(&self) -> bool {
+        self.cancelled
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ClipboardFixture {
     text: Option<String>,
@@ -220,6 +294,12 @@ impl ClipboardFixture {
             (_, Some(error)) => Err(error.clone()),
             _ => Err("clipboard empty".into()),
         }
+    }
+}
+
+impl ClipboardPort for ClipboardFixture {
+    fn read_text(&mut self) -> Result<String, String> {
+        self.read().map(str::to_owned)
     }
 }
 
