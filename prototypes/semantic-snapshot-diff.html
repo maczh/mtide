@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>mtide 语义快照差分原型</title>
+  <style>
+    :root { color-scheme:dark; --bg:#0b1020; --panel:#121a2d; --line:#2b3b61; --text:#e8eefc; --muted:#9caed0; --accent:#5eead4; --warn:#fbbf24; --bad:#fb7185; }
+    * { box-sizing:border-box; } body { margin:0; padding:28px; background:var(--bg); color:var(--text); font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif; }
+    main { max-width:1180px; margin:auto; } h1 { font-size:28px; margin:0 0 10px; } h2 { color:var(--accent); font-size:18px; margin:26px 0 10px; }
+    p { color:var(--muted); } .notice,.panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:16px; margin-top:14px; }
+    .notice { border-left:4px solid var(--accent); } .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:12px; }
+    button { background:#182542; color:var(--text); border:1px solid #40557f; border-radius:6px; padding:8px 10px; cursor:pointer; } button:hover { border-color:var(--accent); }
+    button.active { background:var(--accent); color:#08201d; } .buttons { display:flex; flex-wrap:wrap; gap:8px; }
+    pre { margin:0; padding:12px; overflow:auto; background:#0b1428; border-radius:7px; color:#dce7ff; font:13px/1.45 ui-monospace,SFMono-Regular,Consolas,monospace; }
+    code,kbd { color:var(--accent); background:#0b1428; border-radius:4px; padding:2px 5px; } table { width:100%; border-collapse:collapse; }
+    th,td { text-align:left; vertical-align:top; border-bottom:1px solid var(--line); padding:9px 8px; } th { color:var(--accent); }
+    .pass { color:var(--accent); } .warn { color:var(--warn); } .fail { color:var(--bad); } .small { color:var(--muted); font-size:13px; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>mtide 语义快照差分原型</h1>
+  <div class="notice">
+    <strong>原型问题：</strong>如何比较 ttt 与 mtide 的屏幕、布局、焦点、应用状态和副作用，同时只忽略明确允许的动态值？<br>
+    这是可丢弃的逻辑原型，不是最终 schema。当前示例专门演示：时间/PID/临时路径可归一化，但菜单命令、焦点、文件内容和退出结果不能被隐藏。
+  </div>
+
+  <h2>输入快照</h2>
+  <section class="grid">
+    <div class="panel"><h3>ttt oracle</h3><pre id="oracle"></pre></div>
+    <div class="panel"><h3>mtide candidate</h3><pre id="candidate"></pre></div>
+  </section>
+
+  <h2>归一化开关</h2>
+  <section class="panel">
+    <div class="buttons" id="normalizers"></div>
+    <p class="small">建议只允许字段级、显式、可审计的归一化；禁止整段屏幕文本模糊匹配。</p>
+  </section>
+
+  <h2>语义差分</h2>
+  <section class="panel"><div id="diff"></div></section>
+
+  <h2>快照契约</h2>
+  <section class="panel">
+    <table><thead><tr><th>层</th><th>必须比较</th><th>允许归一化</th><th>失败分类</th></tr></thead><tbody>
+      <tr><td>screen</td><td>固定尺寸、cell 文本/宽度/属性、菜单和布局关系</td><td>颜色别名、终端噪声（仅在规则声明时）</td><td>behavior-mismatch</td></tr>
+      <tr><td>app</td><td>focus、active file、cursor、selection、dirty、panels、terminal focus</td><td>动态内部 ID（必须保留稳定引用）</td><td>behavior-mismatch</td></tr>
+      <tr><td>side_effects</td><td>文件、配置、workspace、插件 storage 和 clipboard 结果</td><td>临时目录前缀、平台路径分隔符</td><td>behavior/protocol mismatch</td></tr>
+      <tr><td>protocol</td><td>插件/LSP/Agent 请求、响应、取消、清理和退出顺序</td><td>PID、时间戳、随机 request id</td><td>protocol-mismatch</td></tr>
+      <tr><td>lifecycle</td><td>exit code、错误类别、资源关闭和安全拒绝</td><td>错误中的动态路径和版本装饰</td><td>security-rejection/environment/flaky</td></tr>
+    </tbody></table>
+  </section>
+</main>
+
+<script>
+const rawOracle = {
+  meta:{scenario_id:"editor.save.001", oracle:"ttt", baseline_commit:"afa48edc0b35539423062bafef747dca610fbd5b", captured_at:"2026-11-07T10:20:31.123Z", pid:4312, temp_root:"/tmp/ttt-case-4312"},
+  screen:{width:80,height:24,focus:"editor",cells:["File  Edit  Selection  View  Options  Help","main.go","Saved"]},
+  app:{active_file:"/tmp/ttt-case-4312/main.go",cursor:{line:2,col:5},selection:null,dirty:false,panels:{sidebar:false,bottom:"none"}},
+  side_effects:{files:{"/tmp/ttt-case-4312/main.go":"package main\n"},config:{},clipboard:""},
+  protocol:{events:[{kind:"save",request_id:"req-4312",at:"2026-11-07T10:20:31.124Z"}]},
+  lifecycle:{exit_code:0,error:null,cleaned_up:true}
+};
+
+const rawCandidate = {
+  meta:{scenario_id:"editor.save.001", oracle:"mtide", baseline_commit:"afa48edc0b35539423062bafef747dca610fbd5b", captured_at:"2026-11-07T10:20:32.991Z", pid:9981, temp_root:"/tmp/mtide-case-9981"},
+  screen:{width:80,height:24,focus:"editor",cells:["File  Edit  Selection  View  Options  Help","main.go","Saved"]},
+  app:{active_file:"/tmp/mtide-case-9981/main.go",cursor:{line:2,col:5},selection:null,dirty:false,panels:{sidebar:false,bottom:"none"}},
+  side_effects:{files:{"/tmp/mtide-case-9981/main.go":"package main\n"},config:{},clipboard:""},
+  protocol:{events:[{kind:"save",request_id:"req-7777",at:"2026-11-07T10:20:33.002Z"}]},
+  lifecycle:{exit_code:0,error:null,cleaned_up:true}
+};
+
+const rules = { timestamp:true, pid:true, temp_path:true, request_id:true, terminal_noise:false };
+const labels = { timestamp:"时间戳", pid:"PID", temp_path:"临时路径", request_id:"动态 request id", terminal_noise:"终端噪声" };
+
+function clone(value) { return JSON.parse(JSON.stringify(value)); }
+function normalize(value, key="") {
+  if (Array.isArray(value)) return value.map(item => normalize(item, key));
+  if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([k,v]) => [k, normalize(v,k)]));
+  if (rules.timestamp && (key === "captured_at" || key === "at")) return "<TIMESTAMP>";
+  if (rules.pid && key === "pid") return "<PID>";
+  if (rules.request_id && key === "request_id") return "<REQUEST_ID>";
+  if (rules.temp_path && typeof value === "string" && /^\/tmp\/(ttt|mtide)-case-\d+/.test(value)) return value.replace(/^\/tmp\/(ttt|mtide)-case-\d+/, "<TEMP_ROOT>");
+  if (rules.terminal_noise && typeof value === "string") return value.replace(/\x1b\[[0-9;?]*[ -\/]*[@-~]/g, "");
+  return value;
+}
+
+function flatten(value, prefix="", output={}) {
+  if (Array.isArray(value)) value.forEach((v,i) => flatten(v, `${prefix}[${i}]`, output));
+  else if (value && typeof value === "object") Object.entries(value).forEach(([k,v]) => flatten(v, prefix ? `${prefix}.${k}` : k, output));
+  else output[prefix] = value;
+  return output;
+}
+
+function compare() {
+  const left = flatten(normalize(rawOracle));
+  const right = flatten(normalize(rawCandidate));
+  const paths = [...new Set([...Object.keys(left), ...Object.keys(right)])].sort();
+  return paths.map(path => ({path, oracle:left[path], candidate:right[path], equal:JSON.stringify(left[path])===JSON.stringify(right[path])})).filter(row => !row.equal);
+}
+
+function render() {
+  document.querySelector("#oracle").textContent = JSON.stringify(rawOracle,null,2);
+  document.querySelector("#candidate").textContent = JSON.stringify(rawCandidate,null,2);
+  document.querySelector("#normalizers").innerHTML = Object.entries(rules).map(([key,on]) => `<button class="${on?"active":""}" data-rule="${key}">${on?"✓":"○"} ${labels[key]}</button>`).join("");
+  document.querySelectorAll("[data-rule]").forEach(button => button.onclick = () => { rules[button.dataset.rule] = !rules[button.dataset.rule]; render(); });
+  const rows = compare();
+  document.querySelector("#diff").innerHTML = rows.length === 0
+    ? `<div class="pass"><strong>等价：</strong>所有启用归一化后的语义字段一致。</div>`
+    : `<div class="${rows.some(row => row.path.startsWith("screen") || row.path.startsWith("app") || row.path.startsWith("side_effects")) ? "fail" : "warn"}"><strong>发现 ${rows.length} 个差异：</strong></div><table><thead><tr><th>路径</th><th>ttt</th><th>mtide</th><th>结论</th></tr></thead><tbody>${rows.map(row => `<tr><td><code>${row.path}</code></td><td>${escapeHtml(JSON.stringify(row.oracle))}</td><td>${escapeHtml(JSON.stringify(row.candidate))}</td><td class="fail">必须修复或显式分类</td></tr>`).join("")}</tbody></table>`;
+}
+
+function escapeHtml(value) { return value.replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;"); }
+render();
+</script>
+</body>
+</html>
