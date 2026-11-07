@@ -1,0 +1,12 @@
+{
+  "schema": "mtide.compat.manifest.v1",
+  "scenario_id": "startup-exit",
+  "oracle": "ttt",
+  "oracle_commit": "afa48edc0b35539423062bafef747dca610fbd5b",
+  "platform": "runtime",
+  "terminal": { "columns": 80, "rows": 24 },
+  "locale": "C",
+  "environment_fingerprint": "b025a56fe5e1c94c",
+  "scenario_schema": "mtide.compat.scenario.v1",
+  "snapshot_schema": "mtide.compat.snapshot.v1"
+}

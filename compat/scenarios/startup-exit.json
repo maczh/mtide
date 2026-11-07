@@ -1,0 +1,7 @@
+{
+  "scenario_id": "startup-exit",
+  "description": "Start with a deterministic terminal size, observe startup, then exit.",
+  "terminal": { "columns": 80, "rows": 24 },
+  "oracle": { "program": "ttt", "args": ["--welcome", "--exec", "[{\"action\":\"key\",\"key\":\"ctrl+q\"}]" ] },
+  "candidate": { "program": "mtide", "args": ["--welcome", "--exec", "[{\"action\":\"key\",\"key\":\"ctrl+q\"}]" ] }
+}

@@ -9,7 +9,8 @@
 5. 根据任务阅读 [CLI 与配置](05-cli-config.md)、[编辑器内核](06-editor-core.md)、[服务与渲染](07-services-and-rendering.md)、[插件与 Agent](08-plugin-and-agent.md)、[Git 远程凭据交互](15-git-credentials.md)。
 6. 开发前后遵守 [测试](09-testing.md) 与 [开发流程](11-development-workflow.md)。
 7. 每次同步上游前阅读 [上游功能与社区建议研究](13-upstream-research.md)。
-8. 开发过程中用 [当前实现状态](14-implementation-status.md) 区分已落地能力和规划能力。
+8. 开发启动时按 [P0 开发启动规格](16-p0-development-spec.md) 建立差分兼容 Harness。
+9. 开发过程中用 [当前实现状态](14-implementation-status.md) 区分已落地能力和规划能力。
 
 ## 文档状态
 
