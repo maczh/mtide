@@ -924,15 +924,16 @@ fn menu_hit(area: Rect, column: u16, row: u16) -> Option<usize> {
         return None;
     }
     let offset = column.checked_sub(area.x.saturating_add(6))?;
-    if offset >= 31 {
+    if offset >= 45 {
         return None;
     }
     Some(match offset {
         0..=6 => 0,
         7..=12 => 1,
-        13..=18 => 2,
-        19..=27 => 3,
-        _ => 4,
+        13..=23 => 2,
+        24..=29 => 3,
+        30..=38 => 4,
+        _ => 5,
     })
 }
 
@@ -1122,7 +1123,7 @@ fn draw_menu(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            "  File  Edit  View  Options  Help ",
+            "  File  Edit  Selection  View  Options  Help ",
             Style::default().fg(theme.muted),
         ),
         Span::styled(

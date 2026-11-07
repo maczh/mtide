@@ -2804,7 +2804,7 @@ impl App {
         self.select_sidebar(tab);
     }
     pub fn menu_click(&mut self, index: usize) {
-        let label = ["File", "Edit", "View", "Options", "Help"]
+        let label = ["File", "Edit", "Selection", "View", "Options", "Help"]
             .get(index)
             .copied()
             .unwrap_or("Menu");
