@@ -4138,16 +4138,19 @@ impl App {
                     }
                 }
                 PluginPanelRequest::CloseTab { id } => {
+                    // Release callbacks for background tabs as well as the
+                    // currently visible tab; otherwise Lua registry values
+                    // and event handlers survive until runtime shutdown.
+                    if let Some(runtime) = self.plugin_runtimes.get(runtime_index) {
+                        if let Err(error) = runtime.close_tab(&id) {
+                            self.status_message = format!("Plugin tab close failed: {error}");
+                        }
+                    }
                     if self
                         .plugin_custom_tab
                         .as_ref()
                         .is_some_and(|(owner, current)| *owner == runtime_index && current == &id)
                     {
-                        if let Some(runtime) = self.plugin_runtimes.get(runtime_index) {
-                            if let Err(error) = runtime.close_tab(&id) {
-                                self.status_message = format!("Plugin tab close failed: {error}");
-                            }
-                        }
                         self.plugin_custom_tab = None;
                         self.plugin_file_view = None;
                         self.plugin_file_view_path = None;
