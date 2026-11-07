@@ -1,0 +1,6 @@
+{
+  "scenario_id": "terminal-routing",
+  "terminal": { "columns": 120, "rows": 40 },
+  "oracle": { "program": "ttt", "args": ["--welcome", "--exec", "[{\"action\":\"key\",\"key\":\"ctrl+t\"},{\"action\":\"key\",\"key\":\"f10\"},{\"action\":\"key\",\"key\":\"ctrl+p\"},{\"action\":\"key\",\"key\":\"esc\"},{\"action\":\"key\",\"key\":\"ctrl+q\"}]" ] },
+  "candidate": { "program": "mtide", "args": ["--welcome", "--exec", "[{\"action\":\"key\",\"key\":\"ctrl+t\"},{\"action\":\"key\",\"key\":\"f10\"},{\"action\":\"key\",\"key\":\"ctrl+p\"},{\"action\":\"key\",\"key\":\"esc\"},{\"action\":\"key\",\"key\":\"ctrl+q\"}]" ] }
+}
