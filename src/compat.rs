@@ -9,6 +9,7 @@ use std::{
 
 pub const TTT_ORACLE_COMMIT: &str = "afa48edc0b35539423062bafef747dca610fbd5b";
 pub const MANIFEST_SCHEMA: &str = "mtide.compat.manifest.v1";
+pub const SNAPSHOT_SCHEMA: &str = "mtide.compat.snapshot.v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ScenarioManifest {
@@ -85,6 +86,169 @@ pub struct DifferentialResult {
     pub oracle: ScenarioResult,
     pub candidate: ScenarioResult,
     pub classification: ResultClass,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SemanticSnapshot {
+    pub schema: String,
+    pub meta: serde_json::Value,
+    pub screen: serde_json::Value,
+    pub app: serde_json::Value,
+    pub side_effects: serde_json::Value,
+    pub protocol: serde_json::Value,
+    pub lifecycle: serde_json::Value,
+}
+
+impl SemanticSnapshot {
+    pub fn empty() -> Self {
+        let empty = serde_json::Value::Object(Default::default());
+        Self {
+            schema: SNAPSHOT_SCHEMA.to_owned(),
+            meta: empty.clone(),
+            screen: empty.clone(),
+            app: empty.clone(),
+            side_effects: empty.clone(),
+            protocol: empty.clone(),
+            lifecycle: empty,
+        }
+    }
+
+    fn layer(&self, name: &str) -> Option<&serde_json::Value> {
+        match name {
+            "meta" => Some(&self.meta),
+            "screen" => Some(&self.screen),
+            "app" => Some(&self.app),
+            "side_effects" => Some(&self.side_effects),
+            "protocol" => Some(&self.protocol),
+            "lifecycle" => Some(&self.lifecycle),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum NormalizationRule {
+    Replace {
+        path: String,
+        value: serde_json::Value,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SnapshotDiff {
+    pub path: String,
+    pub oracle: Option<serde_json::Value>,
+    pub candidate: Option<serde_json::Value>,
+    pub scenario_id: String,
+    pub platform: String,
+    pub class: ResultClass,
+}
+
+pub fn normalize_snapshot(
+    snapshot: &SemanticSnapshot,
+    rules: &[NormalizationRule],
+) -> SemanticSnapshot {
+    let mut normalized = snapshot.clone();
+    for rule in rules {
+        let NormalizationRule::Replace { path, value } = rule;
+        if let Some((layer, json_path)) = path.split_once('.') {
+            if let Some(target) = normalized.layer_mut(layer) {
+                replace_at_path(target, json_path, value.clone());
+            }
+        }
+    }
+    normalized
+}
+
+pub fn diff_snapshots(
+    oracle: &SemanticSnapshot,
+    candidate: &SemanticSnapshot,
+    manifest: &ScenarioManifest,
+    class: ResultClass,
+) -> Vec<SnapshotDiff> {
+    let layers = [
+        "meta",
+        "screen",
+        "app",
+        "side_effects",
+        "protocol",
+        "lifecycle",
+    ];
+    let mut diffs = Vec::new();
+    for layer in layers {
+        if let (Some(left), Some(right)) = (oracle.layer(layer), candidate.layer(layer)) {
+            diff_value(layer, left, right, manifest, &class, &mut diffs);
+        }
+    }
+    diffs
+}
+
+impl SemanticSnapshot {
+    fn layer_mut(&mut self, name: &str) -> Option<&mut serde_json::Value> {
+        match name {
+            "meta" => Some(&mut self.meta),
+            "screen" => Some(&mut self.screen),
+            "app" => Some(&mut self.app),
+            "side_effects" => Some(&mut self.side_effects),
+            "protocol" => Some(&mut self.protocol),
+            "lifecycle" => Some(&mut self.lifecycle),
+            _ => None,
+        }
+    }
+}
+
+fn replace_at_path(target: &mut serde_json::Value, path: &str, replacement: serde_json::Value) {
+    let mut current = target;
+    let parts: Vec<&str> = path.split('.').collect();
+    for part in &parts[..parts.len().saturating_sub(1)] {
+        let Some(next) = current.get_mut(*part) else {
+            return;
+        };
+        current = next;
+    }
+    if let Some(last) = parts.last() {
+        if let Some(slot) = current.get_mut(*last) {
+            *slot = replacement;
+        }
+    }
+}
+
+fn diff_value(
+    path: &str,
+    oracle: &serde_json::Value,
+    candidate: &serde_json::Value,
+    manifest: &ScenarioManifest,
+    class: &ResultClass,
+    diffs: &mut Vec<SnapshotDiff>,
+) {
+    match (oracle, candidate) {
+        (serde_json::Value::Object(left), serde_json::Value::Object(right)) => {
+            let keys = left
+                .keys()
+                .chain(right.keys())
+                .collect::<std::collections::BTreeSet<_>>();
+            for key in keys {
+                diff_value(
+                    &format!("{path}.{key}"),
+                    left.get(key).unwrap_or(&serde_json::Value::Null),
+                    right.get(key).unwrap_or(&serde_json::Value::Null),
+                    manifest,
+                    class,
+                    diffs,
+                );
+            }
+        }
+        (serde_json::Value::Array(left), serde_json::Value::Array(right)) if left == right => {}
+        _ if oracle == candidate => {}
+        _ => diffs.push(SnapshotDiff {
+            path: path.to_owned(),
+            oracle: Some(oracle.clone()),
+            candidate: Some(candidate.clone()),
+            scenario_id: manifest.scenario_id.clone(),
+            platform: manifest.platform.clone(),
+            class: class.clone(),
+        }),
+    }
 }
 
 pub fn run_definition(definition: &ScenarioDefinition) -> DifferentialResult {
@@ -292,5 +456,64 @@ mod tests {
         assert_eq!(result.oracle.implementation, "oracle");
         assert_eq!(result.candidate.implementation, "candidate");
         assert_eq!(result.manifest.scenario_id, "startup-exit");
+    }
+
+    #[test]
+    fn normalization_only_replaces_explicit_dynamic_fields() {
+        let mut oracle = SemanticSnapshot::empty();
+        oracle.meta = serde_json::json!({"pid": 10, "command_id": "save", "dirty": true});
+        let mut candidate = oracle.clone();
+        candidate.meta["pid"] = serde_json::json!(20);
+        candidate.meta["dirty"] = serde_json::json!(false);
+        let rules = [NormalizationRule::Replace {
+            path: "meta.pid".into(),
+            value: serde_json::json!("<pid>"),
+        }];
+        let normalized_oracle = normalize_snapshot(&oracle, &rules);
+        let normalized = normalize_snapshot(&candidate, &rules);
+        let manifest = ScenarioManifest::new(
+            "startup-exit",
+            TerminalSize {
+                columns: 80,
+                rows: 24,
+            },
+        );
+        let diffs = diff_snapshots(
+            &normalized_oracle,
+            &normalized,
+            &manifest,
+            ResultClass::BehaviorFailure,
+        );
+        assert!(diffs.iter().any(|diff| diff.path == "meta.dirty"));
+        assert!(!diffs.iter().any(|diff| diff.path == "meta.pid"));
+        assert_eq!(normalized.meta["command_id"], "save");
+    }
+
+    #[test]
+    fn all_six_layers_are_serialized_and_paths_are_auditable() {
+        let mut oracle = SemanticSnapshot::empty();
+        oracle.screen = serde_json::json!({"focus": "editor"});
+        let mut candidate = oracle.clone();
+        candidate.screen["focus"] = serde_json::json!("terminal");
+        let manifest = ScenarioManifest::new(
+            "startup-exit",
+            TerminalSize {
+                columns: 80,
+                rows: 24,
+            },
+        );
+        let diffs = diff_snapshots(&oracle, &candidate, &manifest, ResultClass::BehaviorFailure);
+        assert_eq!(diffs[0].path, "screen.focus");
+        let encoded = serde_json::to_value(SemanticSnapshot::empty()).expect("snapshot JSON");
+        for layer in [
+            "meta",
+            "screen",
+            "app",
+            "side_effects",
+            "protocol",
+            "lifecycle",
+        ] {
+            assert!(encoded.get(layer).is_some());
+        }
     }
 }
