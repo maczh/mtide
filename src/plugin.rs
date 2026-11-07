@@ -49,7 +49,7 @@ pub struct PluginRegistryEntry {
 
 #[allow(dead_code)]
 pub fn fetch_plugin_registry(endpoint: &str) -> AppResult<Vec<PluginRegistryEntry>> {
-    if !endpoint.starts_with("https://") || endpoint.contains([' ', '\n', '\r']) {
+    if !secure_plugin_endpoint(endpoint) {
         return Err(crate::error::AppError::Plugin(
             "plugin registry must use an HTTPS endpoint".into(),
         ));
@@ -86,7 +86,7 @@ pub fn fetch_plugin_registry(endpoint: &str) -> AppResult<Vec<PluginRegistryEntr
     for entry in &entries {
         if entry.name.trim().is_empty()
             || entry.version.trim().is_empty()
-            || !entry.url.starts_with("https://")
+            || !secure_plugin_endpoint(&entry.url)
         {
             return Err(crate::error::AppError::Plugin(
                 "plugin registry contains an invalid entry".into(),
@@ -146,8 +146,7 @@ fn compare_plugin_versions(left: &str, right: &str) -> std::cmp::Ordering {
 pub fn download_plugin_registry_entry(entry: &PluginRegistryEntry) -> AppResult<Vec<u8>> {
     if entry.name.trim().is_empty()
         || entry.version.trim().is_empty()
-        || !entry.url.starts_with("https://")
-        || entry.url.contains([' ', '\n', '\r'])
+        || !secure_plugin_endpoint(&entry.url)
     {
         return Err(crate::error::AppError::Plugin(
             "invalid plugin registry download entry".into(),
@@ -195,6 +194,20 @@ pub fn download_plugin_registry_entry(entry: &PluginRegistryEntry) -> AppResult<
         }
     }
     Ok(bytes.to_vec())
+}
+
+fn secure_plugin_endpoint(endpoint: &str) -> bool {
+    if endpoint.contains([' ', '\t', '\n', '\r']) {
+        return false;
+    }
+    let Ok(url) = reqwest::Url::parse(endpoint) else {
+        return false;
+    };
+    url.scheme() == "https"
+        && url.host_str().is_some_and(|host| !host.is_empty())
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.port().is_none_or(|port| port == 443)
 }
 
 #[allow(dead_code)]
@@ -14380,6 +14393,10 @@ assert(line.active() == true)
     fn plugin_registry_rejects_insecure_endpoints_before_network_access() {
         assert!(fetch_plugin_registry("http://registry.example/plugins.json").is_err());
         assert!(fetch_plugin_registry("https://registry.example/plugins.json\n").is_err());
+        assert!(
+            fetch_plugin_registry("https://user:secret@registry.example/plugins.json").is_err()
+        );
+        assert!(fetch_plugin_registry("https://registry.example:8443/plugins.json").is_err());
     }
 
     #[test]
@@ -14429,6 +14446,22 @@ assert(line.active() == true)
             sha256: None,
         };
         assert!(download_plugin_registry_entry(&entry).is_err());
+    }
+
+    #[test]
+    fn plugin_registry_download_rejects_url_credentials_and_nonstandard_ports() {
+        for url in [
+            "https://user:secret@example.com/demo.zip",
+            "https://example.com:8443/demo.zip",
+        ] {
+            let entry = PluginRegistryEntry {
+                name: "demo".into(),
+                version: "1.0.0".into(),
+                url: url.into(),
+                sha256: None,
+            };
+            assert!(download_plugin_registry_entry(&entry).is_err(), "{url}");
+        }
     }
 
     #[test]
