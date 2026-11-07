@@ -580,24 +580,27 @@ pub fn blame(root: &Path, path: &str) -> Vec<BlameLine> {
     parse_blame(&String::from_utf8_lossy(&output.stdout))
 }
 
-pub fn history_page(root: &Path, skip: usize, limit: usize) -> (Vec<GitCommit>, bool) {
+pub fn history_page(
+    root: &Path,
+    skip: usize,
+    limit: usize,
+    snapshot_head: Option<&str>,
+) -> (Vec<GitCommit>, bool, Option<String>) {
     let limit = limit.clamp(1, 200);
     let fetch_limit = limit.saturating_add(1);
     let output = Command::new("git")
-        .args([
-            "log",
-            &format!("-{fetch_limit}"),
-            &format!("--skip={skip}"),
-            "--date=short",
-            "--pretty=format:%H%x1f%an%x1f%ad%x1f%s",
-        ])
+        .arg("log")
+        .arg(format!("-{fetch_limit}"))
+        .arg(format!("--skip={skip}"))
+        .args(["--date=short", "--pretty=format:%H%x1f%an%x1f%ad%x1f%s"])
+        .arg(snapshot_head.unwrap_or("HEAD"))
         .current_dir(root)
         .output();
     let Ok(output) = output else {
-        return (Vec::new(), false);
+        return (Vec::new(), false, snapshot_head.map(ToOwned::to_owned));
     };
     if !output.status.success() {
-        return (Vec::new(), false);
+        return (Vec::new(), false, snapshot_head.map(ToOwned::to_owned));
     }
     let mut commits: Vec<_> = String::from_utf8_lossy(&output.stdout)
         .lines()
@@ -605,7 +608,38 @@ pub fn history_page(root: &Path, skip: usize, limit: usize) -> (Vec<GitCommit>, 
         .collect();
     let has_more = commits.len() > limit;
     commits.truncate(limit);
-    (commits, has_more)
+    let snapshot_head = snapshot_head
+        .map(ToOwned::to_owned)
+        .or_else(|| commits.first().map(|commit| commit.hash.clone()));
+    (commits, has_more, snapshot_head)
+}
+
+/// Return the complete metadata and patch for a commit from a repository.
+/// The hash is passed as a single argument and validated to avoid option or
+/// revision-expression injection from callers.
+pub fn show_commit(root: &Path, hash: &str, context_lines: usize) -> Result<String, String> {
+    if hash.len() < 7 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("invalid commit hash".to_owned());
+    }
+    let context_lines = context_lines.min(1000);
+    let context_arg = format!("--unified={context_lines}");
+    let output = Command::new("git")
+        .args([
+            "show",
+            "--no-ext-diff",
+            "--find-renames",
+            "--format=fuller",
+            &context_arg,
+            hash,
+            "--",
+        ])
+        .current_dir(root)
+        .output()
+        .map_err(|error| error.to_string())?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 pub fn fetch(root: &Path) -> AppResult<()> {
@@ -1182,5 +1216,45 @@ mod tests {
                 subject: "Initial commit".into(),
             })
         );
+    }
+
+    #[test]
+    fn show_commit_returns_metadata_and_patch_and_rejects_invalid_hash() {
+        let root = std::env::temp_dir().join(format!("mtide-show-commit-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("repository directory");
+        let run = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .output()
+                .expect("git command")
+        };
+        assert!(run(&["init", "-q"]).status.success());
+        assert!(run(&["config", "user.name", "Ada"]).status.success());
+        assert!(run(&["config", "user.email", "ada@example.test"])
+            .status
+            .success());
+        fs::write(root.join("note.md"), "before\noriginal\nafter\n").expect("initial file");
+        assert!(run(&["add", "note.md"]).status.success());
+        assert!(run(&["commit", "-qm", "initial note"]).status.success());
+        fs::write(root.join("note.md"), "before\nupdated\nafter\n").expect("updated file");
+        assert!(run(&["add", "note.md"]).status.success());
+        assert!(run(&["commit", "-qm", "update note"]).status.success());
+        let hash = String::from_utf8(run(&["rev-parse", "HEAD"]).stdout)
+            .expect("hash utf8")
+            .trim()
+            .to_owned();
+
+        let detail = show_commit(&root, &hash, 3).expect("commit detail");
+        assert!(detail.contains("update note"));
+        assert!(detail.contains("diff --git a/note.md b/note.md"));
+        assert!(detail.contains("+updated"));
+        assert!(detail.contains(" before"));
+        let changes_only = show_commit(&root, &hash, 0).expect("changes only");
+        assert!(!changes_only.lines().any(|line| line == " before"));
+        assert!(changes_only.contains("+updated"));
+        assert!(show_commit(&root, "--all", 3).is_err());
+        fs::remove_dir_all(root).expect("cleanup");
     }
 }

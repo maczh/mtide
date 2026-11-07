@@ -19,9 +19,34 @@ pub struct Theme {
     pub positive: Color,
     pub foreground: Color,
     pub selection: Color,
+    pub search_match: Color,
+    pub search_active: Color,
     pub warning: Color,
     pub error: Color,
     pub terminal_colors: [Color; 16],
+    pub syntax: SyntaxTheme,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SyntaxTheme {
+    pub comment: Color,
+    pub string: Color,
+    pub number: Color,
+    pub keyword: Color,
+    pub function: Color,
+    pub type_name: Color,
+    pub variable: Color,
+    pub constant: Color,
+    pub builtin: Color,
+    pub operator: Color,
+    pub punctuation: Color,
+    pub heading: Color,
+    pub quote: Color,
+    pub link: Color,
+    pub code: Color,
+    pub tag: Color,
+    pub attribute: Color,
+    pub property: Color,
 }
 
 impl Default for Theme {
@@ -35,6 +60,8 @@ impl Default for Theme {
             positive: Color::Rgb(141, 218, 164),
             foreground: Color::White,
             selection: Color::Rgb(44, 57, 86),
+            search_match: Color::Yellow,
+            search_active: Color::Rgb(113, 192, 255),
             warning: Color::Yellow,
             error: Color::Red,
             terminal_colors: [
@@ -55,6 +82,26 @@ impl Default for Theme {
                 Color::LightCyan,
                 Color::White,
             ],
+            syntax: SyntaxTheme {
+                comment: Color::Rgb(137, 145, 173),
+                string: Color::Yellow,
+                number: Color::Yellow,
+                keyword: Color::Rgb(113, 192, 255),
+                function: Color::Rgb(113, 192, 255),
+                type_name: Color::Rgb(141, 218, 164),
+                variable: Color::White,
+                constant: Color::Yellow,
+                builtin: Color::Rgb(141, 218, 164),
+                operator: Color::White,
+                punctuation: Color::White,
+                heading: Color::Rgb(113, 192, 255),
+                quote: Color::Rgb(137, 145, 173),
+                link: Color::Rgb(113, 192, 255),
+                code: Color::Rgb(113, 192, 255),
+                tag: Color::Rgb(113, 192, 255),
+                attribute: Color::Rgb(141, 218, 164),
+                property: Color::Rgb(113, 192, 255),
+            },
         }
     }
 }
@@ -75,6 +122,10 @@ impl Theme {
         let terminal = colors
             .get("terminal")
             .or_else(|| value.get("terminal"))
+            .unwrap_or(&serde_json::Value::Null);
+        let syntax = colors
+            .get("syntax")
+            .or_else(|| value.get("syntax"))
             .unwrap_or(&serde_json::Value::Null);
         let mut terminal_colors = defaults.terminal_colors;
         let terminal_names = [
@@ -100,35 +151,117 @@ impl Theme {
                 terminal_colors[index] = parsed;
             }
         }
+        let syntax_color = |role: &str, fallback| {
+            let key = format!("{role}.fg");
+            color(syntax, &[key.as_str()]).unwrap_or(fallback)
+        };
+        let accent = color(
+            colors,
+            &[
+                "accent",
+                "focus",
+                "ui.accent",
+                "borderActive.fg",
+                "tabs.active.fg",
+            ],
+        )
+        .unwrap_or(defaults.accent);
+        let muted = color(
+            colors,
+            &["muted", "foregroundMuted", "ui.muted", "muted.fg"],
+        )
+        .unwrap_or(defaults.muted);
+        let positive = color(colors, &["positive", "success", "git.added", "success.fg"])
+            .unwrap_or(defaults.positive);
+        let foreground = color(colors, &["foreground", "editor.foreground", "default.fg"])
+            .unwrap_or(defaults.foreground);
+        let warning =
+            color(colors, &["warning", "editor.warning", "warning.fg"]).unwrap_or(defaults.warning);
         Self {
             background: color(
                 colors,
-                &["background", "ui.background", "editor.background"],
+                &[
+                    "background",
+                    "ui.background",
+                    "editor.background",
+                    "default.bg",
+                ],
             )
             .unwrap_or(defaults.background),
-            panel: color(colors, &["panel", "ui.panel", "sideBar.background"])
-                .unwrap_or(defaults.panel),
-            border: color(colors, &["border", "ui.border", "panel.border"])
-                .unwrap_or(defaults.border),
-            muted: color(colors, &["muted", "foregroundMuted", "ui.muted"])
-                .unwrap_or(defaults.muted),
-            accent: color(colors, &["accent", "focus", "ui.accent"]).unwrap_or(defaults.accent),
-            positive: color(colors, &["positive", "success", "git.added"])
-                .unwrap_or(defaults.positive),
-            foreground: color(colors, &["foreground", "editor.foreground"])
-                .unwrap_or(defaults.foreground),
-            selection: color(colors, &["selection", "editor.selectionBackground"])
-                .unwrap_or(defaults.selection),
-            warning: color(colors, &["warning", "editor.warning"]).unwrap_or(defaults.warning),
-            error: color(colors, &["error", "editor.error"]).unwrap_or(defaults.error),
+            panel: color(
+                colors,
+                &["panel", "ui.panel", "sideBar.background", "statusBar.bg"],
+            )
+            .or_else(|| color(colors, &["default.bg"]))
+            .unwrap_or(defaults.panel),
+            border: color(
+                colors,
+                &["border", "ui.border", "panel.border", "border.fg"],
+            )
+            .unwrap_or(defaults.border),
+            muted,
+            accent,
+            positive,
+            foreground,
+            selection: color(
+                colors,
+                &[
+                    "selection",
+                    "editor.selectionBackground",
+                    "editor.selection.bg",
+                ],
+            )
+            .unwrap_or(defaults.selection),
+            search_match: color(
+                colors,
+                &["searchMatch", "editor.searchMatch", "editor.searchMatch.bg"],
+            )
+            .or_else(|| color(colors, &["editor.searchMatch.bg"]))
+            .unwrap_or(defaults.search_match),
+            search_active: color(
+                colors,
+                &[
+                    "searchActive",
+                    "editor.searchActive",
+                    "editor.searchActive.bg",
+                ],
+            )
+            .or_else(|| color(colors, &["editor.searchActive.bg"]))
+            .unwrap_or(defaults.search_active),
+            warning,
+            error: color(colors, &["error", "editor.error", "danger.fg"]).unwrap_or(defaults.error),
             terminal_colors,
+            syntax: SyntaxTheme {
+                comment: syntax_color("comment", muted),
+                string: syntax_color("string", warning),
+                number: syntax_color("number", warning),
+                keyword: syntax_color("keyword", accent),
+                function: syntax_color("function", accent),
+                type_name: syntax_color("type", positive),
+                variable: syntax_color("variable", foreground),
+                constant: syntax_color("constant", warning),
+                builtin: syntax_color("builtin", positive),
+                operator: syntax_color("operator", foreground),
+                punctuation: syntax_color("punctuation", foreground),
+                heading: syntax_color("heading", accent),
+                quote: syntax_color("quote", muted),
+                link: syntax_color("link", accent),
+                code: syntax_color("code", accent),
+                tag: syntax_color("tag", accent),
+                attribute: syntax_color("attribute", positive),
+                property: syntax_color("property", accent),
+            },
         }
     }
 }
 
 fn color(value: &serde_json::Value, keys: &[&str]) -> Option<Color> {
     keys.iter()
-        .find_map(|key| value.get(*key).and_then(serde_json::Value::as_str))
+        .find_map(|key| {
+            key.split('.')
+                .try_fold(value, |node, part| node.get(part))
+                .and_then(serde_json::Value::as_str)
+        })
         .and_then(parse_color)
 }
 
@@ -181,6 +314,8 @@ pub struct Settings {
     pub quick_open: QuickOpenSettings,
     #[serde(rename = "explorer")]
     pub explorer: ExplorerSettings,
+    #[serde(default)]
+    pub git: GitSettings,
     pub editor: EditorSettings,
     pub search: SearchSettings,
     #[serde(default)]
@@ -231,6 +366,24 @@ pub struct ExplorerSettings {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
+pub struct GitSettings {
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
+    #[serde(rename = "fileView", alias = "file_view")]
+    pub file_view: String,
+}
+
+impl Default for GitSettings {
+    fn default() -> Self {
+        Self {
+            extra: BTreeMap::new(),
+            file_view: "list".to_owned(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
 pub struct EditorSettings {
     #[serde(flatten)]
     pub extra: BTreeMap<String, serde_json::Value>,
@@ -246,6 +399,10 @@ pub struct EditorSettings {
     pub word_wrap_column: usize,
     #[serde(rename = "diffContext", alias = "diff_context")]
     pub diff_context: String,
+    #[serde(rename = "diffWordWrap", alias = "diff_word_wrap")]
+    pub diff_word_wrap: bool,
+    #[serde(rename = "diffHighContrast", alias = "diff_high_contrast")]
+    pub diff_high_contrast: bool,
     #[serde(rename = "trimTrailingWhitespace", alias = "trim_trailing_whitespace")]
     pub trim_trailing_whitespace: bool,
     #[serde(rename = "insertFinalNewline", alias = "insert_final_newline")]
@@ -301,6 +458,8 @@ impl Default for EditorSettings {
             word_wrap: false,
             word_wrap_column: 120,
             diff_context: "changes".to_owned(),
+            diff_word_wrap: false,
+            diff_high_contrast: false,
             trim_trailing_whitespace: false,
             insert_final_newline: false,
             format_on_save: false,
@@ -448,6 +607,7 @@ impl Default for Settings {
             keyboard: KeyboardSettings::default(),
             quick_open: QuickOpenSettings::default(),
             explorer: ExplorerSettings::default(),
+            git: GitSettings::default(),
             editor: EditorSettings::default(),
             search: SearchSettings::default(),
             formatters: BTreeMap::new(),
@@ -569,6 +729,11 @@ impl Settings {
         self.bottom_height = self.bottom_height.clamp(3, 24);
         self.agent_width = self.agent_width.clamp(24, 80);
         self.editor.auto_save_delay_ms = self.editor.auto_save_delay_ms.clamp(500, 60_000);
+        self.git.file_view = if self.git.file_view.eq_ignore_ascii_case("tree") {
+            "tree".to_owned()
+        } else {
+            "list".to_owned()
+        };
         if !matches!(
             self.keyboard.modifier_key.to_ascii_lowercase().as_str(),
             "control" | "control+super" | "super"
@@ -743,6 +908,23 @@ mod tests {
         let settings = Settings::default();
         assert!(settings.sidebar_visible);
         assert!(settings.sidebar_width >= 20);
+        assert_eq!(settings.git.file_view, "list");
+    }
+
+    #[test]
+    fn git_file_view_accepts_tree_and_normalizes_unknown_values() {
+        let mut settings: Settings =
+            serde_json::from_str(r#"{"git":{"fileView":"TREE","inlineDiff":true}}"#)
+                .expect("tree settings");
+        settings.normalize_layout();
+        assert_eq!(settings.git.file_view, "tree");
+        let serialized = serde_json::to_value(&settings).expect("serialized settings");
+        assert_eq!(serialized["git"]["inlineDiff"], true);
+
+        let mut settings: Settings = serde_json::from_str(r#"{"git":{"fileView":"compact"}}"#)
+            .expect("unknown view settings");
+        settings.normalize_layout();
+        assert_eq!(settings.git.file_view, "list");
     }
     #[test]
     fn partial_json_uses_defaults() {
@@ -908,10 +1090,12 @@ mod tests {
     #[test]
     fn parses_diff_context_and_ai_settings() {
         let settings: Settings = serde_json::from_str(
-            r#"{"editor":{"diffContext":"full"},"ai":{"enabled":true,"autoSuggest":false,"model":"local"}}"#,
+            r#"{"editor":{"diffContext":"full","diffWordWrap":true,"diffHighContrast":true},"ai":{"enabled":true,"autoSuggest":false,"model":"local"}}"#,
         )
         .expect("diff and AI settings");
         assert_eq!(settings.editor.diff_context, "full");
+        assert!(settings.editor.diff_word_wrap);
+        assert!(settings.editor.diff_high_contrast);
         assert!(settings.ai.enabled);
         assert!(!settings.ai.auto_suggest);
         assert_eq!(settings.ai.model, "local");
@@ -1049,6 +1233,40 @@ mod tests {
         assert_eq!(theme.accent, Color::Rgb(170, 187, 204));
         assert_eq!(theme.foreground, Theme::default().foreground);
         assert_eq!(theme.panel, Theme::default().panel);
+        assert_eq!(theme.syntax.keyword, theme.accent);
+        assert_eq!(theme.syntax.comment, theme.muted);
+    }
+
+    #[test]
+    fn parses_original_ttt_theme_schema() {
+        let theme = Theme::from_json(&serde_json::json!({
+            "default": {"fg": "#fafafa", "bg": "#1f1f1f"},
+            "muted": {"fg": "#888888"},
+            "success": {"fg": "#00ff00"},
+            "warning": {"fg": "#ffff00"},
+            "danger": {"fg": "#ff0000"},
+            "border": {"fg": "#555555"},
+            "borderActive": {"fg": "#00aaff"},
+            "editor": {"selection": {"bg": "#334455"}},
+            "terminal": {"red": "#123456"},
+            "syntax": {
+                "comment": {"fg": "#010203"},
+                "keyword": {"fg": "#040506"},
+                "function": {"fg": "#070809"},
+                "property": {"fg": "#0a0b0c"}
+            }
+        }));
+        assert_eq!(theme.background, Color::Rgb(31, 31, 31));
+        assert_eq!(theme.foreground, Color::Rgb(250, 250, 250));
+        assert_eq!(theme.muted, Color::Rgb(136, 136, 136));
+        assert_eq!(theme.border, Color::Rgb(85, 85, 85));
+        assert_eq!(theme.accent, Color::Rgb(0, 170, 255));
+        assert_eq!(theme.selection, Color::Rgb(51, 68, 85));
+        assert_eq!(theme.terminal_colors[1], Color::Rgb(18, 52, 86));
+        assert_eq!(theme.syntax.comment, Color::Rgb(1, 2, 3));
+        assert_eq!(theme.syntax.keyword, Color::Rgb(4, 5, 6));
+        assert_eq!(theme.syntax.function, Color::Rgb(7, 8, 9));
+        assert_eq!(theme.syntax.property, Color::Rgb(10, 11, 12));
     }
 
     #[test]

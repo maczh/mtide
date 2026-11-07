@@ -147,10 +147,7 @@ fn run_headless_exec(args: &[String], stdin_text: Option<&str>) -> AppResult<()>
         .next()
         .filter(|value| !value.is_empty());
     for script in option_values(args, "--exec") {
-        let scripts = separator.as_deref().map_or_else(
-            || vec![script.clone()],
-            |separator| script.split(separator).map(str::to_owned).collect(),
-        );
+        let scripts = split_exec_scripts(&script, separator.as_deref());
         for script in scripts {
             execute_script_with_debug(
                 &mut app,
@@ -194,10 +191,7 @@ fn run<B: ratatui::backend::Backend>(
         .next()
         .filter(|value| !value.is_empty());
     for script in option_values(args, "--exec") {
-        let scripts = separator.as_deref().map_or_else(
-            || vec![script.clone()],
-            |separator| script.split(separator).map(str::to_owned).collect(),
-        );
+        let scripts = split_exec_scripts(&script, separator.as_deref());
         for script in scripts {
             let size = terminal.size()?;
             let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
@@ -393,6 +387,37 @@ fn option_values(args: &[String], option: &str) -> Vec<String> {
         .collect()
 }
 
+fn split_exec_scripts(script: &str, separator: Option<&str>) -> Vec<String> {
+    if let Some(separator) = separator.filter(|separator| !separator.is_empty()) {
+        script.split(separator).map(str::to_owned).collect()
+    } else if script.trim_start().starts_with('[') || script.trim_start().starts_with('{') {
+        vec![script.to_owned()]
+    } else {
+        let mut commands = Vec::new();
+        let mut start = 0;
+        let mut quote = None;
+        let mut escaped = false;
+        for (index, character) in script.char_indices() {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' && quote.is_some() {
+                escaped = true;
+            } else if matches!(character, '\'' | '"') {
+                if quote == Some(character) {
+                    quote = None;
+                } else if quote.is_none() {
+                    quote = Some(character);
+                }
+            } else if character == ';' && quote.is_none() {
+                commands.push(script[start..index].to_owned());
+                start = index + character.len_utf8();
+            }
+        }
+        commands.push(script[start..].to_owned());
+        commands
+    }
+}
+
 fn parse_size(value: &str) -> AppResult<(u16, u16)> {
     let (columns, rows) = value
         .split_once('x')
@@ -421,8 +446,10 @@ fn execute_script_with_debug(
     area: ratatui::layout::Rect,
     debug: bool,
 ) -> AppResult<()> {
-    let actions: Vec<serde_json::Value> = serde_json::from_str(script)
-        .map_err(|error| error::AppError::Workspace(format!("invalid --exec script: {error}")))?;
+    let actions: Vec<serde_json::Value> = match serde_json::from_str(script) {
+        Ok(actions) => actions,
+        Err(_) => vec![parse_exec_command(script)?],
+    };
     for action in actions {
         let kind = action
             .get("action")
@@ -493,11 +520,15 @@ fn execute_script_with_debug(
                     .get("key")
                     .and_then(serde_json::Value::as_str)
                     .ok_or_else(|| error::AppError::Workspace("--exec key is required".into()))?;
-                let key = parse_script_key(key)?;
-                if key.code == KeyCode::Char('q') && key.modifiers.contains(KeyModifiers::CONTROL) {
-                    app.quit();
-                } else {
-                    app.handle_key(key)?;
+                for key in key.split_whitespace() {
+                    let key = parse_script_key(key)?;
+                    if key.code == KeyCode::Char('q')
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                    {
+                        app.quit();
+                    } else {
+                        app.handle_key(key)?;
+                    }
                 }
             }
             "type" | "paste" => {
@@ -506,6 +537,20 @@ fn execute_script_with_debug(
                     .and_then(serde_json::Value::as_str)
                     .ok_or_else(|| error::AppError::Workspace("--exec text is required".into()))?;
                 app.handle_paste(text)?;
+            }
+            "type-keys" => {
+                let text = action
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| error::AppError::Workspace("--exec text is required".into()))?;
+                for character in text.chars() {
+                    let code = match character {
+                        '\n' | '\r' => KeyCode::Enter,
+                        '\t' => KeyCode::Tab,
+                        character => KeyCode::Char(character),
+                    };
+                    app.handle_key(KeyEvent::new(code, KeyModifiers::NONE))?;
+                }
             }
             "copy" => {
                 app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))?;
@@ -560,6 +605,15 @@ fn execute_script_with_debug(
                 app.automation_open(path, line, column, readonly)?;
             }
             "exec" => execute_external_script_action(&action)?,
+            "command" => {
+                let command = action
+                    .get("command")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        error::AppError::Workspace("--exec command is required".into())
+                    })?;
+                app.automation_command(command)?;
+            }
             "wait" => {
                 let milliseconds = action
                     .get("ms")
@@ -590,6 +644,30 @@ fn execute_script_with_debug(
                     std::thread::sleep(std::time::Duration::from_millis(10));
                 }
             }
+            "wait-for-text" => {
+                let needle = action
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|text| !text.is_empty())
+                    .ok_or_else(|| {
+                        error::AppError::Workspace("--exec wait-for requires screen text".into())
+                    })?;
+                let timeout = action
+                    .get("ms")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(5_000)
+                    .min(30_000);
+                let started = std::time::Instant::now();
+                while !app.automation_screenshot().contains(needle) {
+                    app.poll_background();
+                    if started.elapsed() >= std::time::Duration::from_millis(timeout) {
+                        return Err(error::AppError::Workspace(format!(
+                            "--exec wait-for timed out waiting for {needle:?}"
+                        )));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+            }
             "quit" => app.quit(),
             other => {
                 return Err(error::AppError::Workspace(format!(
@@ -599,6 +677,85 @@ fn execute_script_with_debug(
         }
     }
     Ok(())
+}
+
+fn parse_exec_command(script: &str) -> AppResult<serde_json::Value> {
+    let script = script.trim();
+    let (action, arguments) = script
+        .split_once(char::is_whitespace)
+        .map_or((script, ""), |(action, arguments)| {
+            (action, arguments.trim())
+        });
+    let invalid = || error::AppError::Workspace(format!("invalid --exec command: {script}"));
+    let action_value = |kind: &str| serde_json::json!({"action": kind});
+    let text_value = |kind: &str, text: &str| serde_json::json!({"action": kind, "text": unquote_exec_argument(text)});
+    match action {
+        "click" | "rclick" | "hover" => {
+            let values = parse_exec_numbers(arguments, 2).ok_or_else(invalid)?;
+            Ok(serde_json::json!({"action": action, "x": values[0], "y": values[1]}))
+        }
+        "drag" => {
+            let values = parse_exec_numbers(arguments, 4).ok_or_else(invalid)?;
+            Ok(
+                serde_json::json!({"action": action, "x1": values[0], "y1": values[1], "x2": values[2], "y2": values[3]}),
+            )
+        }
+        "key" if !arguments.is_empty() => {
+            Ok(serde_json::json!({"action": action, "key": arguments}))
+        }
+        "type" if !arguments.is_empty() => Ok(text_value("type-keys", arguments)),
+        "paste" if !arguments.is_empty() => Ok(text_value("paste", arguments)),
+        "exec" if !arguments.is_empty() => {
+            Ok(serde_json::json!({"action":"command", "command":unquote_exec_argument(arguments)}))
+        }
+        "screenshot" | "debug" if !arguments.is_empty() => {
+            Ok(serde_json::json!({"action":action, "path":unquote_exec_argument(arguments)}))
+        }
+        "panel" if !arguments.is_empty() => {
+            Ok(serde_json::json!({"action":"panel", "panel":arguments}))
+        }
+        "wait-for" if !arguments.is_empty() => {
+            let (text, milliseconds) =
+                if let Some((text, timeout)) = arguments.rsplit_once(" timeout=") {
+                    let milliseconds = timeout.parse::<u64>().map_err(|_| invalid())?;
+                    (text.trim(), milliseconds)
+                } else {
+                    (arguments, 5_000)
+                };
+            Ok(
+                serde_json::json!({"action":"wait-for-text", "text":unquote_exec_argument(text), "ms":milliseconds.min(30_000)}),
+            )
+        }
+        "wait" => {
+            let milliseconds = if arguments.is_empty() {
+                0
+            } else {
+                arguments.parse::<u64>().map_err(|_| invalid())?
+            };
+            Ok(serde_json::json!({"action":"wait", "ms":milliseconds}))
+        }
+        "copy" if arguments.is_empty() => Ok(action_value("copy")),
+        "quit" | "shutdown" if arguments.is_empty() => Ok(action_value("quit")),
+        _ => Err(invalid()),
+    }
+}
+
+fn parse_exec_numbers(arguments: &str, count: usize) -> Option<Vec<u16>> {
+    let numbers: Vec<u16> = arguments
+        .split_whitespace()
+        .map(str::parse)
+        .collect::<Result<_, _>>()
+        .ok()?;
+    (numbers.len() == count).then_some(numbers)
+}
+
+fn unquote_exec_argument(argument: &str) -> String {
+    if argument.starts_with('"') && argument.ends_with('"') && argument.len() >= 2 {
+        serde_json::from_str(argument)
+            .unwrap_or_else(|_| argument[1..argument.len() - 1].to_owned())
+    } else {
+        argument.to_owned()
+    }
 }
 
 fn execute_external_script_action(action: &serde_json::Value) -> AppResult<()> {
@@ -680,7 +837,9 @@ fn parse_script_key(value: &str) -> AppResult<KeyEvent> {
             "enter" | "return" => code = Some(KeyCode::Enter),
             "esc" | "escape" => code = Some(KeyCode::Esc),
             "tab" => code = Some(KeyCode::Tab),
+            "space" => code = Some(KeyCode::Char(' ')),
             "backspace" => code = Some(KeyCode::Backspace),
+            "delete" | "del" => code = Some(KeyCode::Delete),
             "up" => code = Some(KeyCode::Up),
             "down" => code = Some(KeyCode::Down),
             "left" => code = Some(KeyCode::Left),
@@ -703,7 +862,7 @@ fn parse_script_key(value: &str) -> AppResult<KeyEvent> {
 
 fn print_help() {
     println!(
-        "mtide {}\n\nUSAGE:\n    mtide [OPTIONS] [FILE|DIRECTORY]\n\nOPTIONS:\n    --plugin DIR      Load a TTT-compatible Lua plugin package (repeatable)\n    --workspace FILE  Open a .ttt workspace\n    --config FILE     Load settings from FILE\n    --exec JSON       Execute JSON automation actions before entering the UI\n    --size WxH        Set initial PTY and Agent dimensions\n    --listen          Accept file targets from later mtide invocations\n    --new-window      Start a new editor window\n    --clear-default-folders  Clear saved startup folders\n    --welcome         Start with a welcome buffer\n    -h, --help        Show this help\n    --version, -v     Show version\n\nKEYS:\n    Ctrl-Q         Quit\n    Tab             Cycle focus\n    Ctrl-B/T/A      Toggle sidebar/terminal/agent\n    Ctrl-P          Plugin command palette",
+        "mtide {}\n\nUSAGE:\n    mtide [OPTIONS] [FILE|DIRECTORY]\n\nOPTIONS:\n    --plugin FILE|DIR Load a TTT-compatible Lua entry or package (repeatable)\n    --workspace FILE  Open a .ttt workspace\n    --config FILE     Load settings from FILE\n    --exec SCRIPT     Execute automation commands or a JSON action array\n    --size WxH        Set initial PTY and Agent dimensions\n    --listen          Accept file targets from later mtide invocations\n    --new-window      Start a new editor window\n    --clear-default-folders  Clear saved startup folders\n    --welcome         Start with a welcome buffer\n    -h, --help        Show this help\n    --version, -v     Show version\n\nKEYS:\n    Ctrl-Q         Quit\n    Tab             Cycle focus\n    Ctrl-B/T/A      Toggle sidebar/terminal/agent\n    Ctrl-P          Plugin command palette",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -770,6 +929,10 @@ mod tests {
         assert!(key.modifiers.contains(KeyModifiers::SHIFT));
         assert_eq!(parse_script_key("home").expect("home").code, KeyCode::Home);
         assert_eq!(
+            parse_script_key("space").expect("space").code,
+            KeyCode::Char(' ')
+        );
+        assert_eq!(
             parse_script_key("pagedown").expect("pagedown").code,
             KeyCode::PageDown
         );
@@ -780,6 +943,23 @@ mod tests {
     fn collects_repeated_exec_options() {
         let args = vec!["--exec".into(), "[]".into(), "--exec".into(), "[]".into()];
         assert_eq!(option_values(&args, "--exec"), vec!["[]", "[]"]);
+    }
+
+    #[test]
+    fn parses_ttt_exec_commands_and_preserves_quoted_semicolons() {
+        let type_action = parse_exec_command("type ihello").expect("type command");
+        assert_eq!(type_action["action"], "type-keys");
+        assert_eq!(type_action["text"], "ihello");
+        let wait_action = parse_exec_command("wait 250").expect("wait command");
+        assert_eq!(wait_action["ms"], 250);
+        let wait_for_action =
+            parse_exec_command("wait-for \"Vim Mode\" timeout=1200").expect("wait-for");
+        assert_eq!(wait_for_action["action"], "wait-for-text");
+        assert_eq!(wait_for_action["text"], "Vim Mode");
+        assert_eq!(wait_for_action["ms"], 1200);
+        let type_commands = split_exec_scripts("type \"a;b\"; quit", None);
+        assert_eq!(type_commands, vec!["type \"a;b\"", " quit"]);
+        assert_eq!(split_exec_scripts("type a;b", Some("|")), vec!["type a;b"]);
     }
 
     #[cfg(unix)]

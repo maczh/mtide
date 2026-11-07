@@ -370,6 +370,10 @@ fn fs_scope_roots(
             workspace_root.map(Path::to_path_buf)
         } else if scope == "{config}" {
             settings_path.and_then(Path::parent).map(Path::to_path_buf)
+        } else if let Some(relative) = scope.strip_prefix("{config}/") {
+            settings_path
+                .and_then(Path::parent)
+                .map(|directory| directory.join(relative))
         } else if let Some(relative) = scope.strip_prefix("~/") {
             std::env::var_os("HOME").map(|home| PathBuf::from(home).join(relative))
         } else if scope.starts_with('/') {
@@ -386,17 +390,17 @@ fn fs_scope_roots(
     roots
 }
 
-fn resolve_fs_path(package_root: &Path, value: &str) -> PathBuf {
+fn resolve_fs_path(package_root: &Path, config_root: &Path, value: &str) -> PathBuf {
     if let Some(relative) = value.strip_prefix("~/") {
         if let Some(home) = std::env::var_os("HOME") {
             return PathBuf::from(home).join(relative);
         }
     }
     if value == "{config}" {
-        return package_root.to_path_buf();
+        return config_root.to_path_buf();
     }
     if let Some(relative) = value.strip_prefix("{config}/") {
-        return package_root.join(relative);
+        return config_root.join(relative);
     }
     let path = Path::new(value);
     if path.is_absolute() {
@@ -552,6 +556,7 @@ pub enum PluginPanelLocation {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PluginPanelRequest {
+    ReloadTheme,
     Show {
         location: PluginPanelLocation,
         focus: bool,
@@ -625,6 +630,8 @@ pub enum PluginPanelRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PluginEditorRequest {
+    Undo,
+    Redo,
     BeginUndoGroup,
     EndUndoGroup,
     Insert {
@@ -1729,6 +1736,29 @@ impl Manifest {
 }
 
 impl PluginPackage {
+    pub fn load_argument(path: impl AsRef<Path>) -> AppResult<Self> {
+        let path = path.as_ref();
+        if path.is_dir() {
+            return Self::load(path);
+        }
+
+        let root = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let mut package = Self::load(root)?;
+        let entry = path
+            .file_name()
+            .ok_or_else(|| plugin_error("plugin entry path has no file name"))?;
+        let entry = entry
+            .to_str()
+            .ok_or_else(|| plugin_error("plugin entry path is not valid UTF-8"))?
+            .to_owned();
+        package.manifest.entry = Some(entry);
+        package.manifest.validate(&package.root)?;
+        Ok(package)
+    }
+
     pub fn load(root: impl AsRef<Path>) -> AppResult<Self> {
         let root = root.as_ref().to_path_buf();
         let manifest_path = root.join("plugin.ttt.json");
@@ -1853,6 +1883,10 @@ impl PluginRuntime {
             .entry_path()
             .ok_or_else(|| plugin_error("plugin has no Lua entry"))?;
         let source = fs::read_to_string(&entry)?;
+        let plugin_config_root = settings_path(settings_override)
+            .ok()
+            .and_then(|path| path.parent().map(Path::to_path_buf))
+            .unwrap_or_else(|| package.root.clone());
         let lua = Lua::new();
         configure_lua_sandbox(&lua).map_err(lua_error)?;
         let registration = Rc::new(RefCell::new(PluginRegistration::default()));
@@ -2304,6 +2338,14 @@ impl PluginRuntime {
             .map_err(lua_error)?;
 
         let command_sink = Rc::clone(&command_callbacks);
+        let command_editor_requests = Rc::clone(&editor_requests);
+        let command_host_requests = Rc::clone(&panel_requests);
+        let command_can_edit = package
+            .manifest
+            .permissions
+            .get("editor.write")
+            .copied()
+            .unwrap_or(false);
         let command_can_execute = package
             .manifest
             .permissions
@@ -2316,6 +2358,25 @@ impl PluginRuntime {
                 lua.create_function(move |lua, id: String| {
                     if !command_can_execute {
                         return Err(mlua::Error::external("permission denied: commands"));
+                    }
+                    if matches!(id.as_str(), "editor.undo" | "editor.redo") {
+                        if !command_can_edit {
+                            return Err(mlua::Error::external("permission denied: editor.write"));
+                        }
+                        command_editor_requests
+                            .borrow_mut()
+                            .push(if id == "editor.undo" {
+                                PluginEditorRequest::Undo
+                            } else {
+                                PluginEditorRequest::Redo
+                            });
+                        return Ok(true);
+                    }
+                    if id == "settings.reload" {
+                        command_host_requests
+                            .borrow_mut()
+                            .push(PluginPanelRequest::ReloadTheme);
+                        return Ok(true);
                     }
                     let callback = {
                         let callbacks = command_sink.borrow();
@@ -3206,6 +3267,7 @@ impl PluginRuntime {
             settings_override,
         )));
         let snapshot_root = package.root.clone();
+        let snapshot_config_root = plugin_config_root.clone();
         let screenshot_write_roots = snapshot_write_roots.clone();
         module
             .set(
@@ -3221,7 +3283,7 @@ impl PluginRuntime {
                     if !can_snapshot_write {
                         return Err(mlua::Error::external("permission denied: fs.write"));
                     }
-                    let path = resolve_fs_path(&snapshot_root, &path);
+                    let path = resolve_fs_path(&snapshot_root, &snapshot_config_root, &path);
                     if !fs_path_allowed(&path, &screenshot_write_roots.borrow()) {
                         return Err(mlua::Error::external(
                             "screenshot path is outside fs.write scope",
@@ -3236,6 +3298,7 @@ impl PluginRuntime {
         let debug_snapshot = Rc::clone(&editor_snapshot);
         let debug_write_roots = Rc::clone(&snapshot_write_roots);
         let debug_root = package.root.clone();
+        let debug_config_root = plugin_config_root.clone();
         let can_debug = can_screen_read
             && package
                 .manifest
@@ -3275,7 +3338,7 @@ impl PluginRuntime {
                     if !can_snapshot_write {
                         return Err(mlua::Error::external("permission denied: fs.write"));
                     }
-                    let path = resolve_fs_path(&debug_root, &path);
+                    let path = resolve_fs_path(&debug_root, &debug_config_root, &path);
                     if !fs_path_allowed(&path, &debug_write_roots.borrow()) {
                         return Err(mlua::Error::external("debug path is outside fs.write scope"));
                     }
@@ -4286,6 +4349,7 @@ impl PluginRuntime {
             .set(
                 "byte_to_col",
                 lua.create_function(|_, (text, byte_offset): (String, usize)| {
+                    let byte_offset = byte_offset.max(1).saturating_sub(1);
                     Ok(text
                         .char_indices()
                         .take_while(|(offset, _)| *offset < byte_offset)
@@ -4299,13 +4363,10 @@ impl PluginRuntime {
             .set(
                 "col_to_byte",
                 lua.create_function(|_, (text, col): (String, usize)| {
-                    if col <= 1 {
-                        return Ok(0usize);
-                    }
                     Ok(text
                         .char_indices()
-                        .nth(col.saturating_sub(1))
-                        .map_or(text.len(), |(offset, _)| offset))
+                        .nth(col.max(1).saturating_sub(1))
+                        .map_or(text.len() + 1, |(offset, _)| offset + 1))
                 })
                 .map_err(lua_error)?,
             )
@@ -4471,6 +4532,7 @@ impl PluginRuntime {
             .copied()
             .unwrap_or(false);
         let editor_request_sink = Rc::clone(&editor_requests);
+        let editor_shadow = Rc::clone(&editor_snapshot);
         editor_module
             .set(
                 "insert",
@@ -4478,13 +4540,13 @@ impl PluginRuntime {
                     if !editor_write {
                         return Err(mlua::Error::external("permission denied: editor.write"));
                     }
-                    editor_request_sink
-                        .borrow_mut()
-                        .push(PluginEditorRequest::Insert {
-                            line: line.saturating_sub(1),
-                            col: col.saturating_sub(1),
-                            text,
-                        });
+                    let request = PluginEditorRequest::Insert {
+                        line: line.saturating_sub(1),
+                        col: col.saturating_sub(1),
+                        text,
+                    };
+                    editor_request_sink.borrow_mut().push(request.clone());
+                    apply_editor_request_to_snapshot(&mut editor_shadow.borrow_mut(), &request);
                     Ok(true)
                 })
                 .map_err(lua_error)?,
@@ -4497,6 +4559,7 @@ impl PluginRuntime {
             .copied()
             .unwrap_or(false);
         let editor_request_sink = Rc::clone(&editor_requests);
+        let editor_shadow = Rc::clone(&editor_snapshot);
         editor_module
             .set(
                 "set_line",
@@ -4504,12 +4567,12 @@ impl PluginRuntime {
                     if !editor_write {
                         return Err(mlua::Error::external("permission denied: editor.write"));
                     }
-                    editor_request_sink
-                        .borrow_mut()
-                        .push(PluginEditorRequest::SetLine {
-                            line: line.saturating_sub(1),
-                            text,
-                        });
+                    let request = PluginEditorRequest::SetLine {
+                        line: line.saturating_sub(1),
+                        text,
+                    };
+                    editor_request_sink.borrow_mut().push(request.clone());
+                    apply_editor_request_to_snapshot(&mut editor_shadow.borrow_mut(), &request);
                     Ok(true)
                 })
                 .map_err(lua_error)?,
@@ -4522,6 +4585,7 @@ impl PluginRuntime {
             .copied()
             .unwrap_or(false);
         let editor_request_sink = Rc::clone(&editor_requests);
+        let editor_shadow = Rc::clone(&editor_snapshot);
         editor_module
             .set(
                 "replace",
@@ -4537,15 +4601,15 @@ impl PluginRuntime {
                         if !editor_write {
                             return Err(mlua::Error::external("permission denied: editor.write"));
                         }
-                        editor_request_sink
-                            .borrow_mut()
-                            .push(PluginEditorRequest::Replace {
-                                start_line: start_line.saturating_sub(1),
-                                start_col: start_col.saturating_sub(1),
-                                end_line: end_line.saturating_sub(1),
-                                end_col: end_col.saturating_sub(1),
-                                text,
-                            });
+                        let request = PluginEditorRequest::Replace {
+                            start_line: start_line.saturating_sub(1),
+                            start_col: start_col.saturating_sub(1),
+                            end_line: end_line.saturating_sub(1),
+                            end_col: end_col.saturating_sub(1),
+                            text,
+                        };
+                        editor_request_sink.borrow_mut().push(request.clone());
+                        apply_editor_request_to_snapshot(&mut editor_shadow.borrow_mut(), &request);
                         Ok(true)
                     },
                 )
@@ -4559,6 +4623,7 @@ impl PluginRuntime {
             .copied()
             .unwrap_or(false);
         let editor_request_sink = Rc::clone(&editor_requests);
+        let editor_shadow = Rc::clone(&editor_snapshot);
         editor_module
             .set(
                 "set_cursor",
@@ -4566,12 +4631,12 @@ impl PluginRuntime {
                     if !editor_write {
                         return Err(mlua::Error::external("permission denied: editor.write"));
                     }
-                    editor_request_sink
-                        .borrow_mut()
-                        .push(PluginEditorRequest::SetCursor {
-                            line: line.saturating_sub(1),
-                            col: col.saturating_sub(1),
-                        });
+                    let request = PluginEditorRequest::SetCursor {
+                        line: line.saturating_sub(1),
+                        col: col.saturating_sub(1),
+                    };
+                    editor_request_sink.borrow_mut().push(request.clone());
+                    apply_editor_request_to_snapshot(&mut editor_shadow.borrow_mut(), &request);
                     Ok(true)
                 })
                 .map_err(lua_error)?,
@@ -5320,6 +5385,7 @@ impl PluginRuntime {
 
         let fs_module = lua.create_table().map_err(lua_error)?;
         let fs_root = package.root.clone();
+        let fs_config_root = plugin_config_root.clone();
         let workspace_read_scope_enabled = package.fs_read_allow_all
             || package
                 .fs_read_scopes
@@ -5351,6 +5417,7 @@ impl PluginRuntime {
             .copied()
             .unwrap_or(false);
         let read_root = fs_root.clone();
+        let read_config_root = fs_config_root.clone();
         let read_scopes = Rc::clone(&fs_read_roots);
         fs_module
             .set(
@@ -5359,7 +5426,7 @@ impl PluginRuntime {
                     if !can_read {
                         return Err(mlua::Error::external("permission denied: fs.read"));
                     }
-                    let path = resolve_fs_path(&read_root, &relative);
+                    let path = resolve_fs_path(&read_root, &read_config_root, &relative);
                     if !fs_path_allowed(&path, &read_scopes.borrow()) {
                         return Ok((None, Some("access denied".to_owned())));
                     }
@@ -5374,6 +5441,7 @@ impl PluginRuntime {
             )
             .map_err(lua_error)?;
         let exists_root = fs_root.clone();
+        let exists_config_root = fs_config_root.clone();
         let exists_scopes = Rc::clone(&fs_read_roots);
         fs_module
             .set(
@@ -5382,13 +5450,14 @@ impl PluginRuntime {
                     if !can_read {
                         return Err(mlua::Error::external("permission denied: fs.read"));
                     }
-                    let path = resolve_fs_path(&exists_root, &relative);
+                    let path = resolve_fs_path(&exists_root, &exists_config_root, &relative);
                     Ok(fs_path_allowed(&path, &exists_scopes.borrow()) && path.exists())
                 })
                 .map_err(lua_error)?,
             )
             .map_err(lua_error)?;
         let list_root = fs_root.clone();
+        let list_config_root = fs_config_root.clone();
         let list_scopes = Rc::clone(&fs_read_roots);
         fs_module
             .set(
@@ -5398,7 +5467,7 @@ impl PluginRuntime {
                         return Err(mlua::Error::external("permission denied: fs.read"));
                     }
                     let relative = relative.unwrap_or_default();
-                    let path = resolve_fs_path(&list_root, &relative);
+                    let path = resolve_fs_path(&list_root, &list_config_root, &relative);
                     if !fs_path_allowed(&path, &list_scopes.borrow()) {
                         return Ok((None, Some("access denied".to_owned())));
                     }
@@ -5433,6 +5502,8 @@ impl PluginRuntime {
             .copied()
             .unwrap_or(false);
         let write_scopes = Rc::clone(&fs_write_roots);
+        let write_root = fs_root.clone();
+        let write_config_root = fs_config_root.clone();
         fs_module
             .set(
                 "write",
@@ -5440,7 +5511,7 @@ impl PluginRuntime {
                     if !can_write {
                         return Err(mlua::Error::external("permission denied: fs.write"));
                     }
-                    let path = resolve_fs_path(&fs_root, &relative);
+                    let path = resolve_fs_path(&write_root, &write_config_root, &relative);
                     if !fs_path_allowed(&path, &write_scopes.borrow()) {
                         return Ok((None, Some("access denied".to_owned())));
                     }
@@ -9566,6 +9637,80 @@ impl PluginRuntime {
         Ok(true)
     }
 
+    /// Focus or activate the interactive control rendered on a panel row.
+    ///
+    /// Mouse dispatch already has a separate path for row actions. This
+    /// helper covers the controls whose callbacks are otherwise only
+    /// reachable through keyboard focus, so a click on an input, checkbox,
+    /// selector, or button has the same semantics as Tab/Enter navigation.
+    pub fn activate_panel_control_at(&self, id: &str, line: usize) -> AppResult<bool> {
+        if self
+            .panel_inputs
+            .borrow()
+            .get(id)
+            .is_some_and(|state| state.line == line)
+        {
+            return Ok(self.focus_panel_input(id, line));
+        }
+        if self
+            .panel_passwords
+            .borrow()
+            .get(id)
+            .is_some_and(|state| state.line == line)
+        {
+            return Ok(self.focus_panel_password(id, line));
+        }
+        if self
+            .panel_checkboxes
+            .borrow()
+            .get(id)
+            .is_some_and(|state| state.line == line)
+        {
+            return self.activate_panel_checkbox(id, line);
+        }
+        if self
+            .panel_dropdown_lines
+            .borrow()
+            .get(id)
+            .is_some_and(|registered| *registered == line)
+        {
+            return Ok(self.focus_panel_dropdown(id, line));
+        }
+        if self
+            .panel_radio_lines
+            .borrow()
+            .get(id)
+            .is_some_and(|registered| *registered == line)
+        {
+            return Ok(self.focus_panel_radio(id, line));
+        }
+        if self
+            .panel_tabs_lines
+            .borrow()
+            .get(id)
+            .is_some_and(|registered| *registered == line)
+        {
+            return Ok(self.focus_panel_tabs(id, line));
+        }
+        if self
+            .panel_scrollview_lines
+            .borrow()
+            .get(id)
+            .is_some_and(|registered| *registered == line)
+        {
+            return Ok(self.focus_panel_scrollview(id, line));
+        }
+        if self
+            .panel_button_actions
+            .borrow()
+            .get(id)
+            .is_some_and(|actions| actions.iter().any(|(registered, _)| *registered == line))
+        {
+            return self.activate_panel_button(id, line);
+        }
+        Ok(false)
+    }
+
     fn clear_panel_focus(&self, id: &str) {
         if let Some(state) = self.panel_inputs.borrow_mut().get_mut(id) {
             state.focused = false;
@@ -10338,267 +10483,10 @@ impl PluginRuntime {
         self.panel_callbacks
             .borrow_mut()
             .insert(format!("__file:{file_id}"), render_key);
-        let lines = Rc::new(RefCell::new(Vec::<String>::new()));
-        let sink = Rc::clone(&lines);
-        let panel = self._lua.create_table().map_err(lua_error)?;
-        let panel_requests = Rc::clone(&self.panel_requests);
-        panel
-            .set(
-                "redraw",
-                self._lua
-                    .create_function(move |_, _panel: Table| {
-                        panel_requests
-                            .borrow_mut()
-                            .push(PluginPanelRequest::RefreshFileView { id: file_id });
-                        Ok(())
-                    })
-                    .map_err(lua_error)?,
-            )
-            .map_err(lua_error)?;
-        panel
-            .set(
-                "label",
-                self._lua
-                    .create_function(move |lua, (_panel, value): (Table, LuaValue)| {
-                        sink.borrow_mut().push(label_widget_text(lua, &value)?);
-                        Ok(())
-                    })
-                    .map_err(lua_error)?,
-            )
-            .map_err(lua_error)?;
-        panel
-            .set(
-                "text",
-                self._lua
-                    .create_function(|_, (_panel, _value): (Table, String)| Ok(()))
-                    .map_err(lua_error)?,
-            )
-            .map_err(lua_error)?;
-        let markdown_sink = Rc::clone(&lines);
-        panel
-            .set(
-                "markdown",
-                self._lua
-                    .create_function(move |lua, (_panel, value): (Table, Option<LuaValue>)| {
-                        if let Some(value) = value {
-                            markdown_sink
-                                .borrow_mut()
-                                .extend(markdown_widget_lines(lua, value)?);
-                        }
-                        Ok(())
-                    })
-                    .map_err(lua_error)?,
-            )
-            .map_err(lua_error)?;
-        let checkbox_sink = Rc::clone(&lines);
-        panel
-            .set(
-                "checkbox",
-                self._lua
-                    .create_function(move |_lua, (_panel, value): (Table, Option<LuaValue>)| {
-                        if let Some(LuaValue::Table(value)) = value {
-                            checkbox_sink.borrow_mut().push(checkbox_widget_text(value));
-                        }
-                        Ok(())
-                    })
-                    .map_err(lua_error)?,
-            )
-            .map_err(lua_error)?;
-        for (name, table_mode) in [("list", false), ("table", true)] {
-            let sink = Rc::clone(&lines);
-            panel
-                .set(
-                    name,
-                    self._lua
-                        .create_function(move |lua, (_panel, value): (Table, Option<LuaValue>)| {
-                            if let Some(value) = value {
-                                sink.borrow_mut()
-                                    .push(collection_widget_text(lua, value, table_mode));
-                            }
-                            Ok(())
-                        })
-                        .map_err(lua_error)?,
-                )
-                .map_err(lua_error)?;
-        }
-        let pager_sink = Rc::clone(&lines);
-        panel
-            .set(
-                "pager",
-                self._lua
-                    .create_function(move |lua, (_panel, value): (Table, Option<LuaValue>)| {
-                        if let Some(LuaValue::Table(value)) = value {
-                            let page = value.get::<Option<u64>>("page").ok().flatten();
-                            let total = value
-                                .get::<Option<u64>>("pages")
-                                .ok()
-                                .flatten()
-                                .or_else(|| value.get::<Option<u64>>("total").ok().flatten());
-                            if let (Some(page), Some(total)) = (page, total) {
-                                pager_sink.borrow_mut().push(format!("Page {page}/{total}"));
-                            } else {
-                                pager_sink
-                                    .borrow_mut()
-                                    .push(lua_value_text(lua, LuaValue::Table(value)));
-                            }
-                        }
-                        Ok(())
-                    })
-                    .map_err(lua_error)?,
-            )
-            .map_err(lua_error)?;
-        for name in ["tabs", "scrollview"] {
-            let sink = Rc::clone(&lines);
-            panel
-                .set(
-                    name,
-                    self._lua
-                        .create_function(move |lua, (_panel, value): (Table, Option<LuaValue>)| {
-                            if let Some(value) = value {
-                                sink.borrow_mut()
-                                    .push(collection_widget_text(lua, value, false));
-                            }
-                            Ok(())
-                        })
-                        .map_err(lua_error)?,
-                )
-                .map_err(lua_error)?;
-        }
-        let progress_sink = Rc::clone(&lines);
-        let progress_panel_size = Rc::clone(&self.panel_size);
-        panel
-            .set(
-                "progress",
-                self._lua
-                    .create_function(move |lua, (_panel, value): (Table, Option<LuaValue>)| {
-                        if let Some(value) = value {
-                            let width =
-                                usize::from(progress_panel_size.borrow().0.saturating_sub(2))
-                                    .max(1);
-                            progress_sink
-                                .borrow_mut()
-                                .push(progress_widget_text(lua, value, width));
-                        }
-                        Ok(())
-                    })
-                    .map_err(lua_error)?,
-            )
-            .map_err(lua_error)?;
-        for name in [
-            "badge",
-            "border",
-            "box",
-            "dialog",
-            "hstack",
-            "raw",
-            "row_action",
-            "title",
-            "vstack",
-        ] {
-            let sink = Rc::clone(&lines);
-            let is_title = name == "title";
-            let title_menus = Rc::clone(&self.panel_title_menus);
-            let title_callbacks = Rc::clone(&self.panel_title_callbacks);
-            let title_panel_id = format!("__file:{file_id}");
-            panel
-                .set(
-                    name,
-                    self._lua
-                        .create_function(
-                            move |lua, (panel, values): (Table, Variadic<LuaValue>)| {
-                                if is_title && values.len() == 1 {
-                                    if let Some(LuaValue::Table(value)) = values.first() {
-                                        let entries = panel_menu_entries(lua, value, "menu")?;
-                                        if entries.is_empty() {
-                                            title_menus.borrow_mut().remove(&title_panel_id);
-                                        } else {
-                                            title_menus
-                                                .borrow_mut()
-                                                .insert(title_panel_id.clone(), entries);
-                                        }
-                                        if let Some(callback) =
-                                            value.get::<Option<Function>>("on_menu")?
-                                        {
-                                            let key = lua.create_registry_value(callback)?;
-                                            if let Some(previous) = title_callbacks
-                                                .borrow_mut()
-                                                .insert(title_panel_id.clone(), key)
-                                            {
-                                                let _ = lua.remove_registry_value(previous);
-                                            }
-                                        }
-                                        sink.borrow_mut().push(title_widget_text(lua, value)?);
-                                        return Ok(());
-                                    }
-                                }
-                                if !values.is_empty() {
-                                    let mut rendered_children = false;
-                                    if let Some(LuaValue::Table(value)) = values.first() {
-                                        if let Some(render) =
-                                            value.get::<Option<Function>>("render")?
-                                        {
-                                            render.call::<()>(panel.clone())?;
-                                            rendered_children = true;
-                                        }
-                                    }
-                                    if !rendered_children {
-                                        sink.borrow_mut().push(
-                                            values
-                                                .into_iter()
-                                                .map(|value| lua_value_text(lua, value))
-                                                .collect::<Vec<_>>()
-                                                .join(" "),
-                                        );
-                                    }
-                                }
-                                Ok(())
-                            },
-                        )
-                        .map_err(lua_error)?,
-                )
-                .map_err(lua_error)?;
-        }
-        let password_sink = Rc::clone(&lines);
-        panel
-            .set(
-                "password",
-                self._lua
-                    .create_function(move |lua, (_panel, value): (Table, Option<LuaValue>)| {
-                        if let Some(value) = value {
-                            password_sink
-                                .borrow_mut()
-                                .push(password_widget_text(lua, value));
-                        }
-                        Ok(())
-                    })
-                    .map_err(lua_error)?,
-            )
-            .map_err(lua_error)?;
-        let dropdown_sink = Rc::clone(&lines);
-        panel
-            .set(
-                "dropdown",
-                self._lua
-                    .create_function(move |lua, (_panel, value): (Table, Option<Table>)| {
-                        if let Some(value) = value {
-                            dropdown_sink
-                                .borrow_mut()
-                                .push(dropdown_widget_text(lua, value));
-                        }
-                        Ok(())
-                    })
-                    .map_err(lua_error)?,
-            )
-            .map_err(lua_error)?;
-        let rendered = render.call::<LuaValue>(panel).map_err(lua_error)?;
-        if let LuaValue::String(text) = rendered {
-            lines.borrow_mut().push(
-                text.to_str()
-                    .map_or_else(|_| String::new(), |text| text.to_owned()),
-            );
-        }
-        let text = lines.borrow().join("\n");
-        Ok(Some(text))
+        // File views use the same full panel proxy as registered panels and
+        // custom tabs. This keeps widget state, mouse hit testing, and
+        // redraw semantics identical across all plugin-owned views.
+        self.render_panel(&format!("__file:{file_id}"))
     }
 
     pub fn take_file_close_id(&self) -> Option<u64> {
@@ -12576,7 +12464,43 @@ fn label_widget_text(lua: &Lua, value: &LuaValue) -> mlua::Result<String> {
         .get::<Option<LuaValue>>("badge")?
         .map(|badge| lua_value_text(lua, badge))
         .filter(|badge| !badge.is_empty());
-    Ok(badge.map_or(text.clone(), |badge| format!("{text}  {badge}")))
+    let label = match badge {
+        Some(badge) => format!("{text}  {badge}"),
+        None => text,
+    };
+    let padding_left = value
+        .get::<Option<LuaValue>>("padding_left")?
+        .as_ref()
+        .and_then(|value| lua_value_usize(Some(value)))
+        .unwrap_or(0)
+        .min(256);
+    let padding_right = value
+        .get::<Option<LuaValue>>("padding_right")?
+        .as_ref()
+        .and_then(|value| lua_value_usize(Some(value)))
+        .unwrap_or(0)
+        .min(256);
+    let margin_top = value
+        .get::<Option<LuaValue>>("margin_top")?
+        .as_ref()
+        .and_then(|value| lua_value_usize(Some(value)))
+        .unwrap_or(0)
+        .min(256);
+    let margin_bottom = value
+        .get::<Option<LuaValue>>("margin_bottom")?
+        .as_ref()
+        .and_then(|value| lua_value_usize(Some(value)))
+        .unwrap_or(0)
+        .min(256);
+    let mut lines = Vec::with_capacity(margin_top + margin_bottom + 1);
+    lines.extend(std::iter::repeat_n(String::new(), margin_top));
+    lines.push(format!(
+        "{}{label}{}",
+        " ".repeat(padding_left),
+        " ".repeat(padding_right)
+    ));
+    lines.extend(std::iter::repeat_n(String::new(), margin_bottom));
+    Ok(lines.join("\n"))
 }
 
 fn title_widget_text(lua: &Lua, value: &Table) -> mlua::Result<String> {
@@ -12657,6 +12581,7 @@ fn markdown_inline_spans(line: &str) -> Vec<(String, String)> {
     spans
 }
 
+#[cfg(test)]
 fn password_widget_text(lua: &Lua, value: LuaValue) -> String {
     let (text, placeholder) = match &value {
         LuaValue::Table(table) => (
@@ -12772,6 +12697,7 @@ fn pager_widget_text(
     format!("Page {page}/{pages}")
 }
 
+#[cfg(test)]
 fn checkbox_widget_text(table: Table) -> String {
     let checked = table
         .get::<Option<bool>>("checked")
@@ -13682,9 +13608,124 @@ fn ensure_inside(root: &Path, relative: &str) -> AppResult<()> {
     Ok(())
 }
 
+fn apply_editor_request_to_snapshot(
+    snapshot: &mut PluginEditorSnapshot,
+    request: &PluginEditorRequest,
+) {
+    if snapshot.lines.is_empty() {
+        snapshot.lines.push(String::new());
+    }
+    match request {
+        PluginEditorRequest::SetLine { line, text } => {
+            if let Some(current) = snapshot.lines.get_mut(*line) {
+                *current = text.clone();
+            }
+        }
+        PluginEditorRequest::SetCursor { line, col } => {
+            let line = (*line).min(snapshot.lines.len().saturating_sub(1));
+            snapshot.cursor_line = line;
+            snapshot.cursor_col = (*col).min(snapshot.lines[line].chars().count());
+        }
+        PluginEditorRequest::Insert { line, col, text } => {
+            let line = (*line).min(snapshot.lines.len().saturating_sub(1));
+            let col = (*col).min(snapshot.lines[line].chars().count());
+            replace_snapshot_range(snapshot, line, col, line, col, text);
+        }
+        PluginEditorRequest::Replace {
+            start_line,
+            start_col,
+            end_line,
+            end_col,
+            text,
+        } => {
+            let start_line = (*start_line).min(snapshot.lines.len().saturating_sub(1));
+            let end_line = (*end_line).min(snapshot.lines.len().saturating_sub(1));
+            let start_col = (*start_col).min(snapshot.lines[start_line].chars().count());
+            let end_col = (*end_col).min(snapshot.lines[end_line].chars().count());
+            replace_snapshot_range(snapshot, start_line, start_col, end_line, end_col, text);
+        }
+        _ => {}
+    }
+}
+
+fn replace_snapshot_range(
+    snapshot: &mut PluginEditorSnapshot,
+    start_line: usize,
+    start_col: usize,
+    end_line: usize,
+    end_col: usize,
+    text: &str,
+) {
+    let offset = |line: usize, column: usize| {
+        snapshot
+            .lines
+            .iter()
+            .take(line)
+            .map(|line| line.chars().count() + 1)
+            .sum::<usize>()
+            .saturating_add(column)
+    };
+    let source = snapshot.lines.join("\n");
+    let mut characters: Vec<char> = source.chars().collect();
+    let start = offset(start_line, start_col).min(characters.len());
+    let end = offset(end_line, end_col).min(characters.len()).max(start);
+    let replacement: Vec<char> = text.chars().collect();
+    characters.splice(start..end, replacement.iter().copied());
+    snapshot.lines = characters
+        .iter()
+        .collect::<String>()
+        .split('\n')
+        .map(str::to_owned)
+        .collect();
+    let inserted_lines: Vec<&str> = text.split('\n').collect();
+    snapshot.cursor_line = start_line + inserted_lines.len().saturating_sub(1);
+    snapshot.cursor_col = if inserted_lines.len() > 1 {
+        inserted_lines.last().map_or(0, |line| line.chars().count())
+    } else {
+        start_col.saturating_add(
+            inserted_lines
+                .first()
+                .map_or(0, |line| line.chars().count()),
+        )
+    };
+    snapshot.cursor_line = snapshot
+        .cursor_line
+        .min(snapshot.lines.len().saturating_sub(1));
+    snapshot.cursor_col = snapshot
+        .cursor_col
+        .min(snapshot.lines[snapshot.cursor_line].chars().count());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queued_editor_writes_are_visible_to_later_plugin_reads() {
+        let mut snapshot = PluginEditorSnapshot {
+            lines: vec!["a你b".to_owned(), "tail".to_owned()],
+            ..PluginEditorSnapshot::default()
+        };
+        let first = PluginEditorRequest::Replace {
+            start_line: 0,
+            start_col: 3,
+            end_line: 1,
+            end_col: 0,
+            text: " ".to_owned(),
+        };
+        apply_editor_request_to_snapshot(&mut snapshot, &first);
+        assert_eq!(snapshot.lines, ["a你b tail"]);
+
+        let next = PluginEditorRequest::Replace {
+            start_line: 0,
+            start_col: 4,
+            end_line: 0,
+            end_col: 8,
+            text: "done".to_owned(),
+        };
+        apply_editor_request_to_snapshot(&mut snapshot, &next);
+        assert_eq!(snapshot.lines, ["a你b done"]);
+    }
 
     #[test]
     fn line_diff_preserves_context_and_order() {
@@ -13713,6 +13754,76 @@ mod tests {
         assert!(m.permissions["panel.sidebar"]);
         assert!(m.permissions["system.exec"]);
         assert!(m.permissions["fs.read"]);
+    }
+
+    #[test]
+    fn plugin_argument_accepts_entry_file_and_package_directory() {
+        let root = std::env::temp_dir().join(format!("mtide-plugin-entry-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("plugin directory");
+        std::fs::write(
+            root.join("plugin.ttt.json"),
+            r#"{"name":"entry-file","entry":"init.lua","api":2}"#,
+        )
+        .expect("manifest");
+        std::fs::write(root.join("init.lua"), "ttt.register({})").expect("entry file");
+
+        let from_directory = PluginPackage::load_argument(&root).expect("directory argument");
+        let from_file =
+            PluginPackage::load_argument(root.join("init.lua")).expect("entry file argument");
+        assert_eq!(from_directory.entry_path(), from_file.entry_path());
+        assert_eq!(from_file.manifest.name, "entry-file");
+
+        std::fs::remove_dir_all(root).expect("cleanup plugin fixture");
+    }
+
+    #[test]
+    fn plugin_commands_can_queue_editor_undo_and_redo() {
+        let root =
+            std::env::temp_dir().join(format!("mtide-plugin-undo-command-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("plugin directory");
+        std::fs::write(
+            root.join("plugin.ttt.json"),
+            r#"{"name":"undo-command","entry":"init.lua","api":2,"permissions":{"commands":true,"editor.write":true}}"#,
+        )
+        .expect("manifest");
+        std::fs::write(
+            root.join("init.lua"),
+            "local ttt=require('ttt'); assert(ttt.exec_command('editor.undo')); assert(ttt.exec_command('editor.redo'))",
+        )
+        .expect("entry file");
+        let package = PluginPackage::load(&root).expect("package");
+        let runtime = PluginRuntime::load(&package).expect("runtime");
+        assert_eq!(
+            runtime.drain_editor_requests(),
+            vec![PluginEditorRequest::Undo, PluginEditorRequest::Redo]
+        );
+        std::fs::remove_dir_all(root).expect("cleanup plugin fixture");
+    }
+
+    #[test]
+    fn plugin_settings_reload_command_requests_host_theme_reload() {
+        let root = std::env::temp_dir().join(format!(
+            "mtide-plugin-settings-reload-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("plugin directory");
+        std::fs::write(
+            root.join("plugin.ttt.json"),
+            r#"{"name":"settings-reload","entry":"init.lua","api":2,"permissions":{"commands":true}}"#,
+        )
+        .expect("manifest");
+        std::fs::write(
+            root.join("init.lua"),
+            "local ttt=require('ttt'); assert(ttt.exec_command('settings.reload'))",
+        )
+        .expect("entry file");
+        let package = PluginPackage::load(&root).expect("package");
+        let runtime = PluginRuntime::load(&package).expect("runtime");
+        assert_eq!(
+            runtime.drain_panel_requests(),
+            vec![PluginPanelRequest::ReloadTheme]
+        );
+        std::fs::remove_dir_all(root).expect("cleanup plugin fixture");
     }
 
     #[test]
@@ -13969,8 +14080,8 @@ ttt.on("probe", function()
   assert(ttt.debug():find("demo.rs", 1, true) ~= nil)
   assert(ttt.screenshot("screen.txt") == true)
   assert(ttt.debug("debug.json") == true)
-  assert(editor.byte_to_col("你a", 3) == 2)
-  assert(editor.col_to_byte("你a", 2) == 3)
+  assert(editor.byte_to_col("你a", 4) == 2)
+  assert(editor.col_to_byte("你a", 2) == 4)
   assert(editor.viewport().top_line == 1)
   assert(editor.viewport().bottom_line == 2 and editor.viewport().height == 2)
   assert(editor.scroll_to(2) == true)
@@ -14845,9 +14956,13 @@ run("latest")
         let table = lua.create_table().expect("table");
         table.set("text", "Containers").expect("text");
         table.set("badge", 3).expect("badge");
+        table.set("padding_left", 1).expect("left padding");
+        table.set("padding_right", 2).expect("right padding");
+        table.set("margin_top", 1).expect("top margin");
+        table.set("margin_bottom", 1).expect("bottom margin");
         assert_eq!(
             label_widget_text(&lua, &LuaValue::Table(table)).expect("table label"),
-            "Containers  3"
+            "\n Containers  3  \n"
         );
         let title = lua.create_table().expect("title");
         title.set("text", "CONTAINERS").expect("title text");
@@ -15920,6 +16035,49 @@ end}})
     }
 
     #[test]
+    fn regular_panel_mouse_click_focuses_and_activates_controls() {
+        let root =
+            std::env::temp_dir().join(format!("mtide-panel-mouse-controls-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("directory");
+        fs::write(
+            root.join("plugin.ttt.json"),
+            r#"{"name":"panel-mouse-controls","entry":"init.lua","api":2,"permissions":{"panel.sidebar":true}}"#,
+        )
+        .expect("manifest");
+        fs::write(
+            root.join("init.lua"),
+            r#"local ttt = require("ttt")
+ttt.register({sidebar = {id = "mouse", render = function(panel)
+  panel:input({value = "value"})
+  panel:checkbox({label = "Ready", checked = false, on_change = function(value) ttt.log(tostring(value)) end})
+  panel:button({label = "Run", on_click = function() ttt.log("clicked") end})
+end}})
+"#,
+        )
+        .expect("entry");
+        let package = PluginPackage::load(&root).expect("package");
+        let runtime = PluginRuntime::load(&package).expect("runtime");
+        runtime.render_panel("mouse").expect("render");
+
+        assert!(runtime
+            .activate_panel_control_at("mouse", 0)
+            .expect("input click"));
+        assert!(runtime
+            .panel_input_key("mouse", "Char", Some('!'), "")
+            .expect("input key"));
+        assert!(runtime
+            .activate_panel_control_at("mouse", 1)
+            .expect("checkbox click"));
+        assert!(runtime
+            .activate_panel_control_at("mouse", 2)
+            .expect("button click"));
+        assert!(runtime.logs().iter().any(|line| line == "[info] true"));
+        assert!(runtime.logs().iter().any(|line| line == "[info] clicked"));
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
     fn list_row_action_click_dispatches_command() {
         let root = std::env::temp_dir().join(format!("mtide-row-action-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
@@ -16224,6 +16382,59 @@ end})
             .emit_tab_key_event("events", "x", Some('x'), "")
             .expect("closed event"));
         assert!(!runtime.close_tab("events").expect("close missing"));
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn custom_tab_and_file_view_mouse_controls_use_panel_widget_dispatch() {
+        let root =
+            std::env::temp_dir().join(format!("mtide-view-mouse-controls-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("directory");
+        fs::write(
+            root.join("plugin.ttt.json"),
+            r#"{"name":"view-mouse-controls","entry":"init.lua","api":2,"permissions":{"panel.editor":true,"editor.file_handlers":true}}"#,
+        )
+        .expect("manifest");
+        fs::write(
+            root.join("init.lua"),
+            r#"local ttt = require("ttt")
+ttt.open_tab({id = "custom", title = "Custom", render = function(panel)
+  panel:button({label = "Tab", on_click = function() ttt.log("tab-click") end})
+end})
+ttt.register({file_handlers = {{id = "view.file", extensions = {"vwm"}, open = function(_path, tab)
+  tab.render = function(panel)
+    panel:button({label = "File", on_click = function() ttt.log("file-click") end})
+  end
+end}}})
+"#,
+        )
+        .expect("entry");
+        let package = PluginPackage::load(&root).expect("package");
+        let runtime = PluginRuntime::load(&package).expect("runtime");
+        assert_eq!(
+            runtime.render_panel("__tab:custom").expect("tab render"),
+            Some("[ Tab ]".into())
+        );
+        assert!(runtime
+            .activate_panel_control_at("__tab:custom", 0)
+            .expect("tab click"));
+
+        let file = root.join("sample.vwm");
+        fs::write(&file, "content").expect("file");
+        assert_eq!(
+            runtime.open_file(&file).expect("file open"),
+            Some("[ File ]".into())
+        );
+        let file_id = runtime.take_file_close_id().expect("file id");
+        assert!(runtime
+            .activate_panel_control_at(&format!("__file:{file_id}"), 0)
+            .expect("file click"));
+        assert!(runtime.logs().iter().any(|line| line == "[info] tab-click"));
+        assert!(runtime
+            .logs()
+            .iter()
+            .any(|line| line == "[info] file-click"));
         fs::remove_dir_all(root).expect("cleanup");
     }
 
@@ -17036,6 +17247,43 @@ end}}})"#,
         fs::remove_dir_all(root).expect("cleanup");
     }
 
+    #[test]
+    fn plugin_config_scope_writes_to_config_directory_not_package_directory() {
+        let root =
+            std::env::temp_dir().join(format!("mtide-plugin-config-scope-{}", std::process::id()));
+        let config = root.join("config");
+        let package_root = root.join("plugin");
+        fs::create_dir_all(config.join("themes")).expect("config themes");
+        fs::create_dir_all(&package_root).expect("package");
+        let settings_file = config.join("settings.json");
+        fs::write(&settings_file, "{}").expect("settings");
+        fs::write(
+            package_root.join("plugin.ttt.json"),
+            r#"{"name":"config-scope","entry":"init.lua","api":2,"permissions":{"commands":true,"fs.write":["{config}/themes"]}}"#,
+        )
+        .expect("manifest");
+        fs::write(
+            package_root.join("init.lua"),
+            r#"local ttt=require("ttt"); local fs=require("ttt.fs"); ttt.register({commands={{id="write-theme",title="Write",handler=function() assert(fs.write("{config}/themes/omarchy.json", "{}")) end}}})"#,
+        )
+        .expect("entry");
+
+        let package = PluginPackage::load(&package_root).expect("package");
+        let runtime = PluginRuntime::load_with_settings_path_and_workspace(
+            &package,
+            Some(&settings_file),
+            None,
+        )
+        .expect("runtime");
+        assert!(runtime.execute_command("write-theme").expect("command"));
+        assert_eq!(
+            fs::read_to_string(config.join("themes/omarchy.json")).unwrap(),
+            "{}"
+        );
+        assert!(!package_root.join("themes/omarchy.json").exists());
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
     #[cfg(unix)]
     #[test]
     #[ignore = "requires local socket permission; run explicitly in an unrestricted environment"]
@@ -17526,7 +17774,7 @@ ttt.register({sidebar = {title = "Demo", render = function(panel) panel:label("p
         fs::write(&view, b"view").expect("view");
         assert_eq!(
             runtime.open_file(&view).expect("rendered file handler"),
-            Some("file view\n  first\n▶ second\nPage 1/3".into())
+            Some("file view\n  first\n▶ second\n« ‹ 1–1 of 3 › »".into())
         );
         assert_eq!(runtime.logs()[0], "[info] ok\n");
         assert_eq!(runtime.logs()[1], "[info] hello");

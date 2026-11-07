@@ -2,8 +2,19 @@
 
 本文记录代码仓库当前真实状态，和产品需求/迁移计划中的目标状态分开维护。
 
+- 插件兼容验证：上游 `ttt-plugins` 快照中 53 个包可分别及合并加载；上游 `ttt-vim` 编辑行为用例通过 49/50。唯一失败的 `>>`/`<<` 用例源自上游测试辅助函数将以 `<` 开头的字面按键误解析为空特殊键，未实际发送 `<<`。这组验证不代表所有插件交互均已完整兼容。
+- Rust 验证：`cargo fmt --check`、`cargo test`（562 passed、1 ignored）、`cargo clippy --all-targets --all-features -- -D warnings` 与 `cargo build` 均通过。
+- 插件宿主补齐了 `--plugin FILE|DIR`、TTT `--exec` 命令脚本与完整 TUI 截图；插件 `key.press` 可在普通编辑快捷键前消费按键，Escape 事件名称为 `Esc`。插件编辑 API 的字节/列转换采用上游 1-based Lua 字符串偏移，并在一次回调内提供写后即读的编辑器快照；`ttt.exec_command("editor.undo"/"editor.redo")` 已映射到宿主撤销/重做。
+- 上游 Omarchy Theme 插件依赖的 `ttt.exec_command("settings.reload")` 已接入宿主请求队列：从磁盘重读 theme 设置并热加载 `{config}/themes/<name>.json` 或显式 JSON 路径。主题解析兼容 TTT 原生通用颜色字段、终端调色板及 `syntax` lexer 角色色；TextMate `tokenColors` selector 和 grammar 专有角色尚未实现。
+- 编辑器轻量语法着色已从硬编码颜色改为主题 `syntax` 角色：注释、字符串、数字、关键字、函数、类型、变量、常量、内建符号、操作符、标点、标题、链接等均可由 TTT 主题覆盖，未设置时继承当前语义主题色。Find 当前选中命中使用 `editor.searchActive.bg`，其他命中使用 `editor.searchMatch.bg`。
+- 插件文件 API 的 `{config}/...` 路径和 manifest scope 现在均相对于实际配置目录解析；使用上游 Omarchy Theme 插件、隔离配置目录与模拟配色的端到端验证通过，插件生成的主题文件可在运行中立即加载。
+- VT 控制序列解析已限制 CSI 参数长度为 4 KiB、OSC payload 长度为 64 KiB；OSC 只在 BEL 或 ESC-反斜线终止时产生副作用，内部 ESC 不会错误截断，超限 payload 会安全丢弃到终止符。DCS、SOS、PM、APC 字符串控制均会屏蔽至 ST，支持 CAN/SUB 取消，防止控制负载泄漏到终端正文。
+
 - 终端面板已支持非鼠标跟踪模式下的拖拽文本选择、选区反色显示和 `Ctrl-Shift-C` 复制；单击终端 OSC 8 链接仍保持打开链接行为，启用应用鼠标协议时继续将事件原样转发给 PTY。
 - 终端选择坐标已按当前布局同步：底部 Terminal 使用可见三行，全屏 Terminal 使用实际内容高度，复制和选区高亮不会因布局切换错位。
+- 普通终端视图与备用屏幕共用 VT 特殊按键转发：Home/End 按应用光标模式编码，Insert/Delete、Esc、F1–F12 和 Shift-Tab 会发送标准序列；Alt/Ctrl/Shift 组合键使用 xterm modifier 编码。插件社区仓库当前快照的 50 个 Lua 文件通过 `luac -p`，53 个 manifest 可解析，静态调用清单涉及的 `ttt.*` 模块均有预加载实现；语言服务器和外部工具仍需按插件说明安装。
+- Ctrl-hover/Ctrl-click 链接导航已覆盖普通编辑 Buffer、只读 Git/plugin diff tab、Git commit detail，以及 Output 中的 Changes、PR 评论、Git 历史、Blame、插件 Registry 和日志；支持 HTTP(S) 与本地文件引用、源文件相对路径及 `:line[:column]` 定位，文件视图按折行视觉行和 Unicode 显示列命中。悬停阶段只解析链接语法，不访问文件系统；点击阶段再校验并解析文件目标，避免慢文件系统阻塞界面。URL 校验要求有效主机，Windows 使用 `rundll32`，不经过命令 shell；键盘输入或终端失焦时清除链接提示。
+- 普通终端视图与备用屏幕共用 VT 特殊按键转发：Home/End 按应用光标模式编码，Insert/Delete、Esc、F1–F12 和 Shift-Tab 会发送标准序列；Alt/Ctrl/Shift 组合键使用 xterm modifier 编码。插件社区仓库当前快照的 50 个 Lua 文件通过 `luac -p`，53 个 manifest 可解析，静态调用清单涉及的 `ttt.*` 模块均有预加载实现；语言服务器和外部工具仍需按插件说明安装。
 
 ## 已落地
 
@@ -23,6 +34,7 @@
 - 插件 RPC endpoint scope 已接入：`network.rpc=true` 允许全目标，数组声明按 TCP/Unix endpoint 精确匹配，未授权目标在建立连接前拒绝。
 
 - 插件 `radio` widget 已接入统一面板选择状态：支持数字或字符串选中值、方向键导航、`on_change` 回调和单选标记渲染。
+- 插件 `label`/`title` 配置表现已保留 `padding_left`、`padding_right`、`margin_top`、`margin_bottom` 与 badge 布局，并将间距数值限制在 256 以内；兼容社区 Bookmarks、TODO Scanner、Git History、Color Picker 等插件的常用布局参数。
 
 - 插件 `image` widget 已接入；在当前 `graphics.protocol=none` 时以带 alt/src 的文本占位安全降级，避免上游图像插件因未知 widget 失败。
 
@@ -45,9 +57,9 @@
 
 - 插件 `ttt.system` 已接入 `system.exec` 命令 allowlist：`exec`、`exec_async`、`spawn` 共用 manifest 声明的可执行文件范围，未授权命令不会启动。
 
-- Find 面板已支持 Ctrl-Alt-R 切换 smart-case/正则搜索，并在面板中显示当前模式；Search、Include、Exclude 三字段可用 Tab/Shift-Tab 或鼠标点击切换，include/exclude 支持逗号分隔 glob，并实时接入后台 generation/cancellation 搜索链路。
+- Find 面板已支持 Ctrl-Alt-R 切换 smart-case/正则搜索，并在面板中显示当前模式；Search、Include、Exclude 三字段可用 Tab/Shift-Tab 或鼠标点击切换，鼠标按终端显示列定位光标（含宽字符），支持 Unicode 光标编辑、Home/End、Delete 与插入式粘贴，Ctrl-V 始终写入当前字段；Replace 输入也可鼠标聚焦；include/exclude 支持逗号分隔 glob，并实时接入后台 generation/cancellation 搜索链路。
 - Git 的分支名、提交消息、PR 评论和 Explorer 新建/重命名输入统一支持 Unicode 光标编辑、左右移动、Home/End、Backspace/Delete 及 bracketed paste。
-- 编辑区已接入鼠标滚轮 viewport：普通滚轮垂直滚动，Shift+滚轮水平滚动，并对边界进行钳制。
+- 编辑区已接入鼠标滚轮 viewport：普通滚轮垂直滚动，Shift+滚轮水平滚动，并按当前光标行及可视列边界钳制；命令面板提供 Scroll Editor Left/Right，每次滚动 4 个显示列，soft-wrap 开启时清零并忽略水平偏移。
 - 编辑器已在无 .editorconfig 时自动检测前 200 行的缩进风格与步长，并以确定性的最小步长规则处理频率平票。
 - Settings overlay 已增加缩进自动检测和 tabs 手动覆盖选项，状态栏显示当前缩进模式。
 - 缩进自动检测开关已持久化为 editor.autoDetectIndent，重启后继续尊重手动覆盖。
@@ -63,8 +75,8 @@
 - CLI 自动化在无 TTY 的 CI/脚本环境下支持 headless 执行：带 `--exec` 时跳过 raw mode 与备用屏幕，默认使用 80x24 或 `--size` 尺寸，仍执行文件、编辑、截图、debug 和 quit 动作。
 - 键盘导航：Tab/Shift-Tab 焦点循环、面板切换、侧栏/底栏标签切换、退出快捷键。
 - 文本编辑：UTF-8 字符列、插入/换行/删除、上下左右/Home/End、`Ctrl-Alt-M` 嵌套跨行匹配括号跳转、`PageUp/PageDown` 按视口分页移动及 Shift 选区、`Ctrl-Home/End` 文件首尾跳转及 Shift 扩展、`Ctrl-Shift-Left/Right` 按词移动与选区扩展、未按 Shift 时按词移动、`Ctrl-G` 行列定位、`Alt-Backspace`/`Ctrl-Backspace` 与 `Alt-Delete`/`Ctrl-Delete` 按词删除（含跨行边界和单次撤销）、保存规范化、Save As 新路径保存与覆盖保护、自动缩进、选区 Tab/Shift-Tab 批量缩进和反缩进、LSP/外部 formatter format-on-save、语言覆盖、`saveAllOnQuit` 批量保存、撤销/重做、dirty 状态、括号/引号自动闭合和闭合符跳过、基于缩进的代码折叠/全部展开、当前文档 Replace All 单批次撤销、重叠多选区合并、复制行/删除行/按已知语言切换注释（未知语言会明确提示不可用），以及 Shift 选区、支持按光标/选区逐项 spread 的多光标剪贴板、内部剪贴板和受 64 KiB 限制的 OSC52 外部剪贴板；`Alt+Shift+Up/Down` 在无选区时可重复添加上方/下方光标，有选区时继续移动选中行；编辑器支持多标签，每个标签独立保留缓冲区、光标、撤销栈和 dirty 状态。搜索 Replace 模式下按 `Ctrl-Shift-Enter` 可对当前搜索结果覆盖的工作区文件执行全部替换，并遵循与搜索一致的 smart-case 规则；当前打开文件保留内存 dirty/undo 语义，其他文件直接写回磁盘；脏标签检测到磁盘变更后可用 `Ctrl-Alt-R` 显式重载。
-- 工作区：目录浏览、文件打开、Explorer 新建文件/目录、重命名、删除确认和刷新、递归 smart-case 搜索、Unicode 字符列结果、可配置 include/exclude glob、Find 面板运行时编辑三字段过滤、编辑器 `Ctrl-F` 继承单行选区、活动缓冲区未保存编辑后的实时搜索结果、跨根结果循环导航和搜索结果跳转、当前搜索结果跨文件 Replace All、`.ttt` 多根 folder 聚合搜索/Explorer、打开文件磁盘 mtime 轮询与干净标签自动重载、脏标签外部变更保护、Git 分支/status、Branches 侧栏创建/切换/删除分支、unstaged/staged unified diff 读取、保存后状态刷新，以及 Changes 面板整文件/单 hunk/批量 stage/unstage（Space/s/u）、提交消息提交、当前文件 blame、提交历史和后台 fetch/pull/push/sync（pull 后 push）操作；远程结果在主循环回收，认证失败进入内存凭据重试 overlay；Changes 面板按 `d` 可进入可滚动 Output diff 视图，长上下文默认折叠并支持 `Enter`/`e` 局部展开、`c` 全文/变更上下文切换和 `v` unified/split 切换。
-- 终端：portable-pty 多 tab 持久 shell、settings shell/args/scrollback/ctrlV 配置、后台读取、命令提交、方向键、application cursor mode、PageUp/PageDown 与鼠标滚轮 scrollback 浏览、Tab、Ctrl-C/Ctrl-D/Ctrl-L、可选 Ctrl-V 剪贴板写入、resize，以及 VT screen（光标、滚屏、独立 scrollback、宽字符双列占位、组合字符附着、alternate screen、CSI 移动/清屏、SGR 基础颜色/粗体/下划线/反色），并在底栏按 ANSI 样式渲染；Terminal 焦点下支持 `Ctrl-Shift-T` 创建和 `Ctrl-Alt-Left/Right` 切换；解析终端的 1000/1002/1003/1006 鼠标模式，并按 SGR 或 legacy X10 编码转发鼠标事件至 PTY；Alt 字符、Shift-Tab 及带修饰键的光标/分页/功能键使用 xterm CSI modifier 编码。
+- 工作区：目录浏览、文件打开、Explorer 新建文件/目录、重命名、删除确认和刷新、递归 smart-case 搜索、Unicode 字符列结果、可配置 include/exclude glob、Find 面板运行时编辑三字段过滤、编辑器 `Ctrl-F` 按主选区/列选区/次级选区顺序继承第一段非空单行文本、搜索焦点下 `Ctrl-R` 切换 Replace、编辑器焦点下 `Ctrl-R` 打开并聚焦 Replace 输入、活动缓冲区未保存编辑后的实时搜索结果、跨根结果循环导航和搜索结果跳转、当前搜索结果跨文件 Replace All、`.ttt` 多根 folder 聚合搜索/Explorer、打开文件磁盘 mtime 轮询与干净标签自动重载、脏标签外部变更保护、Git 分支/status、Branches 侧栏创建/切换/删除分支、unstaged/staged unified diff 读取、保存后状态刷新，以及多根目录 Changes 文件树、目录级批量 stage/unstage/toggle、整文件/单 hunk/批量 stage/unstage、提交消息提交、当前文件 blame、提交历史和后台 fetch/pull/push/sync（pull 后 push）操作；远程结果在主循环回收，认证失败进入内存凭据重试 overlay；Changes 面板按 `d` 可进入可滚动 Output diff 视图，长上下文默认折叠并支持 `Enter`/`e` 局部展开、`c` 全文/变更上下文切换和 `v` unified/split 切换；全局 `editor.diffWordWrap`/`editor.diffHighContrast` 设置作用于 Changes、提交详情与 PR diff，并可从设置面板或命令面板切换。
+- 终端：portable-pty 多 tab 持久 shell、settings shell/args/scrollback/ctrlV 配置、后台读取、命令提交、方向键、application cursor mode、PageUp/PageDown 与鼠标滚轮 scrollback 浏览、Tab、Ctrl-C/Ctrl-D/Ctrl-L、可选 Ctrl-V 剪贴板写入、resize，以及 VT screen（光标、滚屏、独立 scrollback、宽字符双列占位、组合字符附着、alternate screen、CSI 移动/清屏、SGR 基础颜色/粗体/下划线/反色），并在底栏按 ANSI 样式渲染；Terminal 焦点下支持 `Ctrl-Shift-T` 创建和 `Ctrl-Alt-Left/Right` 切换；解析终端的 X10(9)、1000/1002/1003/1006 鼠标模式，并按 SGR、UTF-8 或 legacy X10 编码转发鼠标事件至 PTY；X10 跟踪只上报按下事件，切换/关闭模式时不会误清除当前生效的其他跟踪模式；Alt 字符、Shift-Tab 及带修饰键的光标/分页/功能键使用 xterm CSI modifier 编码。
 - VT `CSI ! p` soft reset 已补齐：保留屏幕内容，同时清理属性、鼠标跟踪/编码、焦点上报、滚动区域、保存光标和自定义 Tab stop，避免全屏程序复位后把宿主终端模式带入下一会话。
 - VT DECRQM 批量查询已补齐：`CSI ?mode;mode...$p` 会按请求顺序逐项返回 `DECRPM` 状态，不再只响应第一个模式。
 - LSP：配置模型、按语言选择 server、后台 stdio JSON-RPC reader、request/response 匹配、initialize、initialized、didOpen、按 URI 递增版本的 full didChange、统一 manager 关闭时的 shutdown/exit 与子进程回收、事件循环轮询，以及 publishDiagnostics 状态解析和编辑器行号标记、UTF-16 code unit 列与编辑器字符列双向转换、completion/hover/signatureHelp/definition、workspace edit Rename、formatting 和首个 Code Action。
@@ -78,7 +90,7 @@
 - 插件标准进程入口：`system.spawn(binary, options)` 已兼容标准二参数签名，支持 `args`/`cwd`/`env`/标准流回调，并保留旧 options-only 写法。
 - 网络权限边界：`network.http` 的空数组、显式 host allowlist 和 `true` 全放行三种状态已区分，同步、异步及重定向请求统一执行目标校验。
 - 插件生命周期：已支持注册与显式执行 `ttt.on_uninstall` 清理钩子，并与已有一次性 `ttt.on_install` hook 一样在执行后清理 Lua registry 资源。
-- 设置 UI：命令面板中的 `Open Settings` 可打开键盘导航的设置覆盖层，支持即时切换侧栏、底部面板、Agent、软换行、保存格式化、退出批量保存、自动保存及 1/5/10/30 秒延迟、终端 Ctrl-V、LSP、缩进自动检测、tabs 覆盖和 2/4/8 缩进步长；可用 `Ctrl-S` 将当前设置持久化到 settings 文件，状态栏同步显示当前缩进模式。
+- 设置 UI：命令面板中的 `Open Settings` 可打开键盘导航的设置覆盖层，支持即时切换侧栏、底部面板、Agent、软换行、保存格式化、退出批量保存、自动保存及 1/5/10/30 秒延迟、终端 Ctrl-V、LSP、缩进自动检测、tabs 覆盖、2/4/8 缩进步长和选区反色；长列表会跟随当前选择滚动，可用 `Ctrl-S` 将当前设置持久化到 settings 文件，状态栏同步显示当前缩进模式。
 - 插件 `editor.change`/`cursor.change` 事件在保持旧参数顺序的基础上追加选区起止 1-based 行列与 `current_word`；无选区坐标为 `0`，Unicode 单词边界由 Host 统一计算，便于 TTT 插件直接实现上下文提示和重构入口。
 - `ttt.editor.current_word()` 已复用 Host 的 Unicode 单词边界规则，插件可直接读取光标所在单词而无需自行转换 rune 列。
 - CLI：支持 `--help`、`--version/-v`、文件/目录位置参数、`file:line:column` 定位、`.ttt` 多根工作区解析、`--config FILE`、可重复的 `--plugin DIR`、`--listen`、`--new-window`、`--welcome` 和标准输入目标；无目标时自动检测 pipe/regular file，显式 `-` 可强制读取，标准输入均在进入 raw mode 前读入并作为未保存 tab 打开；显式文件不可读或 `.ttt` 工作区解析失败时回退欢迎缓冲区/当前目录并在状态栏保留错误，编辑器支持 `Ctrl-O` Open File 路径弹层。
@@ -87,7 +99,13 @@
 
 以下能力已经在需求文档中定义，但尚未达到完整产品级实现：
 
-- 轻量高亮已增加 Markdown 标题/列表/fenced code、JSON/TOML 对象键与 Rust/C 风格单行块注释的上下文颜色，并在跨行块注释、字符串和 Markdown fenced code 间保持状态；搜索、诊断、选区和链接高亮仍在后续阶段叠加。
+补充实现：编辑器正文选区已按 rune 列精确渲染，覆盖跨行、多光标和列选区，并与 Unicode/宽字符定位保持一致。
+
+补充实现：LSP 与插件诊断的正文下划线现在按诊断 range 精确渲染，LSP UTF-16 列会转换为编辑器 rune 列，多行诊断按起止行分别裁剪。
+
+补充实现：LSP `publishDiagnostics` 省略 `severity` 时按信息级别保留并显示，不再因字段缺失而丢失诊断。
+
+- 轻量高亮已增加 Markdown 标题/列表/fenced code、JSON/TOML 对象键、C/C++ 头文件关键字与预处理指令，以及 Rust/C 风格单行块注释的上下文颜色，并在跨行块注释、字符串和 Markdown fenced code 间保持状态；搜索、诊断、选区和链接高亮仍在后续阶段叠加。
 
 - 编辑器多标签、标签切换和未保存关闭保护已接入；每个 tab 可用 `Ctrl-Alt-L` 单独循环语言覆盖，覆盖会保存到工作区 `.mtide/language-overrides.json` 并在重启/重新打开时恢复，立即驱动状态栏、注释、语法着色和 LSP server 选择；已支持关闭 soft-wrap 时的水平视口和光标可见性、按终端列宽计算的 `editor.wordWrap`/`editor.wordWrapMaxColumn` 软换行，以及软换行开启时按屏幕行移动 Up/Down（含宽字符列位置保持）；还支持常见语言轻量语法着色、Markdown `<details>` 区块折叠（忽略行内代码和 fenced code 中的字面量标签）、鼠标点击/拖动选择、`Alt+Shift` 矩形/列选区、`Ctrl-A` 全选、`Ctrl-Alt-N` 选择下一个相同文本、`Alt-Shift-I` 跨行选区拆分为逐行 selections、缩进代码折叠、无选区时 `Alt-Shift-Up/Down` 重复添加上下方光标、有选区时移动选中行、`Ctrl-J` 原子化合并行、`Alt-Shift-S` 排序行和 `Alt-Shift-U/L` 大小写转换，以及 `Alt-Up/Down`/Alt-click 附加光标和多光标字符/换行/退格/删除；编辑器正文中的 HTTP(S) URL 可在 Ctrl-悬停时高亮并在 Ctrl-点击时安全打开，处理 Unicode 列与常见标点边界；列选区已接入复制、剪切、替换和单次撤销，尚无完整格式化和增量语法高亮引擎。
 - 编辑区鼠标滚轮支持普通垂直滚动，并兼容 Shift/Alt+滚轮横向滚动；两种修饰键均按终端事件统一处理并对水平视口做边界钳制。
@@ -99,11 +117,14 @@
 - 插件多行 Input 已兼容 `multiline`/`wrap`/`min_rows`/`max_rows`：Sidebar、Bottom、Drawer 和自定义 Tab 可保留换行文本，按面板 Unicode 列宽显示，Enter 在多行模式插入换行并触发 `on_change`，不会误触发 `on_submit`。
 - 插件 Input/Password 文本编辑已支持 Unicode 光标插入、Left/Right、Home/End、Backspace、Delete 和多行 Enter；Sidebar、Drawer、Dialog 与密码控件共享该光标语义，受控 Input 重新渲染时会安全钳制光标位置。
 - 插件 Markdown 已支持配置表 `wrap_width`，按 Unicode display width 进行稳定的单词换行。
-- 终端已具备 PTY 字节通道、跨读取边界的 UTF-8 解码、ANSI 样式（基础色、亮色、256 色、真彩色、粗体、faint、italic、strikethrough、conceal、blink，RGB 参数安全截断到 0–255）、光标可见性控制（`CSI ?25 h/l` 以反色渲染当前光标单元）、DECSCUSR `CSI Ps SP q` 光标样式状态（块/下划线/竖线）及 alternate-screen/soft-reset 快照语义、DEC bracketed paste 状态跟踪及标准粘贴包装、DEC focus reporting `CSI ?1004 h/l` 与宿主 FocusGained/FocusLost 的 `CSI I`/`CSI O` 通知、alternate screen 下字符/退格/回车/Tab 和 ASCII 控制组合直通 PTY、延迟自动换行（wrap-pending）与禁用自动换行时的宽字符边缘裁剪、宽字符 continuation 元数据及按字符退格/覆盖/清除、`Alt-T` 可逆全屏终端布局、alternate screen（含主屏 links/样式/光标/滚动区域快照恢复）、独立 scrollback、基础鼠标协议转发（SGR/X10/UTF-8 1005）、OSC 8 超链接点击打开（包括 scrollback 浏览中的可视行）、组合字符附着、保存/恢复光标、`CSI r` 局部滚动区域、`CSI L/M/S/T` 区域行编辑与滚动、IND/RI/NEL、CSI Tab/BackTab、DSR `CSI 5 n`/`CSI 6 n` 及私有 `CSI ?6 n` 光标报告、设备属性 `CSI c` 响应、DECRQM `CSI ?Ps $p` 已跟踪模式查询、窗口/屏幕尺寸 `CSI 18 t`/`CSI 19 t` 响应，以及 `CSI J/K/@/P/X/b` 清除、插入、删除和重复字符与元数据同步清理；链接仅允许 `http://`、`https://`，宽字符 continuation 单元清除时会同步清理样式、组合字符和链接元数据；组合字符在退格/光标回退后的附着语义已覆盖，完整终端交互状态仍待实现。
+- 终端已具备 PTY 字节通道、跨读取边界的 UTF-8 解码、ANSI 样式（基础色、亮色、256 色、真彩色、粗体、faint、italic、strikethrough、conceal、blink，RGB 参数安全截断到 0–255）、光标可见性控制（`CSI ?25 h/l` 以反色渲染当前光标单元）、DECSCUSR `CSI Ps SP q` 光标样式状态（块/下划线/竖线）及 alternate-screen/soft-reset 快照语义、DEC bracketed paste 状态跟踪及标准粘贴包装、DEC focus reporting `CSI ?1004 h/l` 与宿主 FocusGained/FocusLost 的 `CSI I`/`CSI O` 通知、alternate screen 下字符/退格/回车/Tab 和 ASCII 控制组合直通 PTY、延迟自动换行（wrap-pending）与禁用自动换行时的宽字符边缘裁剪、宽字符 continuation 元数据及按字符退格/覆盖/清除、`Alt-T` 可逆全屏终端布局、alternate screen（含主屏 links/样式/光标/滚动区域快照恢复）、独立 scrollback、缩窄 resize 时的 scrollback 按列重排、基础鼠标协议转发（SGR/X10/UTF-8 1005）、普通终端鼠标选择按 terminal cell 列处理并保持组合字符选区完整、OSC 8 超链接点击打开（包括 scrollback 浏览中的可视行）、组合字符附着、保存/恢复光标位置、SGR 样式、origin mode 与 autowrap、`CSI r` 局部滚动区域、`CSI L/M/S/T` 区域行编辑与滚动、IND/RI/NEL、CSI Tab/BackTab、DSR `CSI 5 n`/`CSI 6 n` 及私有 `CSI ?6 n` 光标报告、设备属性 `CSI c` 响应、DECRQM `CSI ?Ps $p` 已跟踪模式查询、窗口/屏幕尺寸 `CSI 18 t`/`CSI 19 t` 响应，以及 `CSI J/K/@/P/X/b` 清除、插入、删除和重复字符与元数据同步清理；链接仅允许 `http://`、`https://`，宽字符 continuation 单元清除时会同步清理样式、组合字符和链接元数据；组合字符在退格/光标回退后的附着语义已覆盖，完整终端交互状态仍待实现。
 - 终端 OSC 7 工作目录已解析并按会话保留（支持 BEL/ST 两种终止符，拒绝控制字符）；本地 file:// 或 localhost 路径会作为新 Terminal 标签的启动 cwd，远程 authority 会安全降级为仅显示、不用于本地进程启动。
 - LSP manager、后台通知轮询、didChange/didSave/didClose 同步、5 秒请求超时与 `$/cancelRequest`、diagnostics 行号标记与当前行消息、completion 候选弹层、hover 信息弹层、signature help、document symbols/大纲导航、definition/implementation/type definition/references 位置跳转与多位置选择弹层、workspace-edit Rename、整文件/选区 range formatting 和 Code Action 选择弹层已接入；Code Action 同时支持带 `edit` 的工作区编辑和标准 `command`/`arguments` 命令动作，并通过 `workspace/executeCommand` 执行；Workspace Edit 的 `changes`/`documentChanges` 可写回其他文件，并支持 `CreateFile`/`RenameFile`/`DeleteFile` 资源操作；应用前会预检 URI、目标文件、只读状态、范围合法性、重叠编辑和资源操作覆盖策略，单文件多编辑合并为一次撤销；Rename 现在先展示按文件汇总的可视化预览，资源目标冲突会在预览中显式标注，Enter 应用、Esc 取消；LSP 服务状态已区分启动中、已连接和失败，服务进程异常退出或请求失败会标记失败并从活动客户端移除，后续同步可重新启动服务，状态栏会显示对应状态。
 - Git 目前读取 branch/status/unified diff、保留显式/省略数量的 hunk header、commit 历史和 blame，并支持使用 `porcelain=v1 -z` 安全解析带空格、换行、重命名和复制的路径；支持 Branches 侧栏创建/切换/删除、整文件/单 hunk/批量 stage/unstage、Changes 面板提交及 fetch/pull/push/sync；Changes 面板可用 `d` 打开可滚动的 Output diff 视图，`v` 在 unified/split 视图间切换，`t` 打开独立 Git diff tab，标签内支持 `v` 切换 unified/split、`[`/`]` 选择 hunk，Enter 进入对应文件的可编辑 `HEAD` 基线 diff 模式；Output split 视图也可用 Enter 进入当前变更文件编辑，编辑后行号区实时标记新增/变更行；冲突文件会高亮并支持 Changes 面板 Ours/Theirs 快速检出后暂存，编辑器行号区以 `O`/`B`/`T`/`!` 标识冲突区域，编辑器内还可按标准 diff3 冲突块使用 `Ctrl-Alt-Up/Down` 循环定位、`Ctrl-Alt-O`/`Ctrl-Alt-E`/`Ctrl-Alt-B`/`Ctrl-Alt-K` 选择 Ours/Theirs/Base/Keep Both，`Ctrl-Alt-P` 打开当前冲突块的 Ours/Base/Theirs 三方预览并可直接选择，结果纳入单次 undo；普通保存、Save As 和退出批量保存会检测未解决冲突标记并阻止覆盖文件；远程操作认证失败后提供内存凭据输入、重试和取消，username/password 支持光标编辑与粘贴，凭据仅通过进程环境传给一次性 Git credential helper，不写入日志、配置或工作区。
-- Lua 插件目前能加载基础入口和安全系统 API，插件 keybinding 和 Ctrl-P 命令面板可实际触发已注册 command，`ttt.on` 可订阅 app/document/tick 以及 `tab.open`/`tab.activate`/`tab.close` 生命周期事件，`ttt.set_echo`/`ttt.clear_echo` 可暂时独占并恢复状态栏，sidebar/bottom panel 的 `render` 回调可通过 panel proxy 绘制常用文本/列表/表格，list/table 支持 selected/loading/empty、表格 cells 和右侧标记，以及 pager/tabs/scrollview/dialog/dropdown/password/checkbox/border 等常见 widget 的兼容降级内容；`require("ttt.editor")` 已按 `editor.read` 权限提供活动缓冲区全文、行数组、当前行、当前单词、指定行、行数、光标、选区、选区文本、路径、文件名、语言和多光标快照，`editor.diff()` 可读取活动可编辑 Diff 的变更块并按 `editor.write` 权限通过 `go_to_diff_hunk(index)` 跳转，按 `editor.write` 权限提供插入、整行替换、范围替换、光标/选区和多光标操作，写入复用 Buffer undo checkpoint 并在插件回调后消费，Lua 坐标为 1-based rune 列；插件日志可进入 Output 面板，获得 `terminal.control`/`terminal.read` 权限的插件可通过 `ttt.terminal` 使用受管控的 portable-pty spawn/send/read/screen/resize/focus/close/list 终端 API，`screen` 返回 VT 解析后的可视文本，输出尾部限制为 1 MiB，file handler 已可实际打开为插件视图，支持扩展名和最多 512 字节 `magic` 文件头匹配且 magic 优先，tab proxy 提供 `id`/`title`/`focus`/`set_title`/`close`/`on_close` 入口且 `set_title` 会实际更新视图标题，`ttt.text.width/truncate` 已按终端列宽处理宽字符，`system.exec` 支持受权限保护的 stdin/env/timeout 选项，`exec_async` 已改为后台执行并在主循环回调；manifest 已支持 theme-only 插件、主题 descriptor 和包内路径校验，主题可在启动时加载，并可用 `Ctrl-Alt-T` 在内置/配置/插件主题间循环切换，应用到菜单、编辑器、侧栏、弹窗、Agent 面板、背景、面板、边框和状态栏；终端 ANSI/256 色仍按终端协议语义渲染。尚未覆盖 TTT 的完整交互 widget 状态和终端模块。
+- Git commit history 的首屏分页会锁定初始 HEAD commit hash，后续 Load Older 使用该 hash 加 skip 读取相同历史快照；即使当前分支在翻页期间新增提交，也不会导致页间重复或漏项。
+- Git 远程操作与认证重试会保留发起时的仓库根目录；异步操作完成后仅当该仓库仍是活动根时刷新 Changes，避免多根工作区切换期间更新错仓库状态。
+- Lua 插件目前能加载基础入口和安全系统 API，插件 keybinding 和 Ctrl-P 命令面板可实际触发已注册 command，`ttt.on` 可订阅 app/document/tick 以及 `tab.open`/`tab.activate`/`tab.close` 生命周期事件，`ttt.set_echo`/`ttt.clear_echo` 可暂时独占并恢复状态栏，sidebar/bottom panel 的 `render` 回调可通过 panel proxy 绘制常用文本/列表/表格，list/table 支持 selected/loading/empty、表格 cells 和右侧标记，以及 pager/tabs/scrollview/dialog/dropdown/password/checkbox/border 等常见 widget 的兼容降级内容；交互控件支持键盘焦点循环和面板鼠标命中，自定义 Tab/file view 也复用同一套键盘控件路由，输入/密码、复选框、按钮、下拉、单选、标签和滚动控件的点击会复用同一状态与回调路径；`require("ttt.editor")` 已按 `editor.read` 权限提供活动缓冲区全文、行数组、当前行、当前单词、指定行、行数、光标、选区、选区文本、路径、文件名、语言和多光标快照，`editor.diff()` 可读取活动可编辑 Diff 的变更块并按 `editor.write` 权限通过 `go_to_diff_hunk(index)` 跳转，按 `editor.write` 权限提供插入、整行替换、范围替换、光标/选区和多光标操作，写入复用 Buffer undo checkpoint 并在插件回调后消费，Lua 坐标为 1-based rune 列；插件日志可进入 Output 面板，获得 `terminal.control`/`terminal.read` 权限的插件可通过 `ttt.terminal` 使用受管控的 portable-pty spawn/send/read/screen/resize/focus/close/list 终端 API，`screen` 返回 VT 解析后的可视文本，输出尾部限制为 1 MiB，file handler 已可实际打开为插件视图，支持扩展名和最多 512 字节 `magic` 文件头匹配且 magic 优先，tab proxy 提供 `id`/`title`/`focus`/`set_title`/`close`/`on_close` 入口且 `set_title` 会实际更新视图标题，`ttt.text.width/truncate` 已按终端列宽处理宽字符，`system.exec` 支持受权限保护的 stdin/env/timeout 选项，`exec_async` 已改为后台执行并在主循环回调；manifest 已支持 theme-only 插件、主题 descriptor 和包内路径校验，主题可在启动时加载，并可用 `Ctrl-Alt-T` 在内置/配置/插件主题间循环切换，应用到菜单、编辑器、侧栏、弹窗、Agent 面板、背景、面板、边框和状态栏；终端 ANSI/256 色仍按终端协议语义渲染。完整 TTT 交互 widget 状态与终端模块仍在持续补齐。
+- 自定义 Tab/file view 的插件面板现在同时支持列表/树/表格的方向键、分页、Home/End、快捷命令和 Enter 激活，且与普通 sidebar/bottom panel 共用同一套选择状态、回调和错误处理路径。
 - AI Agent 已具备独立 PTY/VT 会话、独立输入路由、alternate screen 下字符/退格/回车/Tab/鼠标事件直通 PTY、bracketed paste 包装、兼容旧格式的 `agent.command`/`agent.cwd` 配置，以及 `agent.providers`/`agent.active` 多 provider 切换；新增 PATH 可用性检查、`install` 命令配置、显式确认后在普通 Terminal 中执行安装，以及安装完成后的后台可执行文件检测和 Agent PTY 自动重启；新增全局/provider 级 `persist` 配置，存在 tmux 时使用稳定命名的 tmux session 跨 mtide 重启 attach 真实 Agent 进程，未满足条件时回退普通 portable-pty；退出时会以版本化 JSON 原子持久化 active provider、输入缓冲和屏幕文本快照，并对恢复文件执行大小、版本和内容校验，在下次仍配置该 provider 时优先恢复 provider 与会话内容；Agent 及 provider 已支持显式 `tools` 权限清单，并默认拒绝未声明工具；新增受权限和 workspace 根目录限制的结构化 `read_file`/`list_files`/`write_file`/`search` 工具调用入口，写入使用临时文件替换且支持 workspace 内创建新文件，搜索不跟随符号链接并限制结果数量；Agent PTY 的 JSONL `tool_call` 消息现在由主循环异步执行并回写 `tool_result`，沿用同一权限和 workspace 校验。
 
 补充：dialog checkbox 已具备状态保存、含 dropdown/button 混合布局的 Tab/Shift-Tab 焦点切换、Enter/Space 激活、内容行鼠标命中和 `on_change` 回调；dialog password 已接入受控输入、掩码渲染和回调；终端已解析 OSC 0/1/2 窗口/图标标题并显示在 Terminal 面板标题中，支持受 64 KiB 限制的 OSC52 剪贴板接收，并兼容 `ESC Z`、CSI 13/14/16/18/19 t 设备和窗口尺寸查询、DECPAM/DECPNM 应用键盘模式；PTY 退出通知具备幂等语义，只报告一次，主动 close 也具备幂等语义。
@@ -156,7 +177,7 @@ cargo clippy --offline --all-targets --all-features -- -D warnings
 cargo build --offline
 ```
 
-当前基线：`cargo test --offline -- --test-threads=1` 为 497 passed、1 ignored；Clippy 无警告，离线构建通过，`git diff --check` 通过。
+当前验证基线：`cargo test` 为 562 passed、1 ignored；`cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo build` 和 `git diff --check` 通过。兼容烟测对当前上游 `ttt-plugins` checkout 的 53 个插件包逐个加载，并额外将 53 个包同时加载，均可正常退出；该烟测验证入口执行、模块/API 初始化和批量注册，不代表所有外部二进制、网络服务或完整交互流程均已验证。
 
 - VCS 后端已建立 `VcsBackend` trait 与 `GitBackend` adapter，工作区状态读取通过该边界访问 Git；后续可在不改动 UI 面板的前提下接入 `jj` 等实现。
 - 鼠标点击、拖拽/矩形选区和 Alt 多光标现在统一派发插件 `cursor.change`，并覆盖路径、光标、选区和当前单词 payload；插件不会因编辑器输入来源不同而漏收状态变化。
@@ -181,7 +202,7 @@ cargo build --offline
 - 插件运行时销毁会取消未完成的 `system.exec_async`，终止仍登记的 `system.spawn` 子进程；插件终端 PTY 继续由终端管理器统一回收，避免插件卸载后遗留后台进程。
 - LSP 多根回归：新增协议级测试验证同语言同根复用客户端、跨根自动重绑定并清理旧会话。
 - LSP 文件 URI：统一对路径进行 RFC 3986 风格 percent-encoding/decoding，空格、Unicode、百分号路径可稳定用于诊断、同步、补全、Rename 和 Workspace Edit，并拒绝远程 authority 与非法转义。
-- 终端 VT 私有模式批量设置：`CSI ?mode;mode... h/l` 现在逐项应用光标可见性、焦点报告、bracketed paste、鼠标模式、自动换行和 alternate screen 等状态，兼容全屏程序合并发送的模式序列。
+- 终端 VT 私有模式批量设置：`CSI ?mode;mode... h/l` 现在逐项应用光标可见性、焦点报告、bracketed paste、鼠标模式、自动换行和 alternate screen 等状态，兼容全屏程序合并发送的模式序列。Xterm `CSI ? Ps s/r` 另可按需保存/恢复各个已支持 DEC 私有模式，模式查询与保存共享同一状态映射，未知模式不产生伪状态。
 - LSP 签名帮助交互：编辑器在已启用且已配置语言服务器时，输入 `(` 或 `,` 会自动请求 `textDocument/signatureHelp`；手动快捷键仍保持兼容，无 LSP 配置时不会打扰普通输入。
 - LSP 自动补全调度：普通字符、退格和删除会以 150ms debounce 在主循环触发补全请求，连续输入会取消旧计时；编辑时会关闭过期候选，避免旧结果覆盖当前文档。
 - LSP 自动补全生命周期：打开、切换或关闭编辑标签时会清理旧标签的待执行 debounce，避免补全请求串到新活动文档。
@@ -193,6 +214,9 @@ cargo build --offline
 - Git blame 状态栏：加载当前文件 blame 后，状态栏会跟随光标显示当前行的短 commit、作者和提交行摘要，Output 面板仍提供完整逐行 blame 浏览。
 - Git blame 读取已后台化：使用 workspace root、相对路径和 generation 校验回收结果；切换文件、标签或改看 history 时会使旧任务失效，避免慢速 Git 操作阻塞 TUI 或污染当前文件。
 - Git history 读取已后台化：按仓库 root 和 generation 回收提交列表；切换文件或标签会清理旧历史任务和结果，慢速仓库不会阻塞输入线程。
+- Git 提交详情现可从 history 列表按 Enter 打开：后台调用 `git show` 展示作者、提交说明和补丁；`v` 切换 split/unified，`c` 切换变更行/完整上下文并异步重载；Esc/Backspace 返回历史，补丁中的文件引用按当前 `+++ b/path` 所属文件解析，支持 Ctrl-click 跳转。
+- Changes 侧栏已按多根工作区与目录分组为可折叠文件树；Up/Down、Left/Right、Enter 可导航和展开目录，鼠标可选文件或折叠目录，目录行支持批量 stage/unstage/toggle，并保留叶节点 index/worktree 状态。
+- Changes 侧栏现支持 Staged Changes/Changes 分区；混合暂存与工作树修改的文件会在两个分区分别出现，分区和目录行均可折叠并可批量 stage/unstage。`git.fileView` 提供默认 List 与可折叠 Tree，按 `v` 切换并立即保存。
 - Git History 采用每页 10 条的有界后台加载；Output 面板显示“加载更多”提示，按 `]` 追加下一页，并沿用 generation 校验避免旧仓库结果污染当前视图。
 - 终端渲染已读取主题 `colors.terminal` 的 16 色 ANSI 调色板；Basic、Bright 和低位 Indexed 色支持主题覆盖，256 色与 RGB 真彩色保持协议值。
 - Git workspace 状态刷新已后台化：status、branch、branches、Changes 聚合和当前 diff 在同一 generation 任务中读取；主循环按活动仓库 root 回收结果，重复刷新或切换仓库会丢弃旧快照，避免大仓库 Git 命令阻塞输入。
@@ -221,7 +245,8 @@ cargo build --offline
 - 插件 Sidebar/Bottom panel、Drawer 和自定义 Tab 的聚焦 Input/Password 现在接收系统 Paste/bracketed paste，内容按控件状态路由，不会误落入编辑器 Buffer。
 - 新增真实 Lua 插件集成回归：Sidebar 的普通 Input 与 Password 均能接收 `App::handle_paste` 内容并保持各自状态/掩码渲染。
 - Drawer Password 已具备独立状态、Tab/Shift-Tab 焦点、键盘输入、系统粘贴和 `on_change` 回调；渲染始终使用掩码，且不会把密码文本写入插件面板输出。
-- 终端 RIS（`ESC c`）会同时清理挂起的 bell 与 OSC52 剪贴板事件，避免 reset 前事件在新终端状态中延迟生效。
+- 终端 RIS（`ESC c`）会同时清理挂起的 bell 与 OSC52 剪贴板事件，避免 reset 前事件在新终端状态中延迟生效；alternate screen 活动期间的 PTY resize 会同步调整主屏快照网格、滚动区域、tab stop 与已保存光标，退出备用屏幕后恢复到当前尺寸。
+- Markdown `<details>` 折叠扫描会按相同长度反引号分隔符识别 inline code span，并跨行保留 code span 状态，避免多反引号代码内容中的 `</details>` 错误结束折叠区。
 - Git inline conflict parser 遇到残缺或嵌套标记时不会跨标记错误配对，也不会因前一个残缺区块隐藏后续有效冲突区块。
 - 终端 VT 相对光标移动：支持 `CSI n a` 水平相对移动和 `CSI n e` 垂直相对移动，并遵守 origin mode 与屏幕边界。
 - 插件普通面板 `scrollview` 已复用 List 集合状态机，支持 `selected`、方向/Page 导航和 `on_select`，并纳入 Tab/Shift-Tab 焦点循环及焦点显示，不再仅静态渲染。
@@ -232,7 +257,8 @@ cargo build --offline
 - 搜索结果现在会合并所有已打开 tab 的未保存内存内容；搜索结果回车命中已打开文件时直接定位其现有 Buffer，不丢失未保存修改。
 - 多标签搜索状态同步已补齐：打开、切换或关闭 tab 时重新合并当前未保存缓冲区，避免搜索结果残留上一个活动 tab 的内存匹配。
 - 终端鼠标转发已按 DEC 模式过滤：Normal 仅转发按键/滚轮，Button 允许拖拽，Any 才转发裸移动，避免普通鼠标移动污染 PTY。
-- 终端鼠标协议已支持 DEC 1005 UTF-8 与 1015 URXVT 坐标编码，且 `DECRQM` 可准确报告 1000/1002/1003/1005/1006/1015 鼠标模式。
+- 终端 X10 鼠标跟踪模式 DECSET 9 已接入，仅转发按键事件，并与 1000/1002/1003 跟踪模式互斥且支持精确 DECRQM 状态查询。
+- 终端鼠标协议已支持 DEC 1005 UTF-8 与 1015 URXVT 坐标编码，且 `DECRQM` 可准确报告 9/1000/1002/1003/1005/1006/1015 鼠标模式。
 - LSP 补全候选已保留原始 `data`，选择带数据的候选时先调用 `completionItem/resolve`，再应用解析后的 `textEdit`/`insertText`；服务不支持解析时安全回退原候选。
 - LSP 补全还支持标准 `additionalTextEdits`，主编辑与附加编辑按原始 UTF-16 坐标从后向前应用，避免多范围替换发生位置漂移。
 - LSP 补全解析器支持标准 `InsertReplaceEdit`，在同时存在 `insert`/`replace` 时使用 `replace` 范围替换已输入前缀。
@@ -383,7 +409,7 @@ cargo build --offline
 - 终端组合字符清理：覆盖组合标记随基字符擦除、退格覆盖和宽字符边界操作的一致性回归。
 - 终端插入模式：支持 CSI `4h/4l` 插入模式，并在 alternate screen 切换时保存/恢复该状态。
 - 终端自动换行：支持 DEC `CSI ?7 h/l` 自动换行模式，并在 alternate screen 切换时保存/恢复该状态。
-- 终端 alternate screen 兼容：兼容 DEC `CSI ?47 h/l`、`?1047 h/l` 和 `?1049 h/l` 三种切换别名。
+- 终端 alternate screen 按 DEC 语义区分：`?47` 保留备用缓冲区内容，`?1047` 在退出时清除备用缓冲区，`?1049` 进入时清屏并在退出时恢复主屏光标；非活动备用缓冲区随 PTY resize 一并调整，RIS 会丢弃两套屏幕状态和待恢复快照。
 - 终端 origin mode：支持 DEC `CSI ?6 h/l`，滚动区域内的光标寻址可切换局部原点并正确恢复。
 - 终端私有光标状态：支持 `CSI ?1048 h/l` 独立保存/恢复光标位置。
 - 终端 soft reset：支持 DEC `CSI ! p`，重置交互模式与样式而保留当前屏幕内容。
@@ -410,7 +436,7 @@ cargo build --offline
 - 默认工作区清除：新增 `--clear-default-folders`，清空并持久化当前配置的默认启动目录。
 - GitHub PR target：已增加 GitHub Pull Request URL 的安全解析与仓库/编号校验；远程 fetch、review diff、评论加载/提交和按评论定位已接入。
 - Git PR fetch service：Git backend 已提供校验后的 PR head fetch 到 `refs/mtide/pr/<number>`，不切换当前分支；Review diff 展示、评论加载/提交和按评论定位已接入。
-- Git PR diff service：Git backend 已提供基于任意两个 ref 的安全 unified diff 读取，并复用现有 hunk parser；Review UI 已接入 Output 视图、评论加载/提交和按评论定位。
+- Git PR diff service：Git backend 已提供基于任意两个 ref 的安全 unified diff 读取，并复用现有 hunk parser；Review UI 已接入 Output diff 与评论列表切换（`m`）、评论加载/提交和按评论定位；diff 与评论列表状态互不覆盖，可在评论加载后返回 PR diff；PR diff 支持统一 word wrap/high contrast 设置和 split/unified、上下文控制。
 - Git PR App 入口：App 已提供 fetch PR head、读取 `HEAD..PR ref` diff 并切换 Output review 视图的入口，不切换当前分支；GitHub PR URL 已路由到该入口，Output 支持加载评论、提交当前 hunk 评论并按 Enter 跳转到评论文件行。
 - GitHub PR review comment backend：Git backend 已提供受 GitHub 仓库校验、30 秒超时和环境令牌保护的评论列表/行级评论创建接口，令牌不写入日志或配置；Output review 视图可用 `m` 拉取并显示评论，`c` 可针对当前 hunk 输入并提交右侧行级评论，Enter 可定位到评论文件行。
 - 插件 Diff 标签导航：`ttt.open_changes` 自定义标签已接入滚动位置和 hunk 位置状态，支持键盘导航、关闭和回归测试。

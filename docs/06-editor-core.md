@@ -60,7 +60,7 @@ Settings overlay 的 Indent size 行可用 Left/Right 或 Enter 在 2、4、8 �
 
 soft wrap 只改变 viewport 映射，不改变 buffer 行。Up/Down 在 wrap 开启时保持目标 visual row；wrap 关闭时支持 horizontal viewport、键盘滚动和鼠标滚轮。
 
-当前编辑器会依据光标行自动调整垂直 viewport，保证光标在可见区域内；关闭 soft-wrap 时支持按 `Ctrl-Alt-Left/Right` 以 4 个字符为步长水平滚动，并在渲染时自动把光标保持在可见列内；启用 soft-wrap 时按配置列宽计算视觉行并同步光标/垂直滚动映射。启动时按父级到子级合并工作区 `.editorconfig`，支持 `root=true` 截断继承，并读取常用 `indent_style`、`indent_size`、`tab_width`、`insert_final_newline` 和 `trim_trailing_whitespace` 规则。
+当前编辑器会依据光标行自动调整垂直 viewport，保证光标在可见区域内；关闭 soft-wrap 时支持按 `Ctrl-Alt-Left/Right` 或命令面板的 `Scroll Editor Left/Right` 以 4 个显示列为步长水平滚动，并在渲染时自动把光标保持在可见列内；启用 soft-wrap 时按配置列宽计算视觉行并同步光标/垂直滚动映射。启动时按父级到子级合并工作区 `.editorconfig`，支持 `root=true` 截断继承，并读取常用 `indent_style`、`indent_size`、`tab_width`、`insert_final_newline` 和 `trim_trailing_whitespace` 规则。
 
 auto-closing 必须处理成对符号、跳过已有 closing rune、选区包裹和 undo 合并，并提供 opt-in 配置。
 
@@ -74,6 +74,8 @@ auto-closing 必须处理成对符号、跳过已有 closing rune、选区包裹
 编辑器行号区会以 `O`、`B`、`T` 和 `!` 标识冲突内容、Base、Theirs 及冲突分隔线，便于在未解决状态下快速辨识三方区域。
 
 鼠标选择：启用 Crossterm mouse capture 后，编辑区左键点击定位光标，左键拖动创建跨行选区，释放鼠标结束选择；按住 `Alt+Shift` 左键拖动创建矩形/列选区，列选区按每一行独立范围参与复制、剪切、替换和单次撤销；行号栏、水平视口和面板边界不参与文本列计算。
+
+链接导航：按住 Ctrl 移过可见的 HTTP(S) URL 或语法有效的文件引用时显示下划线，悬停只做语法检查，不访问文件系统；Ctrl+左键打开时才校验并解析目标，避免慢文件系统阻塞界面。文件引用可带 `:line` 或 `:line:column`，相对路径按当前源文件目录解析；未命名 Buffer 使用第一个 workspace root。HTTP(S) 地址需包含有效主机，外部打开通过 argv 调用系统 URL handler，不经 shell 解析。当前覆盖普通编辑 Buffer、只读 Git/plugin diff tab、Git commit detail，以及 Output 中的 Changes、PR 评论、Git 历史、Blame、插件 Registry 和日志。
 
 ## 7. 格式化与保存
 
@@ -92,7 +94,7 @@ auto-closing 必须处理成对符号、跳过已有 closing rune、选区包裹
 
 Markdown 文档按 `Ctrl-V` 粘贴时会在后台优先探测 Linux `wl-paste`/`xclip` 的 `image/png` 内容，不阻塞 UI；结果按活动文档路径校验后，图片写入当前文档目录下受控的 `editor.markdownImageDir`（默认 `.mtide/assets`），再插入相对 Markdown 图片链接。资源目录必须是相对路径且不能穿越文档目录；没有图片剪贴板时保持普通文本粘贴路径。
 
-Find overlay 打开时保存原 focus；编辑器按 `Ctrl-F` 打开 Find 时，单行 selection 会初始化 query；Find 与 Replace 可以在同一 overlay 内切换；Ctrl+V、Copy、Cut 必须发送给当前 input 而不是 editor。
+Find 通过 Search 侧栏打开；编辑器按 `Ctrl-F` 时，主选区、列选区和多光标次级选区按顺序检查，第一段非空单行文本初始化 query，跨行内容不继承。搜索焦点下 `Ctrl-R` 切换 Replace；编辑器焦点下 `Ctrl-R` 打开 Replace 并聚焦 query/替换输入，保留已有 query 与 replacement；`Esc` 从搜索栏返回编辑器，编辑器焦点下 `Esc` 关闭 Replace。Ctrl+V 按当前 focus 路由到输入框或编辑器。
 # LSP 快捷操作
 
 标签管理：编辑器焦点下 `Ctrl-Shift-T` 重新打开最近关闭的已保存标签，并恢复其光标、选区、折叠和水平滚动状态；脏标签关闭时仍会被保护。

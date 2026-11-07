@@ -23,6 +23,8 @@ Lua 模块通过 `require("ttt")` 注入，不假设全局变量。插件加载�
 
 `require("ttt.editor")` 已提供受 `editor.read` 权限保护的活动缓冲区只读接口：`buffer_text()`、`buffer_lines()`、`current_line()`、`current_word()`、`get_line(n)`、`line_count()`、`cursor()`、`selection()`、`selection_text()`、`file_path()`、`file_name()`、`language()` 和 `get_cursors()`。`current_word()` 与 Host 编辑事件使用同一 Unicode 单词边界规则；`viewport()` 返回 1-based 的 `top_line`/`bottom_line`、当前可见行数 `height` 和水平 `left_col`；UI 绘制后会同步真实编辑区高度。Lua 行列统一采用 1-based，列按 Unicode rune 计数；没有活动选区时 `selection().active` 为 `false`。
 
+`byte_to_col(text, byte_offset)` 与 `col_to_byte(text, rune_column)` 也使用 1-based 输入和输出，分别把 Lua 字符串字节位置转换为 rune 列、以及把 rune 列转换为 Lua 字符串字节位置；超出文本范围会钳制到末尾位置，宽字符 round-trip 与上游 API 一致。
+
 声明 `editor.write` 后，插件可调用 `insert(line, col, text)`、`set_line(line, text)`、`replace(start_line, start_col, end_line, end_col, text)`、`set_cursor(line, col)`、`set_selection(...)`、`clear_selection()`、`add_cursor(line, col)`、`clear_cursors()` 和 `go_to_diff_hunk(index)`；`editor.diff()` 在活动可编辑 Diff 中返回 `hunks`（`file_path`、`kind`、1-based `line`）及 `current_hunk`，普通文件中返回 `nil`。`begin_undo_group()` / `end_undo_group()` 可将连续写入合并成一次撤销操作，并支持嵌套。写入调用进入 Host 编辑请求队列，在插件回调结束后应用，并复用 Buffer 的 undo checkpoint；非法或越界坐标会被安全限制到当前缓冲区范围。
 
 `require("ttt.events")` 提供与 `ttt.on(event, callback)` 等价的 `events.on(event, callback)` 注册入口。同一事件允许多个插件回调同时订阅，Host 按注册顺序依次触发；单个回调失败会被记录，但不会阻断同一事件的后续回调，派发结束后仍向宿主报告首个插件错误。文件/编辑器事件会附带活动路径及必要的 1-based 行列参数：打开/重载/保存事件传入 `path`，`editor.change`/`cursor.change` 传入 `path, line, col, language, selection_active, selection_text, current_line_text, line_count, dirty, selection_start_line, selection_start_col, selection_end_line, selection_end_col, current_word`；新增选区坐标与当前单词字段追加在原有参数之后，旧插件忽略额外参数即可保持兼容；无选区时四个选区坐标为 `0`。
@@ -33,7 +35,7 @@ Lua 模块通过 `require("ttt")` 注入，不假设全局变量。插件加载�
 
 `require("ttt.bookmarks")` 需要 `editor.bookmarks` 权限，所有操作针对当前活动文件：`set(line, icon, style)`、`get(line)`、`remove(line)`、`set_all(items)`、`get_all()` 和 `clear()`。书签图标显示在编辑器行号区，书签数据只存在当前运行时；插件可自行持久化。设置、移除、批量设置和清空会排队触发 `bookmark.change(path, line, action, icon, style)`；用户点击行号左侧书签列时会触发 `gutter.click(path, line)`，插件可据此实现书签切换。两个事件均受 `editor.bookmarks` 权限保护；没有监听器时点击保持编辑器原有行为。
 
-`require("ttt.automation")` 提供 `run(action, args, callback)`。Host 在主循环串行执行 `session`、`buffer`、`type`、`paste`、`key`、`click`、`drag`、`scroll`、`open`、`screenshot`、`debug` 和 `wait-for` 动作，完成后调用 `callback(result, error)`；返回的取消函数可取消尚未执行或正在等待的请求。`key` 支持常见组合键和空格分隔的连续按键，`scroll` 参数为 `x y signed-count` 且滚动次数上限为 1000，`open` 参数为 JSON 对象字符串；`wait-for` 参数为待匹配屏幕文本，可追加 `timeout=MS`，默认 5000ms、上限 30000ms。`wait-for` 在主循环中轮询，不阻塞 TUI，成功返回 `{matched=true}`，超时返回 `{matched=false, timed_out=true}` 并提供错误信息。该模块是单进程 Host 自动化桥接，跨进程会话服务仍由后续 `ttt.rpc` 适配层提供。
+`require("ttt.automation")` 提供 `run(action, args, callback)`。Host 在主循环串行执行 `session`、`buffer`、`type`、`paste`、`key`、`click`、`drag`、`scroll`、`open`、`screenshot`、`debug` 和 `wait-for` 动作，完成后调用 `callback(result, error)`；返回的取消函数可取消尚未执行或正在等待的请求。`key` 支持常见组合键和空格分隔的连续按键，`scroll` 参数为 `x y signed-count` 且滚动次数上限为 1000，`open` 参数为 JSON 对象字符串；`wait-for` 参数为待匹配屏幕文本，可追加 `timeout=MS`，默认 5000ms、上限 30000ms。`wait-for` 在主循环中轮询，不阻塞 TUI，成功返回 `{matched=true}`，超时返回 `{matched=false, timed_out=true}` 并提供错误信息。该模块是单进程 Host 自动化桥接；需要跨进程会话时可使用已实现的 `ttt.rpc`。
 
 `require("ttt.rpc")` 支持 `connect(endpoint, options, callback)`，接受 `unix:` 和 TCP endpoint，并返回具有 `notify(method, params)`、异步 `request(method, params, callback)`、`close()` 的连接对象；需要 `network.rpc` 权限，出站使用 TTT/LSP 兼容的 JSON-RPC `Content-Length` framing，入站同时兼容旧版换行 JSON。manifest 中 `network.rpc=true` 允许任意 endpoint；字符串数组仅允许精确声明的 TCP/Unix endpoint，空数组拒绝全部连接。`request` 返回可调用的取消函数，取消会删除本地 pending 回调并发送 `$/cancelRequest`，重复取消或响应已到达时返回 `false`。`options.on_notification(method, params)`、`options.on_request(method, params)` 和 `options.on_close()` 分别接收服务端通知、反向请求和断开事件；反向请求回调的返回值会作为 JSON-RPC result，回调异常会转换为错误响应。网络读取在线程中完成，Lua 回调统一在 Host 主循环执行，避免跨线程访问 Lua 状态。
 
@@ -55,7 +57,7 @@ Lua 模块通过 `require("ttt")` 注入，不假设全局变量。插件加载�
 
 `panel:image({data, alt, fit, height})` 兼容 TTT 的嵌入 PNG/JPEG/GIF 字节输入；当前无 Kitty/iTerm 图形协议时使用文本降级（优先显示 `alt`，并保留 `src` 或 data 字节长度），因此图像型插件仍可正常加载和表达内容；`ttt.graphics()` 会报告当前协议能力。
 
-兼容的近期插件 API 还包括 pager、border/title/password input、checkbox（`checked` 与 `label/text`）、table 的 `columns` 标题/自动与固定宽度/`min_width`/left-center-right 对齐、数组行与 `{cells=...}` 行、列 actions 文本与鼠标命令命中、row actions/selected/loading/empty/inset、tree/list right badge（`badge`/`badge_right`）与 `inset`、hstack/vstack/box/scrollview 容器 render、keyvalue、divider、`panel:size()` 当前 Sidebar/Bottom/Drawer/自定义 Tab 内容区尺寸、带坐标的顶层 raw text/cell/clear（支持多行文本、空白填充和区域清理）、hstack align、表格水平滚动（`scroll_x`/`horizontal_scroll` 与可选 `width`，按 Unicode 字符裁剪）、双击选择复制、插件 selectionStyle、插件 tab id/on_close/focus、读取/导航 diff tabs、bundled theme manifest、`ttt.text` terminal-column width、`ttt.terminal` 的 spawn/send/read/screen/focus/close/list 进程终端 API、`sys.spawn` 交互 stdio、`sys.exec` 的 env/timeout/cancel 和 `sys.exec_async` 限长流式输出。普通 Sidebar/Bottom 面板的 `password` 已具备受控状态、鼠标聚焦、字符输入、退格、实时 `on_change` 和等长度掩码渲染；input/password/checkbox/button 之间支持 Tab/Shift-Tab 焦点循环。
+兼容的近期插件 API 还包括 pager、border/title/password input、checkbox（`checked` 与 `label/text`）、table 的 `columns` 标题/自动与固定宽度/`min_width`/left-center-right 对齐、数组行与 `{cells=...}` 行、列 actions 文本与鼠标命令命中、row actions/selected/loading/empty/inset、tree/list right badge（`badge`/`badge_right`）与 `inset`、hstack/vstack/box/scrollview 容器 render、keyvalue、divider、`panel:size()` 当前 Sidebar/Bottom/Drawer/自定义 Tab 内容区尺寸、带坐标的顶层 raw text/cell/clear（支持多行文本、空白填充和区域清理）、hstack align、表格水平滚动（`scroll_x`/`horizontal_scroll` 与可选 `width`，按 Unicode 字符裁剪）、双击选择复制、插件 selectionStyle、插件 tab id/on_close/focus、读取/导航 diff tabs、bundled theme manifest、`ttt.text` terminal-column width、`ttt.terminal` 的 spawn/send/read/screen/focus/close/list 进程终端 API、`sys.spawn` 交互 stdio、`sys.exec` 的 env/timeout/cancel 和 `sys.exec_async` 限长流式输出。普通 Sidebar/Bottom 面板以及自定义 Tab/file handler 视图的 `password`/button 等控件已具备受控状态、鼠标聚焦或激活、字符输入、退格、实时 `on_change`/`on_click` 和等长度掩码渲染；input/password/checkbox/button/dropdown/radio/tabs/scrollview 均支持鼠标命中，控件状态与回调语义和键盘焦点一致；input/password/checkbox/button 之间支持 Tab/Shift-Tab 焦点循环。
 
 权限按文件、网络、process、terminal、storage、screen 和事件订阅拆分；`events.file` 保护 `file.open`/`file.close`/`file.save`，`events.editor` 保护 `editor.change`/`cursor.change`/`tab.change`，`editor.bookmarks` 保护 `bookmark.change`/`gutter.click`，`keybindings` 保护 `key.press`。权限拒绝必须返回可处理错误；插件整体禁用时核心编辑器仍可运行。
 
@@ -122,6 +124,10 @@ Agent 默认输出是 PTY 文本，不直接改变编辑器状态；Agent 进入
 插件/Agent 能够执行外部命令，应在 UI 中明确显示来源、权限和 cwd。日志与 debug dump 脱敏；网络权限默认关闭或按插件声明询问。
 
 Lua 沙箱仅保留 TTT 约定的安全运行时：`os` 只暴露 `time`、`clock`、`date`，`io`、`debug`、动态加载函数和 `print` 等入口被移除；`package` 只允许从内置 `preload` 加载受支持的 `ttt.*` 模块，文件系统、网络和进程能力仍必须经过 manifest 权限校验。
+# TTT 主题插件兼容
+
+插件可通过 `ttt.exec_command("settings.reload")` 请求 Host 从当前配置重新读取主题名，并加载 `{config}/themes/<name>.json`；也兼容将 `theme` 配置为 JSON 文件路径。运行时写入的新主题无需重启即可应用。主题颜色解析兼容 mtide 的 `colors` 语义色及 TTT 原生 `default.fg/bg`、`muted.fg`、`success/warning/danger.fg`、`border.fg`、`borderActive.fg`、`editor.selection.bg`、`editor.searchMatch/searchActive.bg` 和 `terminal` 色板。TTT `syntax` 角色色已映射到轻量 lexer 的注释、字符串、数字、关键字、函数、类型、变量、常量、内建符号、操作符、标点、标题和链接 token；当前选中的 Find 结果使用 `searchActive` 色，其他命中使用 `searchMatch` 色。TextMate `tokenColors` scope selector 与 grammar 专有角色尚未实现。
+
 # 兼容性补充：交互弹层
 
 插件可调用 `ttt.confirm(message, callback)` 打开确认弹层。用户按 Enter 时执行回调，按 Esc 取消；确认期间焦点被 overlay 接管，关闭后恢复原焦点。
@@ -150,7 +156,7 @@ Lua 沙箱仅保留 TTT 约定的安全运行时：`os` 只暴露 `time`、`cloc
 
 `panel:markdown` 同时接受 Markdown 字符串和 `{text = "..."}` 配置表；面板会按行渲染标题、基础 inline 样式，并把 `[label](url)` 显示为可读标签。配置表的 `wrap_width` 会按 Unicode 终端列宽对文本换行；fenced code（反引号或波浪号围栏）会保留围栏及代码原文，不会误处理代码内部的 Markdown 标记。
 
-`panel:label` 同时接受普通字符串和 `{text = "...", badge = "..."}` 配置表；配置表会显示主文本及右侧 badge，兼容插件作者指南中的两种写法。
+`panel:label` 同时接受普通字符串和配置表。配置表支持 `text`、`badge`、`padding_left`、`padding_right`、`margin_top`、`margin_bottom`；间距按终端单元格渲染并限制在 256。`panel:title` 复用相同文本、badge 与间距规则。
 
 `panel:input` 支持可选 `prefix`、`autofocus`、`multiline`、`wrap`、`min_rows` 和 `max_rows`；前缀仅作为不可编辑的显示文本，回调始终只收到输入内容本身。`multiline=true` 时 Enter 插入换行而不是提交，`wrap=true` 按面板 Unicode 列宽换行，`min_rows`/`max_rows` 约束显示高度；`autofocus=true` 会在面板或自定义 Tab 获得焦点时自动聚焦该输入；若同时提供 `value` 与旧式 `text`，受控 `value` 优先。
 
@@ -166,7 +172,7 @@ Lua 沙箱仅保留 TTT 约定的安全运行时：`os` 只暴露 `time`、`cloc
 
 插件可通过 `require("ttt.net")` 使用受 `network.http` 权限保护的 `get`、`post`、`get_async` 和 `post_async`。同步/异步请求都限制为 HTTP(S)、30 秒超时和 10 MiB 响应体，并返回 `{status, body, headers, error?}`；异步网络线程只投递完成事件，Lua 回调在主循环执行。`network.http=true` 允许所有目标；声明字符串数组时按主机名/IP 和可选端口精确匹配，未列出的目标在请求离开进程前即被拒绝，自动重定向也会逐跳执行同样的目标校验。
 
-`require("ttt.fs")` 在 `fs.read` 权限下提供 `read(path)`、`exists(path)` 和 `list(directory)`，在 `fs.write` 权限下提供 `write(path, content)`；插件包目录始终可用，manifest 中的 `true` 会额外允许当前 workspace，字符串数组可声明 `{workspace}`、绝对路径、`~/...`、`{config}/...` 或 `*` 范围。所有实际路径都会在 I/O 前做 canonical 边界校验，`list` 返回按名称排序的 `{name, is_dir}` 数组。文件不存在、目录读取失败等普通 I/O 错误返回 `nil, error_string`；权限拒绝和路径越界仍直接返回 Lua 错误。
+`require("ttt.fs")` 在 `fs.read` 权限下提供 `read(path)`、`exists(path)` 和 `list(directory)`，在 `fs.write` 权限下提供 `write(path, content)`；插件包目录始终可用，manifest 中的 `true` 会额外允许当前 workspace，字符串数组可声明 `{workspace}`、绝对路径、`~/...`、`{config}/...` 或 `*` 范围。`{config}/...` 的路径解析和授权 scope 都以当前设置文件所在配置目录为根。所有实际路径都会在 I/O 前做 canonical 边界校验，`list` 返回按名称排序的 `{name, is_dir}` 数组。文件不存在、目录读取失败等普通 I/O 错误返回 `nil, error_string`；权限拒绝和路径越界仍直接返回 Lua 错误。
 
 `network.http: []` 明确拒绝所有网络目标；只有布尔值 `true` 才表示全目标放行，字符串数组则按声明的主机/IP 与端口精确匹配，重定向继续使用同一策略逐跳校验。
 

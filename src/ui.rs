@@ -8,7 +8,7 @@ use ratatui::{
 };
 use std::sync::{OnceLock, RwLock};
 
-use crate::app::{App, BottomTab, Focus, LspPopup, PluginDialog, SidebarTab};
+use crate::app::{App, BottomTab, ChangeTreeRowKind, Focus, LspPopup, PluginDialog, SidebarTab};
 use crate::config::Theme;
 use crate::git::ConflictBlock;
 use crate::lsp::LspServerState;
@@ -536,6 +536,17 @@ pub fn handle_mouse(app: &mut App, event: MouseEvent, area: Rect) {
                     }
                     _ => {}
                 }
+            } else if app.sidebar_tab() == SidebarTab::Changes
+                && event.row >= body.y.saturating_add(2)
+            {
+                let index = usize::from(event.row.saturating_sub(body.y).saturating_sub(2));
+                match event.kind {
+                    MouseEventKind::Moved => app.changes_tree_hover(index),
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        app.activate_changes_tree_row(index);
+                    }
+                    _ => {}
+                }
             } else if app.sidebar_tab() == SidebarTab::Problems
                 && event.row >= body.y.saturating_add(2)
             {
@@ -546,10 +557,24 @@ pub fn handle_mouse(app: &mut App, event: MouseEvent, area: Rect) {
                 }
             } else if app.sidebar_tab() == SidebarTab::Search
                 && event.row >= body.y.saturating_add(1)
-                && event.row < body.y.saturating_add(4)
                 && matches!(event.kind, MouseEventKind::Down(MouseButton::Left))
             {
-                app.set_search_field(event.row.saturating_sub(body.y).saturating_sub(1) as u8);
+                let field_row = event.row.saturating_sub(body.y).saturating_sub(1);
+                let field = field_row as u8;
+                if field < 3 {
+                    let label_width = [9u16, 10, 10][field as usize];
+                    let cursor = usize::from(
+                        event
+                            .column
+                            .saturating_sub(body.x)
+                            .saturating_sub(1 + label_width),
+                    );
+                    app.set_search_field(field, cursor);
+                } else if field == 4 && app.replace_mode() {
+                    let cursor =
+                        usize::from(event.column.saturating_sub(body.x).saturating_sub(10));
+                    app.set_replace_focus(cursor);
+                }
             }
             return;
         }
@@ -613,6 +638,34 @@ pub fn handle_mouse(app: &mut App, event: MouseEvent, area: Rect) {
             } else {
                 Focus::Terminal
             });
+            if app.bottom_tab() == BottomTab::Output && app.output_reference_lines().is_some() {
+                let content_left = bottom.x.saturating_add(1);
+                let content_top = bottom.y.saturating_add(1);
+                if event.column >= content_left && event.row >= content_top {
+                    let column = usize::from(event.column.saturating_sub(content_left));
+                    let row = usize::from(event.row.saturating_sub(content_top));
+                    match event.kind {
+                        MouseEventKind::Moved => app.update_output_hover(
+                            row,
+                            column,
+                            event
+                                .modifiers
+                                .contains(crossterm::event::KeyModifiers::CONTROL),
+                        ),
+                        MouseEventKind::Down(MouseButton::Left) => {
+                            if event
+                                .modifiers
+                                .contains(crossterm::event::KeyModifiers::CONTROL)
+                                && app.open_output_link_at(row, column)
+                            {
+                                return;
+                            }
+                            app.update_output_hover(row, column, false);
+                        }
+                        _ => {}
+                    }
+                }
+            }
         }
     } else if matches!(event.kind, MouseEventKind::Down(MouseButton::Left)) {
         // Any click in the center (including editor tabs) returns keyboard focus
@@ -702,6 +755,49 @@ pub fn handle_mouse(app: &mut App, event: MouseEvent, area: Rect) {
                         app.set_status_message(format!("Plugin tab mouse failed: {error}"))
                     }
                 }
+            }
+        }
+    }
+    if app.plugin_diff_view_active() && app.focus() == Focus::Editor {
+        if let Some(editor) = editor_content_area(app, area) {
+            let content_left = editor.x.saturating_add(1);
+            let content_top = editor.y.saturating_add(1);
+            let content_width = editor.width.saturating_sub(2);
+            let content_height = editor.height.saturating_sub(2);
+            if event.column >= content_left
+                && event.column < content_left.saturating_add(content_width)
+                && event.row >= content_top
+                && event.row < content_top.saturating_add(content_height)
+            {
+                let x = usize::from(event.column.saturating_sub(content_left));
+                let y = usize::from(event.row.saturating_sub(content_top));
+                let width = content_width.max(1);
+                let height = content_height.max(1);
+                match event.kind {
+                    MouseEventKind::Moved => app.update_plugin_file_view_hover(
+                        y,
+                        x,
+                        width,
+                        height,
+                        event
+                            .modifiers
+                            .contains(crossterm::event::KeyModifiers::CONTROL),
+                    ),
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        if event
+                            .modifiers
+                            .contains(crossterm::event::KeyModifiers::CONTROL)
+                            && app.open_plugin_file_view_link_at(y, x, width, height)
+                        {
+                            return;
+                        }
+                        app.update_plugin_file_view_hover(y, x, width, height, false);
+                    }
+                    MouseEventKind::ScrollUp => app.scroll_plugin_file_view(-3),
+                    MouseEventKind::ScrollDown => app.scroll_plugin_file_view(3),
+                    _ => {}
+                }
+                return;
             }
         }
     }
@@ -1156,18 +1252,47 @@ fn draw_sidebar(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 " "
             }
         };
-        sidebar_text.lines.push(Line::from(Span::styled(
-            format!("{} Search: {}", field_marker(0), app.search_query()),
-            Style::default().fg(theme.foreground),
-        )));
-        sidebar_text.lines.push(Line::from(Span::styled(
-            format!("{} Include: {}", field_marker(1), app.search_include()),
-            Style::default().fg(theme.muted),
-        )));
-        sidebar_text.lines.push(Line::from(Span::styled(
-            format!("{} Exclude: {}", field_marker(2), app.search_exclude()),
-            Style::default().fg(theme.muted),
-        )));
+        let input_line = |marker: &str, label: &str, value: &str, field: u8| {
+            let prefix = format!("{marker} {label}: ");
+            let active = app.focus() == Focus::Search
+                && app.search_field() == field
+                && !(field == 0 && app.replace_mode());
+            if active {
+                let cursor = app.search_input_cursor().min(value.chars().count());
+                let before: String = value.chars().take(cursor).collect();
+                let after: String = value.chars().skip(cursor).collect();
+                Line::from(vec![
+                    Span::styled(prefix, Style::default().fg(theme.foreground)),
+                    Span::styled(before, Style::default().fg(theme.foreground)),
+                    Span::styled("▏", Style::default().fg(theme.accent)),
+                    Span::styled(after, Style::default().fg(theme.foreground)),
+                ])
+            } else {
+                Line::from(Span::styled(
+                    format!("{prefix}{value}"),
+                    Style::default().fg(if app.search_field() == field {
+                        theme.foreground
+                    } else {
+                        theme.muted
+                    }),
+                ))
+            }
+        };
+        sidebar_text
+            .lines
+            .push(input_line(field_marker(0), "Search", app.search_query(), 0));
+        sidebar_text.lines.push(input_line(
+            field_marker(1),
+            "Include",
+            app.search_include(),
+            1,
+        ));
+        sidebar_text.lines.push(input_line(
+            field_marker(2),
+            "Exclude",
+            app.search_exclude(),
+            2,
+        ));
         sidebar_text.lines.push(Line::from(Span::styled(
             if app.search_regex() {
                 "Tab/Shift-Tab fields · Regex"
@@ -1177,10 +1302,23 @@ fn draw_sidebar(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Style::default().fg(theme.muted),
         )));
         if app.replace_mode() {
-            sidebar_text.lines.push(Line::from(Span::styled(
-                format!("Replace: {}", app.replace_query()),
-                Style::default().fg(theme.warning),
-            )));
+            let value = app.replace_query();
+            let cursor = app.search_input_cursor().min(value.chars().count());
+            let before: String = value.chars().take(cursor).collect();
+            let after: String = value.chars().skip(cursor).collect();
+            sidebar_text.lines.push(Line::from(vec![
+                Span::styled("Replace: ", Style::default().fg(theme.warning)),
+                Span::styled(before, Style::default().fg(theme.warning)),
+                Span::styled(
+                    if app.focus() == Focus::Search && app.search_field() == 0 {
+                        "▏"
+                    } else {
+                        ""
+                    },
+                    Style::default().fg(theme.accent),
+                ),
+                Span::styled(after, Style::default().fg(theme.warning)),
+            ]));
             sidebar_text.lines.push(Line::from(Span::styled(
                 "Ctrl-Enter: one · Enter: current file · Ctrl-Shift-Enter: workspace",
                 Style::default().fg(theme.muted),
@@ -1256,7 +1394,7 @@ fn draw_sidebar(frame: &mut Frame<'_>, area: Rect, app: &App) {
         }
     } else if app.sidebar_tab() == SidebarTab::Changes {
         sidebar_text.lines.push(Line::from(Span::styled(
-            "Changes",
+            format!("Changes · {}", app.changes_file_view()),
             Style::default().fg(theme.foreground),
         )));
         if app.changes().is_empty() {
@@ -1265,20 +1403,26 @@ fn draw_sidebar(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 Style::default().fg(theme.positive),
             )));
         } else {
-            for (index, change) in app.changes().iter().take(12).enumerate() {
-                let style = if index == app.change_index() {
+            let change_rows = app.changes_tree_rows();
+            for row in change_rows.iter().skip(app.changes_tree_scroll()).take(12) {
+                let style = if app.changes_tree_row_selected(row) {
                     Style::default().fg(theme.background).bg(theme.accent)
                 } else {
                     Style::default().fg(theme.foreground)
                 };
+                let indent = "  ".repeat(row.depth);
+                let (marker, label, status) = if row.kind == ChangeTreeRowKind::File {
+                    (" ", row.label.clone(), row.status.clone())
+                } else {
+                    (
+                        if row.expanded { "▾" } else { "▸" },
+                        format!("{} ({})", row.label, row.descendant_files),
+                        "  ".to_owned(),
+                    )
+                };
                 sidebar_text.lines.push(Line::from(Span::styled(
-                    format!(
-                        "{}{} {}",
-                        change.index,
-                        change.worktree,
-                        app.change_label(index)
-                    ),
-                    if change.is_conflict() {
+                    format!("{indent}{marker} {status} {label}"),
+                    if row.conflict {
                         style.fg(theme.error)
                     } else {
                         style
@@ -1291,7 +1435,7 @@ fn draw_sidebar(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 format!("Commit: {}", app.commit_message())
             } else {
                 format!(
-                    "Space/s/u stage · c commit · b blame · l log · d diff · h/H hunk · [/ ] hunk {}/{} · o/t ours/theirs · f/p/P sync",
+                    "v list/tree · Space/s/u stage · c commit · b blame · l log · d diff · h/H hunk · [/ ] hunk {}/{} · o/t ours/theirs · f/p/P sync",
                     app.change_hunk_index() + 1,
                     app.change_hunk_count().max(1)
                 )
@@ -1457,6 +1601,7 @@ fn draw_center(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(tabs, vertical[0]);
 
     let content_width = vertical[1].width.saturating_sub(8) as usize;
+    app.set_editor_viewport_width(content_width.max(1));
     let cursor = app.cursor();
     let wrap_width = app
         .word_wrap()
@@ -1465,6 +1610,13 @@ fn draw_center(frame: &mut Frame<'_>, area: Rect, app: &App) {
         display_column(app.file_lines()[cursor.line].as_str(), cursor.column);
     let horizontal_scroll = app
         .horizontal_scroll()
+        .min(
+            app.file_lines()[cursor.line]
+                .chars()
+                .map(char_width)
+                .sum::<usize>()
+                .saturating_sub(content_width),
+        )
         .max(cursor_display_column.saturating_sub(content_width.saturating_sub(1)));
     let mut cursor_visual_row = 0usize;
     let mut cursor_visual_column = 0usize;
@@ -1536,11 +1688,7 @@ fn draw_center(frame: &mut Frame<'_>, area: Rect, app: &App) {
             } else {
                 "      ".to_owned()
             };
-            let background = if selected {
-                theme.selection
-            } else {
-                theme.background
-            };
+            let background = theme.background;
             let foreground = if index == cursor.line {
                 theme.accent
             } else {
@@ -1579,6 +1727,9 @@ fn draw_center(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 &chunk,
                 app.search_query(),
                 app.search_regex(),
+                app.active_search_match_column(index)
+                    .and_then(|column| column.checked_sub(chunk_start_column))
+                    .filter(|column| *column < chunk.chars().count()),
             );
             apply_link_highlight(&mut highlighted, &chunk, app.editor_hover_link(index));
             if let Some(matching) = matching_bracket {
@@ -1596,9 +1747,17 @@ fn draw_center(frame: &mut Frame<'_>, area: Rect, app: &App) {
                     .collect::<Vec<_>>();
                 apply_bracket_highlights(&mut highlighted, &local_columns);
             }
+            apply_diagnostic_highlights(&mut highlighted, index, chunk_start_column, app);
+            apply_selection_highlights(
+                &mut highlighted,
+                index,
+                chunk_start_column,
+                theme.selection,
+                selection_modifier,
+                app,
+            );
             for span in &mut highlighted {
-                span.style = span.style.add_modifier(selection_modifier);
-                if diagnostic.is_some() || decoration.is_some() {
+                if decoration.is_some() {
                     span.style = span.style.add_modifier(Modifier::UNDERLINED);
                 }
             }
@@ -1614,16 +1773,16 @@ fn draw_center(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let natural_scroll_y =
         cursor_visual_row.saturating_sub(vertical[1].height.saturating_sub(3) as usize);
     let scroll_y = app.editor_scroll_line().unwrap_or(natural_scroll_y);
-    let plugin_text = if app.plugin_custom_tab_active() {
+    let plugin_text = if app.plugin_file_view().is_some() {
         app.plugin_file_view_text_sized(
             vertical[1].width.saturating_sub(2),
             vertical[1].height.saturating_sub(2),
         )
     } else {
-        app.plugin_file_view().map(|(_, text)| text.to_owned())
+        None
     };
     let editor = if let Some(text) = plugin_text {
-        Paragraph::new(text.to_owned())
+        Paragraph::new(plugin_view_text(&text, app))
             .block(panel(
                 plugin_title.as_deref().unwrap_or("Plugin"),
                 app.focus() == Focus::Editor,
@@ -1792,7 +1951,16 @@ fn draw_center(frame: &mut Frame<'_>, area: Rect, app: &App) {
             text
         }
         BottomTab::Output => {
-            let output = if !app.blame_lines().is_empty() {
+            let output = if app.commit_detail_active() {
+                let lines = app.output_reference_lines().unwrap_or_default();
+                lines
+                    .iter()
+                    .skip(app.output_scroll())
+                    .take(10)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            } else if !app.blame_lines().is_empty() {
                 app.blame_lines()
                     .iter()
                     .skip(app.output_scroll())
@@ -1855,7 +2023,8 @@ fn draw_center(frame: &mut Frame<'_>, area: Rect, app: &App) {
                         .collect::<Vec<_>>()
                         .join("\n")
                 }
-            } else if !app.pull_request_comments().is_empty() {
+            } else if app.pull_request_comments_visible() && !app.pull_request_comments().is_empty()
+            {
                 app.pull_request_comments()
                     .iter()
                     .skip(app.output_scroll())
@@ -1898,10 +2067,53 @@ fn draw_center(frame: &mut Frame<'_>, area: Rect, app: &App) {
         }
     };
     let mut bottom = bottom;
+    if app.output_reference_lines().is_some() {
+        for (visible_row, line) in bottom.lines.iter_mut().enumerate() {
+            let source_row = app.output_scroll().saturating_add(visible_row);
+            if let Some(link) = app.output_hover_link(source_row) {
+                let text = line
+                    .spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>();
+                *line = line_with_link(&text, link);
+            }
+        }
+    }
     if app.pull_request_comment_mode() {
         bottom
             .lines
             .push(Line::from(format!("Comment: {}", app.commit_message())));
+    }
+    if app.diff_view_active() && app.diff_high_contrast() {
+        for line in &mut bottom.lines {
+            let content = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>();
+            let color = if content.contains(" │ ") {
+                let Some((left, right)) = content.split_once(" │ ") else {
+                    continue;
+                };
+                match (left.trim().is_empty(), right.trim().is_empty()) {
+                    (false, true) => Some(theme.error),
+                    (true, false) => Some(theme.positive),
+                    _ => None,
+                }
+            } else if content.starts_with('+') && !content.starts_with("+++") {
+                Some(theme.positive)
+            } else if content.starts_with('-') && !content.starts_with("---") {
+                Some(theme.error)
+            } else if content.starts_with('…') {
+                Some(theme.warning)
+            } else {
+                None
+            };
+            if let Some(color) = color {
+                line.style = line.style.fg(color);
+            }
+        }
     }
     if let Some(panel_text) = app.plugin_panel_text_sized(
         PluginPanelLocation::Bottom,
@@ -1917,7 +2129,9 @@ fn draw_center(frame: &mut Frame<'_>, area: Rect, app: &App) {
             .lines
             .extend(panel_text.lines().map(|line| Line::from(line.to_owned())));
     }
-    let bottom_title = if app.bottom_tab() == BottomTab::Terminal {
+    let bottom_title = if let Some(title) = app.commit_detail_title() {
+        title
+    } else if app.bottom_tab() == BottomTab::Terminal {
         let title = app.terminal_title();
         let terminal_name = if title.is_empty() {
             if let Some(directory) = app.terminal_working_directory() {
@@ -1946,28 +2160,41 @@ fn draw_center(frame: &mut Frame<'_>, area: Rect, app: &App) {
         format!("{terminal_name} · Ctrl-Shift-T new · Ctrl-Alt-Left/Right switch")
     } else if app.pull_request_comment_mode() {
         "PR comment · Enter submit · Esc cancel".to_owned()
+    } else if app.pull_request_comments_visible() && !app.pull_request_comments().is_empty() {
+        "PR comments · m diff · Enter open comment".to_owned()
+    } else if app.pull_request_comments_visible() {
+        "Loading PR comments… · m diff".to_owned()
     } else if !app.change_diff().is_empty() {
         format!(
-            "Output · Git diff {} · c {} context · Enter/e expand",
-            if app.diff_split() { "split" } else { "unified" },
-            if app.diff_full_context() {
-                "changes"
+            "Output · {} {} · {} · Enter/e expand · m comments",
+            if app.pull_request_review_active() {
+                "PR diff"
             } else {
-                "full"
+                "Git diff"
+            },
+            if app.diff_split() { "split" } else { "unified" },
+            if app.pull_request_review_active() {
+                "c comment"
+            } else if app.diff_full_context() {
+                "c changes"
+            } else {
+                "c full"
             }
         )
     } else {
         app.bottom_tab().label().to_owned()
     };
-    frame.render_widget(
-        Paragraph::new(bottom)
-            .style(Style::default().fg(theme.muted))
-            .block(panel(
-                &bottom_title,
-                app.focus() == Focus::Terminal || app.focus() == Focus::Output,
-            )),
-        vertical[2],
-    );
+    let paragraph = Paragraph::new(bottom)
+        .style(Style::default().fg(theme.muted))
+        .block(panel(
+            &bottom_title,
+            app.focus() == Focus::Terminal || app.focus() == Focus::Output,
+        ));
+    if app.diff_view_active() && app.diff_word_wrap() {
+        frame.render_widget(paragraph.wrap(Wrap { trim: false }), vertical[2]);
+    } else {
+        frame.render_widget(paragraph, vertical[2]);
+    }
 }
 
 fn draw_terminal_fullscreen(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -2113,10 +2340,35 @@ fn highlight_line_with_state(
     background: Color,
     mode: &mut HighlightMode,
 ) -> Vec<Span<'static>> {
-    let theme = active_theme();
+    highlight_line_with_theme_state(text, language, foreground, background, mode, active_theme())
+}
+
+fn highlight_line_with_theme_state(
+    text: &str,
+    language: &str,
+    foreground: Color,
+    background: Color,
+    mode: &mut HighlightMode,
+    theme: Theme,
+) -> Vec<Span<'static>> {
     let chars: Vec<char> = text.chars().collect();
     let mut spans = Vec::new();
     let mut index = 0;
+    if matches!(language, "c" | "cpp" | "h" | "cc" | "hpp" | "hxx" | "cxx") {
+        let first = chars
+            .iter()
+            .position(|character| !character.is_whitespace())
+            .unwrap_or(chars.len());
+        if chars.get(first) == Some(&'#') {
+            return vec![Span::styled(
+                text.to_owned(),
+                Style::default()
+                    .fg(theme.syntax.heading)
+                    .bg(background)
+                    .add_modifier(Modifier::BOLD),
+            )];
+        }
+    }
     if let HighlightMode::MarkdownFence(marker, length) = *mode {
         let first = chars
             .iter()
@@ -2132,7 +2384,7 @@ fn highlight_line_with_state(
             spans.push(Span::styled(
                 text.to_owned(),
                 Style::default()
-                    .fg(theme.accent)
+                    .fg(theme.syntax.code)
                     .bg(background)
                     .add_modifier(Modifier::BOLD),
             ));
@@ -2163,7 +2415,7 @@ fn highlight_line_with_state(
                 spans.push(Span::styled(
                     text.to_owned(),
                     Style::default()
-                        .fg(theme.accent)
+                        .fg(theme.syntax.code)
                         .bg(background)
                         .add_modifier(Modifier::BOLD),
                 ));
@@ -2202,7 +2454,7 @@ fn highlight_line_with_state(
             spans.push(Span::styled(
                 chars[first..end].iter().collect::<String>(),
                 Style::default()
-                    .fg(theme.accent)
+                    .fg(theme.syntax.heading)
                     .bg(background)
                     .add_modifier(Modifier::BOLD),
             ));
@@ -2231,7 +2483,7 @@ fn highlight_line_with_state(
             index = terminator.unwrap_or(chars.len());
             spans.push(Span::styled(
                 chars[start..index].iter().collect::<String>(),
-                Style::default().fg(theme.muted).bg(background),
+                Style::default().fg(theme.syntax.comment).bg(background),
             ));
             if terminator.is_none() {
                 break;
@@ -2244,7 +2496,7 @@ fn highlight_line_with_state(
             if chars[index..].starts_with(&marker) {
                 spans.push(Span::styled(
                     chars[index..].iter().collect::<String>(),
-                    Style::default().fg(theme.muted).bg(background),
+                    Style::default().fg(theme.syntax.comment).bg(background),
                 ));
                 break;
             }
@@ -2263,7 +2515,7 @@ fn highlight_line_with_state(
             }
             spans.push(Span::styled(
                 chars[start..index].iter().collect::<String>(),
-                Style::default().fg(theme.muted).bg(background),
+                Style::default().fg(theme.syntax.comment).bg(background),
             ));
         } else if matches!(character, '"' | '\'' | '`') {
             let quote = character;
@@ -2291,7 +2543,11 @@ fn highlight_line_with_state(
             spans.push(Span::styled(
                 chars[start..index].iter().collect::<String>(),
                 Style::default()
-                    .fg(if is_key { theme.accent } else { theme.warning })
+                    .fg(if is_key {
+                        theme.syntax.property
+                    } else {
+                        theme.syntax.string
+                    })
                     .bg(background),
             ));
         } else if character.is_ascii_digit() {
@@ -2302,7 +2558,7 @@ fn highlight_line_with_state(
             }
             spans.push(Span::styled(
                 chars[start..index].iter().collect::<String>(),
-                Style::default().fg(theme.warning).bg(background),
+                Style::default().fg(theme.syntax.number).bg(background),
             ));
         } else if character.is_ascii_alphabetic() || character == '_' {
             let start = index;
@@ -2313,19 +2569,41 @@ fn highlight_line_with_state(
                 index += 1;
             }
             let word: String = chars[start..index].iter().collect();
-            let color = if is_keyword(language, &word) {
-                theme.accent
+            let color = if is_literal(language, &word) {
+                theme.syntax.constant
+            } else if is_builtin(language, &word) {
+                theme.syntax.builtin
+            } else if is_keyword(language, &word) {
+                theme.syntax.keyword
+            } else if chars[index..]
+                .iter()
+                .find(|character| !character.is_whitespace())
+                == Some(&'(')
+            {
+                theme.syntax.function
+            } else if word.chars().next().is_some_and(char::is_uppercase) {
+                theme.syntax.type_name
             } else {
-                foreground
+                theme.syntax.variable
             };
             spans.push(Span::styled(
                 word,
                 Style::default().fg(color).bg(background),
             ));
         } else {
+            let color = if matches!(
+                character,
+                '+' | '-' | '*' | '/' | '=' | '!' | '<' | '>' | '|' | '&' | '%' | '^' | '~'
+            ) {
+                theme.syntax.operator
+            } else if character.is_ascii_punctuation() {
+                theme.syntax.punctuation
+            } else {
+                foreground
+            };
             spans.push(Span::styled(
                 character.to_string(),
-                Style::default().fg(foreground).bg(background),
+                Style::default().fg(color).bg(background),
             ));
             index += 1;
         }
@@ -2336,7 +2614,31 @@ fn highlight_line_with_state(
     spans
 }
 
-fn apply_search_highlights(spans: &mut [Span<'static>], text: &str, query: &str, use_regex: bool) {
+fn apply_search_highlights(
+    spans: &mut [Span<'static>],
+    text: &str,
+    query: &str,
+    use_regex: bool,
+    active_start_column: Option<usize>,
+) {
+    apply_search_highlights_with_theme(
+        spans,
+        text,
+        query,
+        use_regex,
+        active_start_column,
+        active_theme(),
+    );
+}
+
+fn apply_search_highlights_with_theme(
+    spans: &mut [Span<'static>],
+    text: &str,
+    query: &str,
+    use_regex: bool,
+    active_start_column: Option<usize>,
+    theme: Theme,
+) {
     if query.is_empty() || text.is_empty() {
         return;
     }
@@ -2371,21 +2673,32 @@ fn apply_search_highlights(spans: &mut [Span<'static>], text: &str, query: &str,
     if ranges.is_empty() {
         return;
     }
-    let theme = active_theme();
+    let active_start_byte = active_start_column
+        .and_then(|column| text.char_indices().nth(column).map(|(byte, _)| byte));
     let mut byte_offset = 0;
     for span in spans {
         let span_text = span.content.as_ref();
         let span_start = byte_offset;
         byte_offset += span_text.len();
         let span_end = byte_offset;
-        if ranges
+        let matching_ranges = ranges
             .iter()
-            .any(|range| range.start < span_end && range.end > span_start)
-        {
+            .filter(|range| range.start < span_end && range.end > span_start)
+            .collect::<Vec<_>>();
+        if !matching_ranges.is_empty() {
+            let active = active_start_byte.is_some_and(|active_start| {
+                matching_ranges
+                    .iter()
+                    .any(|range| range.start == active_start)
+            });
             span.style = span
                 .style
                 .fg(theme.background)
-                .bg(theme.warning)
+                .bg(if active {
+                    theme.search_active
+                } else {
+                    theme.search_match
+                })
                 .add_modifier(Modifier::BOLD);
         }
     }
@@ -2407,11 +2720,37 @@ fn apply_link_highlight(spans: &mut [Span<'static>], text: &str, link: Option<&s
         if span_start < end && span_end > start {
             span.style = span
                 .style
-                .fg(active_theme().accent)
+                .fg(active_theme().syntax.link)
                 .add_modifier(Modifier::UNDERLINED);
         }
         offset = span_end;
     }
+}
+
+fn plugin_view_text(text: &str, app: &App) -> Text<'static> {
+    Text::from_iter(text.lines().enumerate().map(|(index, line)| {
+        let Some(link) = app.plugin_file_view_hover_link(index) else {
+            return Line::from(line.to_owned());
+        };
+        line_with_link(line, link)
+    }))
+}
+
+fn line_with_link(line: &str, link: &str) -> Line<'static> {
+    let Some(start) = line.find(link) else {
+        return Line::from(line.to_owned());
+    };
+    let end = start + link.len();
+    Line::from(vec![
+        Span::raw(line[..start].to_owned()),
+        Span::styled(
+            link.to_owned(),
+            Style::default()
+                .fg(active_theme().accent)
+                .add_modifier(Modifier::UNDERLINED),
+        ),
+        Span::raw(line[end..].to_owned()),
+    ])
 }
 
 fn apply_bracket_highlights(spans: &mut Vec<Span<'static>>, columns: &[usize]) {
@@ -2447,11 +2786,69 @@ fn apply_bracket_highlights(spans: &mut Vec<Span<'static>>, columns: &[usize]) {
     *spans = rebuilt;
 }
 
+fn apply_selection_highlights(
+    spans: &mut Vec<Span<'static>>,
+    line: usize,
+    start_column: usize,
+    selection_background: Color,
+    selection_modifier: Modifier,
+    app: &App,
+) {
+    if !app.is_line_selected(line) {
+        return;
+    }
+    let original = std::mem::take(spans);
+    let mut result = Vec::new();
+    let mut column = start_column;
+    for span in original {
+        let style = span.style;
+        for character in span.content.chars() {
+            let mut character_style = style;
+            if app.is_position_selected(line, column) {
+                character_style = character_style
+                    .bg(selection_background)
+                    .add_modifier(selection_modifier);
+            }
+            result.push(Span::styled(character.to_string(), character_style));
+            column += 1;
+        }
+    }
+    *spans = result;
+}
+
+fn apply_diagnostic_highlights(
+    spans: &mut Vec<Span<'static>>,
+    line: usize,
+    start_column: usize,
+    app: &App,
+) {
+    if app.diagnostic_severity(line).is_none() {
+        return;
+    }
+    let original = std::mem::take(spans);
+    let mut result = Vec::new();
+    let mut column = start_column;
+    for span in original {
+        let style = span.style;
+        for character in span.content.chars() {
+            let character_style = if app.is_diagnostic_position(line, column) {
+                style.add_modifier(Modifier::UNDERLINED)
+            } else {
+                style
+            };
+            result.push(Span::styled(character.to_string(), character_style));
+            column += 1;
+        }
+    }
+    *spans = result;
+}
+
 fn comment_prefix(language: &str) -> Option<&'static str> {
     match language {
         "py" | "pyi" | "sh" | "bash" | "zsh" | "yaml" | "yml" | "toml" => Some("#"),
         "lua" => Some("--"),
-        "rs" | "go" | "js" | "jsx" | "ts" | "tsx" | "java" | "c" | "cpp" | "h" => Some("//"),
+        "rs" | "go" | "js" | "jsx" | "ts" | "tsx" | "java" | "c" | "cpp" | "h" | "cc" | "hpp"
+        | "hxx" | "cxx" => Some("//"),
         _ => None,
     }
 }
@@ -2536,9 +2933,140 @@ fn is_keyword(language: &str, word: &str) -> bool {
             word,
             "local" | "function" | "end" | "then" | "do" | "require" | "return" | "and" | "or"
         ),
+        "c" | "cpp" | "h" | "cc" | "hpp" | "hxx" | "cxx" => matches!(
+            word,
+            "auto"
+                | "break"
+                | "case"
+                | "char"
+                | "class"
+                | "const"
+                | "constexpr"
+                | "continue"
+                | "default"
+                | "delete"
+                | "do"
+                | "double"
+                | "else"
+                | "enum"
+                | "extern"
+                | "float"
+                | "for"
+                | "friend"
+                | "goto"
+                | "inline"
+                | "int"
+                | "long"
+                | "namespace"
+                | "new"
+                | "nullptr"
+                | "private"
+                | "protected"
+                | "public"
+                | "register"
+                | "restrict"
+                | "short"
+                | "signed"
+                | "sizeof"
+                | "static"
+                | "struct"
+                | "switch"
+                | "template"
+                | "this"
+                | "typedef"
+                | "typename"
+                | "union"
+                | "unsigned"
+                | "using"
+                | "virtual"
+                | "void"
+                | "volatile"
+                | "while"
+        ),
         _ => false,
     };
     common || language_keyword
+}
+
+fn is_literal(language: &str, word: &str) -> bool {
+    if matches!(word, "true" | "false" | "null" | "nil") {
+        return true;
+    }
+    match language {
+        "rs" => matches!(word, "Some" | "None" | "Ok" | "Err"),
+        "py" | "pyi" => matches!(word, "True" | "False" | "None"),
+        "toml" | "yaml" | "yml" => matches!(word, "true" | "false" | "null"),
+        _ => false,
+    }
+}
+
+fn is_builtin(language: &str, word: &str) -> bool {
+    match language {
+        "rs" | "rust" => matches!(word, "Some" | "None" | "Ok" | "Err" | "String" | "Vec"),
+        "py" | "pyw" | "python" => matches!(
+            word,
+            "print"
+                | "len"
+                | "range"
+                | "str"
+                | "int"
+                | "bool"
+                | "list"
+                | "dict"
+                | "set"
+                | "tuple"
+                | "open"
+                | "enumerate"
+                | "zip"
+                | "map"
+                | "filter"
+        ),
+        "go" => matches!(
+            word,
+            "append"
+                | "cap"
+                | "close"
+                | "copy"
+                | "delete"
+                | "len"
+                | "make"
+                | "new"
+                | "panic"
+                | "recover"
+        ),
+        "js" | "jsx" | "mjs" | "cjs" | "ts" | "tsx" | "typescript" => matches!(
+            word,
+            "Array"
+                | "Boolean"
+                | "Date"
+                | "Error"
+                | "JSON"
+                | "Map"
+                | "Math"
+                | "Number"
+                | "Object"
+                | "Promise"
+                | "Set"
+                | "String"
+                | "Symbol"
+        ),
+        "lua" => matches!(
+            word,
+            "assert"
+                | "error"
+                | "ipairs"
+                | "pairs"
+                | "pcall"
+                | "print"
+                | "require"
+                | "select"
+                | "tonumber"
+                | "tostring"
+                | "type"
+                | "xpcall"
+        ),
+        _ => false,
+    }
 }
 
 fn terminal_style(style: TerminalStyle) -> Style {
@@ -2671,7 +3199,7 @@ fn draw_plugin_palette(frame: &mut Frame<'_>, area: Rect, app: &App) {
 fn draw_settings_overlay(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let theme = active_theme();
     let width = area.width.clamp(34, 64);
-    let height = area.height.clamp(8, 20);
+    let height = area.height.clamp(1, 24);
     let popup = Rect::new(
         area.x + area.width.saturating_sub(width) / 2,
         area.y + area.height.saturating_sub(height) / 3,
@@ -2679,16 +3207,24 @@ fn draw_settings_overlay(frame: &mut Frame<'_>, area: Rect, app: &App) {
         height,
     );
     let rows = app.settings_rows();
+    let visible_rows = popup.height.saturating_sub(3) as usize;
+    let start = app
+        .settings_index()
+        .saturating_sub(visible_rows.saturating_sub(1))
+        .min(rows.len().saturating_sub(visible_rows));
+    let end = (start + visible_rows).min(rows.len());
     let mut lines = vec!["↑/↓ select · Enter/Space toggle · Ctrl-S save · Esc close".to_owned()];
-    lines.extend(rows.iter().enumerate().map(|(index, (label, enabled))| {
-        let marker = if index == app.settings_index() {
-            "▶"
-        } else {
-            " "
-        };
-        let value = if *enabled { "on" } else { "off" };
-        format!("{marker} {label:<24} {value}")
-    }));
+    lines.extend(rows.iter().enumerate().skip(start).take(end - start).map(
+        |(index, (label, enabled))| {
+            let marker = if index == app.settings_index() {
+                "▶"
+            } else {
+                " "
+            };
+            let value = if *enabled { "on" } else { "off" };
+            format!("{marker} {label:<24} {value}")
+        },
+    ));
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(lines.join("\n"))
@@ -3001,7 +3537,7 @@ mod tests {
         let theme = active_theme();
         let mut smart_case =
             highlight_line("Needle needle", "txt", theme.foreground, theme.background);
-        apply_search_highlights(&mut smart_case, "Needle needle", "Needle", false);
+        apply_search_highlights(&mut smart_case, "Needle needle", "Needle", false, None);
         assert_eq!(
             smart_case
                 .iter()
@@ -3011,10 +3547,91 @@ mod tests {
         );
 
         let mut regex = highlight_line("one 42 two", "txt", theme.foreground, theme.background);
-        apply_search_highlights(&mut regex, "one 42 two", r"\d+", true);
+        apply_search_highlights(&mut regex, "one 42 two", r"\d+", true, None);
         assert!(regex
             .iter()
             .any(|span| span.style.bg == Some(theme.warning)));
+    }
+
+    #[test]
+    fn selected_search_match_uses_ttt_active_match_color() {
+        let theme = Theme::from_json(&serde_json::json!({
+            "editor": {
+                "searchMatch": {"bg": "#112233"},
+                "searchActive": {"bg": "#aabbcc"}
+            }
+        }));
+        let mut spans = vec![
+            Span::styled("needle".to_owned(), Style::default()),
+            Span::raw(" ".to_owned()),
+            Span::styled("needle".to_owned(), Style::default()),
+        ];
+        apply_search_highlights_with_theme(
+            &mut spans,
+            "needle needle",
+            "needle",
+            false,
+            Some(7),
+            theme,
+        );
+        assert_eq!(
+            spans[0].style.bg,
+            Some(ratatui::style::Color::Rgb(17, 34, 51))
+        );
+        assert_eq!(
+            spans[2].style.bg,
+            Some(ratatui::style::Color::Rgb(170, 187, 204))
+        );
+    }
+
+    #[test]
+    fn ttt_syntax_theme_colors_drive_lexer_token_roles() {
+        let theme = Theme::from_json(&serde_json::json!({
+            "default": {"fg": "#ffffff", "bg": "#000000"},
+            "syntax": {
+                "keyword": {"fg": "#010203"},
+                "function": {"fg": "#040506"},
+                "number": {"fg": "#070809"},
+                "comment": {"fg": "#0a0b0c"},
+                "builtin": {"fg": "#0d0e0f"}
+            }
+        }));
+        let spans = highlight_line_with_theme_state(
+            "fn run() { 42 } // note",
+            "rs",
+            theme.foreground,
+            theme.background,
+            &mut HighlightMode::Normal,
+            theme,
+        );
+        let color_of = |text: &str| {
+            spans
+                .iter()
+                .find(|span| span.content.as_ref() == text)
+                .and_then(|span| span.style.fg)
+        };
+        assert_eq!(color_of("fn"), Some(ratatui::style::Color::Rgb(1, 2, 3)));
+        assert_eq!(color_of("run"), Some(ratatui::style::Color::Rgb(4, 5, 6)));
+        assert_eq!(color_of("42"), Some(ratatui::style::Color::Rgb(7, 8, 9)));
+        assert_eq!(
+            color_of("// note"),
+            Some(ratatui::style::Color::Rgb(10, 11, 12))
+        );
+        let python = highlight_line_with_theme_state(
+            "len(values)",
+            "py",
+            theme.foreground,
+            theme.background,
+            &mut HighlightMode::Normal,
+            theme,
+        );
+        assert_eq!(
+            python
+                .iter()
+                .find(|span| span.content.as_ref() == "len")
+                .and_then(|span| span.style.fg),
+            Some(ratatui::style::Color::Rgb(13, 14, 15))
+        );
     }
 
     #[test]
@@ -3041,6 +3658,59 @@ mod tests {
         let block_comment =
             highlight_line("/* note */ value", "rs", theme.foreground, theme.background);
         assert_eq!(block_comment[0].style.fg, Some(theme.muted));
+    }
+
+    #[test]
+    fn c_and_cpp_headers_receive_directive_and_keyword_highlighting() {
+        let theme = active_theme();
+        let directive =
+            highlight_line("#include <vector>", "h", theme.foreground, theme.background);
+        assert_eq!(directive[0].style.fg, Some(theme.accent));
+        let declaration =
+            highlight_line("static int main()", "h", theme.foreground, theme.background);
+        let declaration_keywords: Vec<_> = declaration
+            .iter()
+            .filter(|span| matches!(span.content.as_ref(), "static" | "int"))
+            .collect();
+        assert_eq!(declaration_keywords.len(), 2);
+        assert!(declaration_keywords
+            .iter()
+            .all(|span| span.style.fg == Some(theme.accent)));
+        let template = highlight_line(
+            "template <typename T>",
+            "hpp",
+            theme.foreground,
+            theme.background,
+        );
+        let template_keywords: Vec<_> = template
+            .iter()
+            .filter(|span| matches!(span.content.as_ref(), "template" | "typename"))
+            .collect();
+        assert_eq!(template_keywords.len(), 2);
+        assert!(template_keywords
+            .iter()
+            .all(|span| span.style.fg == Some(theme.accent)));
+    }
+
+    #[test]
+    fn literals_receive_distinct_warning_highlighting() {
+        let theme = active_theme();
+        let rust = highlight_line(
+            "let value = Some(true);",
+            "rs",
+            theme.foreground,
+            theme.background,
+        );
+        assert!(rust.iter().any(|span| {
+            span.content.as_ref() == "Some" && span.style.fg == Some(theme.warning)
+        }));
+        assert!(rust.iter().any(|span| {
+            span.content.as_ref() == "true" && span.style.fg == Some(theme.warning)
+        }));
+        let python = highlight_line("value = None", "py", theme.foreground, theme.background);
+        assert!(python.iter().any(|span| {
+            span.content.as_ref() == "None" && span.style.fg == Some(theme.warning)
+        }));
     }
 
     #[test]
@@ -3163,6 +3833,123 @@ mod tests {
             area,
         );
         assert_eq!(app.horizontal_scroll(), 0);
+    }
+
+    #[test]
+    fn search_sidebar_mouse_selects_fields_and_replace_cursor() {
+        let mut app = App::new(&[]).expect("app");
+        app.select_sidebar_tab_by_index(1);
+        app.set_replace_focus(0);
+        let area = Rect::new(0, 0, 120, 40);
+        let sidebar = sidebar_area(&app, area).expect("sidebar area");
+        let body = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(2),
+                Constraint::Min(3),
+                Constraint::Length(3),
+            ])
+            .split(sidebar)[1];
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: body.x + 15,
+                row: body.y + 2,
+                modifiers: KeyModifiers::NONE,
+            },
+            area,
+        );
+        assert_eq!(app.search_field(), 1);
+        assert_eq!(app.search_input_cursor(), 0);
+
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: body.x + 12,
+                row: body.y + 5,
+                modifiers: KeyModifiers::NONE,
+            },
+            area,
+        );
+        assert!(app.replace_mode());
+        assert_eq!(app.search_field(), 0);
+        assert_eq!(app.focus(), Focus::Search);
+    }
+
+    #[test]
+    fn changes_sidebar_renders_hierarchy_and_mouse_collapses_directories() {
+        let root =
+            std::env::temp_dir().join(format!("mtide-ui-changes-tree-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).expect("source directory");
+        assert!(std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&root)
+            .status()
+            .expect("git init")
+            .success());
+        std::fs::write(root.join("src/a.rs"), "a\n").expect("file a");
+        std::fs::write(root.join("src/b.rs"), "b\n").expect("file b");
+        let config = root.with_extension("settings.json");
+        std::fs::write(&config, r#"{"git":{"fileView":"tree"}}"#).expect("settings");
+        let args = vec![
+            "--config".to_owned(),
+            config.to_string_lossy().into_owned(),
+            root.to_string_lossy().into_owned(),
+        ];
+        let mut app = App::new(&args).expect("app");
+        app.select_sidebar_tab_by_index(2);
+        let area = Rect::new(0, 0, 120, 40);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal.draw(|frame| draw(frame, &app)).expect("draw tree");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("src (2)"));
+        assert!(rendered.contains("Changes (2)"));
+        assert!(rendered.contains("a.rs"));
+
+        let sidebar = sidebar_area(&app, area).expect("sidebar area");
+        let body = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(2),
+                Constraint::Min(3),
+                Constraint::Length(3),
+            ])
+            .split(sidebar)[1];
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: body.x + 4,
+                row: body.y + 3,
+                modifiers: KeyModifiers::NONE,
+            },
+            area,
+        );
+        assert_eq!(app.changes_tree_rows().len(), 2);
+        terminal
+            .draw(|frame| draw(frame, &app))
+            .expect("draw collapsed tree");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("▸"));
+        assert!(!rendered.contains("a.rs"));
+        let _ = std::fs::remove_file(config);
+        std::fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]

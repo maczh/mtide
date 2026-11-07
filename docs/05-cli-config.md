@@ -6,7 +6,7 @@
 mtide [options] [files|folders|urls...]
 ```
 
-兼容参数：`--help/-h`、`--version/-v`、`--workspace FILE`、`--config FILE`、`--plugin DIR`（可重复）、`--exec SCRIPT`、`--exec-split-on SEP`、`--size WxH`、`--debug`、`--listen`、`--new-window`、`--clear-default-folders`、`--welcome`、`-`。Rust 版支持这些参数及标准输入目标；`--size WxH` 会在启动时调整 PTY 与 Agent 会话尺寸，`--debug` 会将启动阶段的 `--exec` 动作写入 stderr，`--exec` 接受 JSON 动作数组并支持 `key`、`type`、`paste`、`wait`、`quit`，可用 `--exec-split-on SEP` 将一个参数拆分为多个 JSON 动作数组；当 stdin 或 stdout 不是 TTY 时，带 `--exec` 的调用会使用 80x24（或 `--size` 指定尺寸）执行 headless 自动化，不进入 raw mode，适合 CI 和脚本测试。默认启动实例在当前用户/目录对应的 loopback Unix socket 上监听文件目标，后续调用会转发目标和行列位置；`--listen` 显式保留监听实例，`--new-window` 绕过复用并启动独立实例。
+兼容参数：`--help/-h`、`--version/-v`、`--workspace FILE`、`--config FILE`、`--plugin FILE|DIR`（可重复）、`--exec SCRIPT`、`--exec-split-on SEP`、`--size WxH`、`--debug`、`--listen`、`--new-window`、`--clear-default-folders`、`--welcome`、`-`。`--plugin` 同时接受带 manifest 的入口 Lua 文件和插件目录；指定入口文件时以该文件作为包入口，权限仍按同目录 manifest 执行。`--exec` 兼容 TTT 命令脚本（`key`、`type`、`paste`、`click`、`drag`、`hover`、`exec`、`panel`、`screenshot`、`debug`、`wait`、`wait-for`、`copy`、`quit`）和 JSON 动作数组；脚本默认以未加引号的分号分隔，可用 `--exec-split-on SEP` 选择自定义分隔符。自动化 `type` 按字符派发按键，`paste` 才执行整段粘贴。Rust 版支持这些参数及标准输入目标；`--size WxH` 会在启动时调整 PTY 与 Agent 会话尺寸，`--debug` 会将启动阶段的 `--exec` 动作写入 stderr；当 stdin 或 stdout 不是 TTY 时，带 `--exec` 的调用会使用 80x24（或 `--size` 指定尺寸）执行 headless 自动化，不进入 raw mode，适合 CI 和脚本测试。默认启动实例在当前用户/目录对应的 loopback Unix socket 上监听文件目标，后续调用会转发目标和行列位置；`--listen` 显式保留监听实例，`--new-window` 绕过复用并启动独立实例。
 
 Agent 配置支持 `agent.persist: true` 或 provider 级 `persist: true`（别名 `persistent`/`persist_session`）。当系统存在 `tmux` 时，Agent 会运行在稳定命名的 tmux session 中，mtide 重启后重新 attach 并保留真实进程；未安装 tmux 或未开启该选项时回退到普通 portable-pty。Provider 级设置优先于全局设置。
 
@@ -32,9 +32,11 @@ Agent 配置支持 `agent.persist: true` 或 provider 级 `persist: true`（别�
 
 `editor.markdownImageDir` 配置 Markdown 图片粘贴的资源目录，默认 `.mtide/assets`，只允许相对路径；`editor.autoSave` 默认开启，`editor.autoSaveDelayMs` 默认 5000，范围限制为 500–60000 毫秒。
 
+Git 设置位于 `git`；`git.fileView` 支持 `list` 和 `tree`，默认 `list`。Changes 侧栏按 `v` 切换显示模式并立即保存设置；tree 模式支持目录折叠与目录级暂存操作。
+
 设置覆盖层可直接切换自动保存，并用 Left/Right 在 1/5/10/30 秒延迟间循环。
 
-编辑器包括 `tabSize`、`insertSpaces`、`language`、`wordWrap`、`wordWrapMaxColumn`、`lineNumbers`、`formatOnSave`、`insertFinalNewline`、`trimTrailingWhitespace`、`syntaxHighlight`、`gitGutter`、`diffMode`、`diffContext`、`gutterStyle`、`borderStyle` 和 large-file limits。当前 Rust 版已读取 `editor.language` 作为全局语言回退，并用于状态栏、注释语法、语法着色和 LSP server 选择；编辑器中按 `Ctrl-Alt-L` 可对当前 tab 循环设置语言覆盖，并写入工作区 `.mtide/language-overrides.json`，下次启动或重新打开文件时恢复；未设置 tab 覆盖时依次回退到全局 `editor.language` 和文件扩展名。已读取 `editor.wordWrap`、`editor.wordWrapMaxColumn` 并用于编辑区渲染；启用 `formatOnSave` 时，顶层 `formatters` 中匹配扩展名的外部格式化器优先通过 stdin/stdout 工作，否则回退到 LSP formatting；保存时再按 `insertFinalNewline`/`trimTrailingWhitespace` 规范化文本，LSP formatting 的 `tabSize` 和 `insertSpaces` 使用当前 editor 配置。格式化命令支持 `{file}` 占位符，命令面板提供 `editor.formatExternal` 手动执行。主题 JSON 支持 `colors` 对象及语义色，颜色使用 `#RRGGBB` 或 `#RGB`；插件主题包启动时会自动加载首个有效主题。
+编辑器包括 `tabSize`、`insertSpaces`、`language`、`wordWrap`、`wordWrapMaxColumn`、`lineNumbers`、`formatOnSave`、`insertFinalNewline`、`trimTrailingWhitespace`、`syntaxHighlight`、`gitGutter`、`diffMode`、`diffContext`、`diffWordWrap`、`diffHighContrast`、`gutterStyle`、`borderStyle` 和 large-file limits。当前 Rust 版已读取 `editor.language` 作为全局语言回退，并用于状态栏、注释语法、语法着色和 LSP server 选择；编辑器中按 `Ctrl-Alt-L` 可对当前 tab 循环设置语言覆盖，并写入工作区 `.mtide/language-overrides.json`，下次启动或重新打开文件时恢复；未设置 tab 覆盖时依次回退到全局 `editor.language` 和文件扩展名。已读取 `editor.wordWrap`、`editor.wordWrapMaxColumn` 并用于编辑区渲染；启用 `formatOnSave` 时，顶层 `formatters` 中匹配扩展名的外部格式化器优先通过 stdin/stdout 工作，否则回退到 LSP formatting；保存时再按 `insertFinalNewline`/`trimTrailingWhitespace` 规范化文本，LSP formatting 的 `tabSize` 和 `insertSpaces` 使用当前 editor 配置。格式化命令支持 `{file}` 占位符，命令面板提供 `editor.formatExternal` 手动执行。主题 JSON 支持 mtide `colors` 语义色和原版 TTT 的 `default.fg/bg`、`border`、`editor.selection`、`editor.searchMatch/searchActive`、`terminal` 等颜色 schema，并支持 `syntax` 中注释、字符串、数字、关键字、函数、类型、变量、常量、内建符号、操作符、标点、标题、链接等角色色；颜色使用 `#RRGGBB` 或 `#RGB`。插件可以调用 `ttt.exec_command("settings.reload")` 热加载 `{config}/themes/<name>.json`，无需重启。
 
 搜索配置位于顶层 `search`：`include` 和 `exclude` 为 glob 字符串数组；`include` 为空表示不限制文件类型，`exclude` 可使用 `target/**`、`node_modules/**` 或 `*.generated.*` 等规则。默认排除 `target`、`node_modules`、`vendor`，隐藏目录仍不会被递归扫描。规则同时作用于多根工作区搜索和跨文件替换。Find 面板也提供可运行时编辑的 `Search`、`Include`、`Exclude` 三个字段，按 `Tab`/`Shift-Tab` 或鼠标点击切换焦点，include/exclude 使用逗号分隔的 glob；这些面板值优先于配置文件中的数组，仅影响当前会话。
 
@@ -42,7 +44,7 @@ Agent 配置支持 `agent.persist: true` 或 provider 级 `persist: true`（别�
 
 编辑器焦点下 `Ctrl-O` 打开 Open File 路径弹层；相对路径相对于当前工作区根目录，Enter 打开文件，Esc 取消。`Ctrl-Shift-S` 打开 Save As，保存到新路径后更新当前 tab，已有路径不会被覆盖；`Ctrl-G` 打开 Go to Line，输入 `line` 或 `line:column` 定位；`Ctrl-Enter` 在当前行下方插入保持缩进的新行；`Ctrl-Alt-M` 跳转到当前括号的匹配括号，支持嵌套和跨行；`PageUp/PageDown` 按视口分页移动，按住 Shift 可扩展分页选区；`Ctrl-Home/End` 跳到文件首尾，按住 Shift 可扩展到文件首尾；`Ctrl-Shift-Left/Right` 按词移动并扩展选区，未按 Shift 时按词移动；选中多行时 `Tab` 缩进、`Shift-Tab` 反缩进；`Ctrl-Insert` 复制、`Shift-Delete` 剪切、`Shift-Insert` 粘贴，均与 Ctrl+C/X/V 共享选区、多光标和 OSC52 语义；`Alt-Backspace`/`Ctrl-Backspace` 删除光标前的一个词，`Alt-Delete`/`Ctrl-Delete` 删除光标后的一个词（必要时跨越行边界），选区存在时仍删除选区；终端焦点下 `Alt-T` 切换全屏终端，再次按下恢复编辑器布局；检测到脏文件发生外部变更后，`Ctrl-Alt-R` 显式从磁盘重载并清空该标签撤销栈；`Ctrl-Alt-L` 循环当前 tab 的语言覆盖。`Ctrl-Alt-T` 在已加载主题间循环切换。LSP 快捷键包括 `Ctrl-Space` 补全、`Ctrl-H` 悬停、`Ctrl-Alt-S` 签名帮助、`Ctrl-D` 定义、`Ctrl-Shift-O` 文档符号/大纲；命令面板中的 `Workspace Symbols (Find query)` 使用当前 Find 查询调用跨文件符号搜索。
 
-配置示例：`{"editor":{"diffContext":"changes"},"formatters":{"go":"gofmt","js":"prettier --stdin-filepath {file}"}}`。`editor.diffContext` 支持 `changes`（默认，长安静上下文折叠）和 `full`。外部格式化器非零退出、输出非 UTF-8 或没有文件路径时不会覆盖原文。
+配置示例：`{"editor":{"diffContext":"changes","diffWordWrap":false,"diffHighContrast":false},"formatters":{"go":"gofmt","js":"prettier --stdin-filepath {file}"}}`。`editor.diffContext` 支持 `changes`（默认，长安静上下文折叠）和 `full`；`diffWordWrap` 与 `diffHighContrast` 默认关闭，作为统一默认值作用于 Changes、提交详情与 PR diff。设置面板及命令面板可切换换行/高对比度；命令面板还可选择 changes-only/full context 与 split/unified 显示。外部格式化器非零退出、输出非 UTF-8 或没有文件路径时不会覆盖原文。
 
 AI 补全为可选回退：`ai.enabled` 开启后，当前语言没有可用 LSP 时，自动补全会按 `ai.autoSuggest` 调度 OpenAI-compatible Chat Completions 请求；`Ctrl-Space` 可手动触发。配置 `ai.endpoint`、`ai.model`、`ai.apiKeyEnv`、`ai.maxContextLines` 和 `ai.timeoutMs`，API key 只从环境变量读取，不写入配置或日志。
 
@@ -72,7 +74,7 @@ AI 补全为可选回退：`ai.enabled` 开启后，当前语言没有可用 LSP
 
 ```text
 mtide [OPTIONS] [FILE|DIRECTORY]
-    --plugin DIR       可重复，加载一个 TTT 兼容 Lua 插件包
+    --plugin FILE|DIR  可重复，加载 Lua 插件入口文件或插件包目录
     -h, --help
     --version
 ```
