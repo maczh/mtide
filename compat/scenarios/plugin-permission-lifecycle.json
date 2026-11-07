@@ -1,5 +1,7 @@
 {
   "scenario_id": "plugin-permission-lifecycle",
+  "capability": "plugin-permission-lifecycle",
+  "dependency_class": "external-process",
   "terminal": { "columns": 120, "rows": 40 },
   "oracle": { "program": "ttt", "args": ["--welcome", "--exec", "[{\"action\":\"key\",\"key\":\"ctrl+q\"}]" ] },
   "candidate": { "program": "mtide", "args": ["--welcome", "--exec", "[{\"action\":\"key\",\"key\":\"ctrl+q\"}]" ] }

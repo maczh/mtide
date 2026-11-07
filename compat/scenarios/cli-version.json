@@ -1,5 +1,7 @@
 {
   "scenario_id": "cli-version",
+  "capability": "cli-version",
+  "dependency_class": "external-process",
   "terminal": { "columns": 80, "rows": 24 },
   "oracle": { "program": "ttt", "args": ["--version"] },
   "candidate": { "program": "mtide", "args": ["--version"] }

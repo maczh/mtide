@@ -1,5 +1,7 @@
 {
   "scenario_id": "menus-keybindings",
+  "capability": "menus-keybindings",
+  "dependency_class": "none",
   "terminal": { "columns": 120, "rows": 40 },
   "oracle": { "program": "ttt", "args": ["--welcome", "--exec", "[{\"action\":\"key\",\"key\":\"ctrl+p\"},{\"action\":\"key\",\"key\":\"esc\"},{\"action\":\"key\",\"key\":\"ctrl+q\"}]" ] },
   "candidate": { "program": "mtide", "args": ["--welcome", "--exec", "[{\"action\":\"key\",\"key\":\"ctrl+p\"},{\"action\":\"key\",\"key\":\"esc\"},{\"action\":\"key\",\"key\":\"ctrl+q\"}]" ] }

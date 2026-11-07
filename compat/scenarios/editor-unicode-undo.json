@@ -1,5 +1,7 @@
 {
   "scenario_id": "editor-unicode-undo",
+  "capability": "editor-undo-unicode",
+  "dependency_class": "none",
   "terminal": { "columns": 80, "rows": 24 },
   "oracle": { "program": "ttt", "args": ["--welcome", "--exec", "[{\"action\":\"text\",\"text\":\"界面\"},{\"action\":\"key\",\"key\":\"ctrl+z\"},{\"action\":\"key\",\"key\":\"ctrl+q\"}]" ] },
   "candidate": { "program": "mtide", "args": ["--welcome", "--exec", "[{\"action\":\"text\",\"text\":\"界面\"},{\"action\":\"key\",\"key\":\"ctrl+z\"},{\"action\":\"key\",\"key\":\"ctrl+q\"}]" ] }
