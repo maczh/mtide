@@ -352,6 +352,19 @@ pub struct ScenarioDefinition {
     pub terminal: TerminalSize,
     pub oracle: ScenarioCommand,
     pub candidate: ScenarioCommand,
+    #[serde(default = "default_capability")]
+    pub capability: String,
+    #[serde(default)]
+    pub gui_terminal: bool,
+    #[serde(default = "default_dependency_class")]
+    pub dependency_class: String,
+}
+
+fn default_capability() -> String {
+    "unclassified".to_owned()
+}
+fn default_dependency_class() -> String {
+    "none".to_owned()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -435,6 +448,9 @@ pub struct DifferentialResult {
     pub oracle_normalized: SemanticSnapshot,
     pub candidate_normalized: SemanticSnapshot,
     pub snapshot_diffs: Vec<SnapshotDiff>,
+    pub capability: String,
+    pub gui_terminal: bool,
+    pub dependency_class: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -628,6 +644,9 @@ pub fn run_definition(definition: &ScenarioDefinition) -> DifferentialResult {
         oracle_normalized,
         candidate_normalized,
         snapshot_diffs,
+        capability: definition.capability.clone(),
+        gui_terminal: definition.gui_terminal,
+        dependency_class: definition.dependency_class.clone(),
     }
 }
 
@@ -829,6 +848,9 @@ mod tests {
                 program: "sh".into(),
                 args: vec!["-c".into(), "printf same".into()],
             },
+            capability: "startup-exit".into(),
+            gui_terminal: false,
+            dependency_class: "none".into(),
         };
         let result = run_definition(&definition);
         assert_eq!(result.classification, ResultClass::Success);
