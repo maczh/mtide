@@ -823,4 +823,31 @@ mod tests {
             "fn main() { println!(\"saved\"); }\n"
         );
     }
+
+    #[test]
+    fn editor_semantics_keep_text_cursor_selection_and_dirty_state_visible() {
+        let mut oracle = SemanticSnapshot::empty();
+        oracle.app = serde_json::json!({
+            "text": "界面",
+            "cursor": {"line": 0, "column": 2},
+            "selection": null,
+            "dirty": true,
+            "exit_code": 0
+        });
+        let mut candidate = oracle.clone();
+        candidate.app["dirty"] = serde_json::json!(false);
+        let manifest = ScenarioManifest::new(
+            "editor-unicode-undo",
+            TerminalSize {
+                columns: 80,
+                rows: 24,
+            },
+        );
+        let diffs = diff_snapshots(&oracle, &candidate, &manifest, ResultClass::BehaviorFailure);
+        assert_eq!(
+            diffs.iter().filter(|diff| diff.path == "app.dirty").count(),
+            1
+        );
+        assert!(diffs.iter().all(|diff| diff.path != "app.text"));
+    }
 }
