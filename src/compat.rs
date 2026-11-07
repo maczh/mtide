@@ -1061,4 +1061,24 @@ mod tests {
         assert!(diff_snapshots(&oracle, &candidate, &manifest, ResultClass::Success).is_empty());
         assert_eq!(candidate.app["unknown"]["future"], true);
     }
+
+    #[test]
+    fn workspace_search_keeps_root_and_result_generation_visible() {
+        let mut oracle = SemanticSnapshot::empty();
+        oracle.app = serde_json::json!({"roots": ["one", "two"], "search_generation": 7, "active_file": "two/src/lib.rs"});
+        let mut candidate = oracle.clone();
+        candidate.app["search_generation"] = serde_json::json!(6);
+        let manifest = ScenarioManifest::new(
+            "workspace-search",
+            TerminalSize {
+                columns: 120,
+                rows: 40,
+            },
+        );
+        let diffs = diff_snapshots(&oracle, &candidate, &manifest, ResultClass::BehaviorFailure);
+        assert!(diffs
+            .iter()
+            .any(|diff| diff.path == "app.search_generation"));
+        assert!(diffs.iter().all(|diff| diff.path != "app.roots"));
+    }
 }
