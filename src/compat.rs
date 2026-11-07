@@ -1120,4 +1120,25 @@ mod tests {
         assert!(diffs.iter().any(|diff| diff.path == "protocol.security"));
         assert!(diffs.iter().all(|diff| diff.path != "screen.markdown"));
     }
+
+    #[test]
+    fn lsp_results_keep_generation_and_utf16_position_semantics_visible() {
+        let mut oracle = SemanticSnapshot::empty();
+        oracle.protocol =
+            serde_json::json!({"generation": 4, "position_encoding": "utf-16", "diagnostics": 1});
+        let mut candidate = oracle.clone();
+        candidate.protocol["generation"] = serde_json::json!(3);
+        let manifest = ScenarioManifest::new(
+            "lsp-language-service",
+            TerminalSize {
+                columns: 120,
+                rows: 40,
+            },
+        );
+        let diffs = diff_snapshots(&oracle, &candidate, &manifest, ResultClass::BehaviorFailure);
+        assert!(diffs.iter().any(|diff| diff.path == "protocol.generation"));
+        assert!(diffs
+            .iter()
+            .all(|diff| diff.path != "protocol.position_encoding"));
+    }
 }
