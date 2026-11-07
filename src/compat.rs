@@ -1045,4 +1045,20 @@ mod tests {
         assert!(process.is_cancelled());
         assert!(!process.log.events.is_empty());
     }
+
+    #[test]
+    fn settings_cancel_and_unknown_fields_remain_observable() {
+        let mut oracle = SemanticSnapshot::empty();
+        oracle.app = serde_json::json!({"theme": "dark", "settings_applied": false, "unknown": {"future": true}});
+        let candidate = oracle.clone();
+        let manifest = ScenarioManifest::new(
+            "settings-theme",
+            TerminalSize {
+                columns: 120,
+                rows: 40,
+            },
+        );
+        assert!(diff_snapshots(&oracle, &candidate, &manifest, ResultClass::Success).is_empty());
+        assert_eq!(candidate.app["unknown"]["future"], true);
+    }
 }

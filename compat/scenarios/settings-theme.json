@@ -1,0 +1,8 @@
+{
+  "scenario_id": "settings-theme",
+  "capability": "settings-theme-transaction",
+  "dependency_class": "none",
+  "terminal": { "columns": 120, "rows": 40 },
+  "oracle": { "program": "ttt", "args": ["--welcome", "--exec", "[{\"action\":\"key\",\"key\":\"ctrl+q\"}]" ] },
+  "candidate": { "program": "mtide", "args": ["--welcome", "--exec", "[{\"action\":\"key\",\"key\":\"ctrl+q\"}]" ] }
+}
