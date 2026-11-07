@@ -350,9 +350,14 @@ pub struct DifferentialResult {
     pub oracle: ScenarioResult,
     pub candidate: ScenarioResult,
     pub classification: ResultClass,
+    pub oracle_snapshot: SemanticSnapshot,
+    pub candidate_snapshot: SemanticSnapshot,
+    pub oracle_normalized: SemanticSnapshot,
+    pub candidate_normalized: SemanticSnapshot,
+    pub snapshot_diffs: Vec<SnapshotDiff>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SemanticSnapshot {
     pub schema: String,
     pub meta: serde_json::Value,
@@ -519,13 +524,43 @@ pub fn run_definition(definition: &ScenarioDefinition) -> DifferentialResult {
     let manifest = ScenarioManifest::new(&definition.scenario_id, definition.terminal);
     let oracle = run_scenario(&manifest, "oracle", &definition.oracle);
     let candidate = run_scenario(&manifest, "candidate", &definition.candidate);
-    let classification = compare_results(&oracle, &candidate);
+    let oracle_snapshot = snapshot_from_result(&oracle);
+    let candidate_snapshot = snapshot_from_result(&candidate);
+    let oracle_normalized = normalize_snapshot(&oracle_snapshot, &[]);
+    let candidate_normalized = normalize_snapshot(&candidate_snapshot, &[]);
+    let mut classification = compare_results(&oracle, &candidate);
+    let snapshot_diffs = diff_snapshots(
+        &oracle_normalized,
+        &candidate_normalized,
+        &manifest,
+        ResultClass::BehaviorFailure,
+    );
+    if classification == ResultClass::Success && !snapshot_diffs.is_empty() {
+        classification = ResultClass::BehaviorFailure;
+    }
     DifferentialResult {
         manifest,
         oracle,
         candidate,
         classification,
+        oracle_snapshot,
+        candidate_snapshot,
+        oracle_normalized,
+        candidate_normalized,
+        snapshot_diffs,
     }
+}
+
+pub fn snapshot_from_result(result: &ScenarioResult) -> SemanticSnapshot {
+    let mut snapshot = SemanticSnapshot::empty();
+    snapshot.meta = serde_json::json!({
+        "scenario_id": result.scenario_id,
+        "exit_code": result.exit_code,
+    });
+    snapshot.screen = serde_json::json!({"stdout": result.stdout});
+    snapshot.protocol = serde_json::json!({"stderr": result.stderr});
+    snapshot.lifecycle = serde_json::json!({"class": result.class});
+    snapshot
 }
 
 pub fn compare_results(oracle: &ScenarioResult, candidate: &ScenarioResult) -> ResultClass {
