@@ -850,4 +850,25 @@ mod tests {
         );
         assert!(diffs.iter().all(|diff| diff.path != "app.text"));
     }
+
+    #[test]
+    fn plugin_permission_and_lifecycle_results_are_not_hidden() {
+        let mut oracle = SemanticSnapshot::empty();
+        oracle.protocol = serde_json::json!({"permission": "denied", "command": "fs.write"});
+        oracle.lifecycle = serde_json::json!({"unloaded": true, "stale_callbacks": 0});
+        let mut candidate = oracle.clone();
+        candidate.protocol["permission"] = serde_json::json!("allowed");
+        let manifest = ScenarioManifest::new(
+            "plugin-permission-lifecycle",
+            TerminalSize {
+                columns: 120,
+                rows: 40,
+            },
+        );
+        let diffs = diff_snapshots(&oracle, &candidate, &manifest, ResultClass::BehaviorFailure);
+        assert!(diffs.iter().any(|diff| diff.path == "protocol.permission"));
+        assert!(diffs
+            .iter()
+            .all(|diff| diff.path != "lifecycle.stale_callbacks"));
+    }
 }
