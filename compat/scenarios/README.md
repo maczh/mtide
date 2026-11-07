@@ -8,6 +8,12 @@ cargo run --bin mtide-p0-gate -- \
   --output target/p0-compat-report.json
 ```
 
+Before interpreting a compatibility result, verify the oracle checkout:
+
+```bash
+scripts/verify-ttt-baseline.sh /path/to/ttt
+```
+
 Each JSON file is a `ScenarioDefinition`. `oracle` and `candidate` receive the
 same argument vector. The runner records the manifest, process result, raw and
 normalized six-layer snapshots, and JSON-path differences.
