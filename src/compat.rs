@@ -1081,4 +1081,23 @@ mod tests {
             .any(|diff| diff.path == "app.search_generation"));
         assert!(diffs.iter().all(|diff| diff.path != "app.roots"));
     }
+
+    #[test]
+    fn agent_sessions_keep_provider_identity_and_permission_outcomes_visible() {
+        let mut oracle = SemanticSnapshot::empty();
+        oracle.app = serde_json::json!({"provider": "codex", "session_id": "session-a"});
+        oracle.protocol = serde_json::json!({"tool": "workspace.write", "permission": "denied"});
+        let mut candidate = oracle.clone();
+        candidate.app["session_id"] = serde_json::json!("session-b");
+        let manifest = ScenarioManifest::new(
+            "agent-sessions",
+            TerminalSize {
+                columns: 120,
+                rows: 40,
+            },
+        );
+        let diffs = diff_snapshots(&oracle, &candidate, &manifest, ResultClass::BehaviorFailure);
+        assert!(diffs.iter().any(|diff| diff.path == "app.session_id"));
+        assert!(diffs.iter().all(|diff| diff.path != "protocol.permission"));
+    }
 }
