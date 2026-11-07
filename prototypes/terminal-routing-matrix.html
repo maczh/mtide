@@ -1,0 +1,241 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>mtide 终端快捷键路由原型</title>
+  <style>
+    :root { color-scheme: dark; --bg:#0b1020; --panel:#121a2d; --line:#2b3b61; --text:#e8eefc; --muted:#9caed0; --accent:#5eead4; --warn:#fbbf24; --bad:#fb7185; }
+    * { box-sizing:border-box; }
+    body { margin:0; padding:28px; background:var(--bg); color:var(--text); font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif; }
+    main { max-width:1180px; margin:auto; }
+    h1,h2,h3 { margin:0 0 10px; }
+    h1 { font-size:28px; }
+    h2 { font-size:18px; color:var(--accent); margin-top:26px; }
+    h3 { font-size:15px; }
+    p { color:var(--muted); }
+    .notice,.panel { border:1px solid var(--line); background:var(--panel); border-radius:10px; padding:16px; margin-top:14px; }
+    .notice { border-left:4px solid var(--accent); }
+    .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(230px,1fr)); gap:12px; }
+    button,select { background:#182542; color:var(--text); border:1px solid #40557f; border-radius:6px; padding:8px 10px; cursor:pointer; }
+    button:hover { border-color:var(--accent); }
+    .buttons { display:flex; flex-wrap:wrap; gap:8px; }
+    code,kbd { color:var(--accent); background:#0b1428; border-radius:4px; padding:2px 5px; }
+    .state { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:10px; }
+    .value { color:var(--accent); font-weight:650; word-break:break-word; }
+    .route { margin-top:14px; padding:12px; border-radius:8px; background:#0c162b; border:1px solid var(--line); }
+    .route.host { border-color:var(--accent); }
+    .route.pty { border-color:var(--warn); }
+    .route.blocked { border-color:var(--bad); }
+    table { width:100%; border-collapse:collapse; font-size:14px; }
+    th,td { text-align:left; vertical-align:top; border-bottom:1px solid var(--line); padding:9px 8px; }
+    th { color:var(--accent); }
+    .tabs { display:flex; flex-wrap:wrap; gap:8px; margin-bottom:12px; }
+    .tabs button.active { background:var(--accent); color:#08201d; }
+    .steps button.done { opacity:.55; text-decoration:line-through; }
+    .small { color:var(--muted); font-size:13px; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>mtide 终端快捷键路由原型</h1>
+  <div class="notice">
+    <strong>原型问题：</strong>当 mtide 运行在不同 GUI 终端中时，如何在不破坏交互式 Shell/Agent 输入的前提下，让 ttt 的 Host 快捷键保持一致？<br>
+    这个文件只验证路由状态模型，不是生产实现。重点观察：终端焦点、force key、Super/Cmd 归一化、PTY 直通和回退入口之间是否互相冲突。
+  </div>
+
+  <h2>当前状态</h2>
+  <section class="panel state" id="state"></section>
+  <div id="route" class="route"></div>
+
+  <h2>自由操作</h2>
+  <section class="panel">
+    <div class="buttons" id="actions"></div>
+  </section>
+
+  <h2>受控终端矩阵</h2>
+  <section class="panel">
+    <table>
+      <thead><tr><th>终端/平台</th><th>修饰键风险</th><th>默认策略</th><th>回退验证入口</th></tr></thead>
+      <tbody>
+        <tr><td>Deepin Terminal / Linux</td><td>桌面 Super、Alt 菜单和窗口快捷键可能抢占</td><td>Ctrl Host 组合优先验证；Alt 组合标记为需验证</td><td><kbd>F10</kbd> 菜单、命令面板、菜单项</td></tr>
+        <tr><td>macOS Terminal / iTerm2 / Termius</td><td>Cmd 通常属于终端菜单；Option 可能是 Esc 前缀或 8-bit</td><td>Cmd 只在 Host 层归一化为 Control；PTY/插件事件保留原始修饰键</td><td><kbd>F10</kbd>、菜单栏、命令面板</td></tr>
+        <tr><td>XShell / Windows PowerShell</td><td>Ctrl/Alt 可能被会话、Windows 或终端设置抢占</td><td>先验证 Ctrl Host 组合；不可靠时使用 F10/菜单/命令面板</td><td><kbd>F10</kbd>、菜单栏、命令面板</td></tr>
+        <tr><td>Conex / 其他 GUI 终端</td><td>未知，不能从终端名称推断行为</td><td>按同一协议登记“可传递/被拦截/需配置/不可用”</td><td>菜单和命令面板必须可达</td></tr>
+      </tbody>
+    </table>
+    <p class="small">矩阵中的“需验证”不是兼容承诺。正式支持状态必须来自真实终端测试，而不是静态推断。</p>
+  </section>
+
+  <h2>引导场景</h2>
+  <section class="panel">
+    <div class="tabs" id="tabs"></div>
+    <div id="scenario"></div>
+  </section>
+</main>
+
+<script>
+// Pure routing model. The page below only renders state and dispatches actions.
+const forceKeys = new Set([
+  "ctrl+t", "alt+t", "ctrl+q", "ctrl+p", "ctrl+k p", "ctrl+b"
+]);
+
+const commands = {
+  "ctrl+p": "command.palette",
+  "ctrl+k p": "file.quickOpen",
+  "ctrl+b": "sidebar.toggle",
+  "ctrl+t": "terminal.toggle",
+  "alt+t": "terminal.fullscreen",
+  "ctrl+q": "editor.quit",
+  "alt+shift+m": "menubar.toggle"
+};
+
+const terminalProfiles = {
+  "Deepin Terminal / Linux": { intercept: [], note: "默认假设可传递；实际需要矩阵验证" },
+  "macOS Terminal": { intercept: ["cmd+p", "cmd+t"], note: "Cmd 可能由终端菜单优先消费" },
+  "iTerm2": { intercept: ["cmd+p", "cmd+t"], note: "Cmd/Option 可由 Profile 配置改变" },
+  "Termius": { intercept: ["cmd+p"], note: "按平台和客户端设置验证" },
+  "XShell / Windows": { intercept: ["ctrl+t"], note: "会话快捷键可能消费 Ctrl 组合" },
+  "Windows PowerShell": { intercept: ["alt+t"], note: "窗口/系统快捷键可能消费 Alt 组合" },
+  "Conex / 未知终端": { intercept: ["ctrl+p", "alt+t"], note: "未知终端必须先登记测试结果" }
+};
+
+function initialState() {
+  return {
+    terminal: "Deepin Terminal / Linux",
+    focus: "editor",
+    modifierMode: "control+super",
+    key: "ctrl+p",
+    route: "idle",
+    command: "—",
+    ptyBytes: "—",
+    explanation: "等待输入"
+  };
+}
+
+function normalizeHostKey(key, modifierMode) {
+  if ((modifierMode === "control+super" || modifierMode === "super") && key.startsWith("cmd+")) {
+    return "ctrl+" + key.slice(4);
+  }
+  return key;
+}
+
+function keyToPtyBytes(key) {
+  const special = { "ctrl+p":"\\x10", "ctrl+t":"\\x14", "ctrl+q":"\\x11", "alt+t":"ESC t", "ctrl+b":"\\x02" };
+  return special[key] || (key.startsWith("alt+") ? "ESC " + key.slice(4) : key);
+}
+
+function route(state, action) {
+  const next = { ...state };
+  if (action.type === "terminal") { next.terminal = action.value; next.explanation = "已切换终端配置"; return next; }
+  if (action.type === "focus") { next.focus = action.value; next.explanation = "已切换焦点"; return next; }
+  if (action.type === "modifier") { next.modifierMode = action.value; next.explanation = "已切换 Host 修饰键模式"; return next; }
+  if (action.type !== "key") return next;
+
+  const raw = action.value;
+  const hostKey = normalizeHostKey(raw, state.modifierMode);
+  const profile = terminalProfiles[state.terminal];
+  const intercepted = profile.intercept.includes(raw);
+  const force = forceKeys.has(hostKey);
+  next.key = raw;
+  next.command = "—";
+  next.ptyBytes = "—";
+
+  if (state.focus === "overlay") {
+    next.route = "overlay";
+    next.explanation = "Overlay 拥有最高输入优先级；先由当前输入框/菜单处理";
+    return next;
+  }
+  if (state.focus === "terminal" && force && !intercepted) {
+    next.route = "host";
+    next.command = commands[hostKey] || "Host force key";
+    next.explanation = "force key 穿透 PTY，由 mtide 宿主处理";
+    return next;
+  }
+  if (state.focus === "terminal" && force && intercepted) {
+    next.route = "blocked";
+    next.explanation = "GUI 终端在进入 mtide 前拦截了首选组合；必须使用回退入口或终端配置";
+    return next;
+  }
+  if (commands[hostKey] && state.focus !== "terminal" && !intercepted) {
+    next.route = "host";
+    next.command = commands[hostKey];
+    next.explanation = "编辑器/普通 Host 焦点下命中 ttt 兼容快捷键";
+    return next;
+  }
+  if (state.focus === "terminal") {
+    next.route = "pty";
+    next.ptyBytes = keyToPtyBytes(raw);
+    next.explanation = "非 force key 原样进入交互式 PTY；不做 Super/Cmd 归一化";
+    return next;
+  }
+  next.route = "unhandled";
+  next.explanation = "当前焦点没有匹配命令；应由命令面板或配置绑定提供入口";
+  return next;
+}
+
+const scenarios = [
+  {
+    name: "终端里的 Host force key",
+    intro: "验证终端焦点下 Ctrl+T 是否由 Host 处理，同时普通字符仍进入 PTY。",
+    steps: [s => ({type:"focus", value:"terminal"}), s => ({type:"key", value:"ctrl+t"}), s => ({type:"key", value:"x"})]
+  },
+  {
+    name: "Cmd 只在 Host 层归一化",
+    intro: "验证 macOS Cmd+P 可以触发命令面板，但 PTY 收到的修饰键不被改写。",
+    steps: [s => ({type:"terminal", value:"iTerm2"}), s => ({type:"focus", value:"editor"}), s => ({type:"key", value:"cmd+p"}), s => ({type:"focus", value:"terminal"}), s => ({type:"key", value:"cmd+x"})]
+  },
+  {
+    name: "GUI 终端拦截与回退",
+    intro: "模拟终端拦截首选组合：不能伪称兼容成功，必须显示被拦截并引导 F10/菜单/命令面板。",
+    steps: [s => ({type:"terminal", value:"XShell / Windows"}), s => ({type:"focus", value:"terminal"}), s => ({type:"key", value:"ctrl+t"}), s => ({type:"key", value:"f10"})]
+  },
+  {
+    name: "Overlay 优先级",
+    intro: "验证菜单、查找框等 Overlay 打开时，按键先交给 Overlay，不应误触发 PTY 或全局命令。",
+    steps: [s => ({type:"focus", value:"overlay"}), s => ({type:"key", value:"ctrl+p"}), s => ({type:"focus", value:"terminal"}), s => ({type:"key", value:"ctrl+p"})]
+  }
+];
+
+let state = initialState();
+let activeScenario = 0;
+let stepIndex = 0;
+
+function dispatch(action) { state = route(state, action); render(); }
+
+function render() {
+  const profile = terminalProfiles[state.terminal];
+  document.querySelector("#state").innerHTML = [
+    ["终端", state.terminal], ["焦点", state.focus], ["修饰键模式", state.modifierMode],
+    ["最近按键", state.key], ["路由", state.route], ["命令", state.command], ["PTY 输出", state.ptyBytes]
+  ].map(([label,value]) => `<div><div class="small">${label}</div><div class="value">${value}</div></div>`).join("");
+  const routeEl = document.querySelector("#route");
+  routeEl.className = "route " + (state.route === "host" ? "host" : state.route === "pty" ? "pty" : state.route === "blocked" ? "blocked" : "");
+  routeEl.innerHTML = `<strong>判断：</strong>${state.explanation}<br><span class="small">当前终端备注：${profile.note}</span>`;
+
+  document.querySelector("#actions").innerHTML = [
+    `<label>终端 <select id="terminalSelect">${Object.keys(terminalProfiles).map(name => `<option ${name===state.terminal?"selected":""}>${name}</option>`).join("")}</select></label>`,
+    `<button data-focus="editor">焦点：编辑器</button><button data-focus="terminal">焦点：终端</button><button data-focus="overlay">打开 Overlay</button>`,
+    `<button data-modifier="control+super">Host：Control+Super</button><button data-modifier="super">Host：Super</button>`,
+    ...["ctrl+p","ctrl+k p","ctrl+b","ctrl+t","alt+t","ctrl+q","alt+shift+m","cmd+p","cmd+x","x","f10"].map(key => `<button data-key="${key}">发送 <kbd>${key}</kbd></button>`)
+  ].join("");
+  document.querySelector("#terminalSelect").onchange = e => dispatch({type:"terminal", value:e.target.value});
+  document.querySelectorAll("[data-focus]").forEach(b => b.onclick = () => dispatch({type:"focus", value:b.dataset.focus}));
+  document.querySelectorAll("[data-modifier]").forEach(b => b.onclick = () => dispatch({type:"modifier", value:b.dataset.modifier}));
+  document.querySelectorAll("[data-key]").forEach(b => b.onclick = () => dispatch({type:"key", value:b.dataset.key}));
+  renderScenario();
+}
+
+function renderScenario() {
+  document.querySelector("#tabs").innerHTML = scenarios.map((s,i) => `<button class="${i===activeScenario?"active":""}" data-tab="${i}">${s.name}</button>`).join("");
+  document.querySelectorAll("[data-tab]").forEach(b => b.onclick = () => { activeScenario=Number(b.dataset.tab); stepIndex=0; state=initialState(); render(); });
+  const s = scenarios[activeScenario];
+  const done = stepIndex >= s.steps.length;
+  document.querySelector("#scenario").innerHTML = `<p>${s.intro}</p><div class="buttons">${s.steps.map((_,i) => `<button class="${i<stepIndex?"done":""}" data-step="${i}" ${i!==stepIndex?"disabled":""}>${i+1}. 执行这一步</button>`).join("")}${done?"<span class='value'>场景完成</span>":""}</div>`;
+  document.querySelectorAll("[data-step]").forEach(b => b.onclick = () => { state=route(state, s.steps[Number(b.dataset.step)](state)); stepIndex++; render(); });
+}
+
+render();
+</script>
+</body>
+</html>
