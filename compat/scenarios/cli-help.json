@@ -1,0 +1,6 @@
+{
+  "scenario_id": "cli-help",
+  "terminal": { "columns": 80, "rows": 24 },
+  "oracle": { "program": "ttt", "args": ["--help"] },
+  "candidate": { "program": "mtide", "args": ["--help"] }
+}

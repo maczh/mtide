@@ -268,6 +268,58 @@ pub struct ScenarioDefinition {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CliTargetScenario {
+    pub scenario_id: String,
+    pub target: String,
+    pub kind: CliTargetKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum CliTargetKind {
+    File,
+    Directory,
+    Stdin,
+    Position,
+    Workspace,
+    Invalid,
+}
+
+pub fn cli_target_scenarios() -> Vec<CliTargetScenario> {
+    vec![
+        CliTargetScenario {
+            scenario_id: "cli-file".into(),
+            target: "fixture/main.rs".into(),
+            kind: CliTargetKind::File,
+        },
+        CliTargetScenario {
+            scenario_id: "cli-directory".into(),
+            target: "fixture".into(),
+            kind: CliTargetKind::Directory,
+        },
+        CliTargetScenario {
+            scenario_id: "cli-stdin".into(),
+            target: "-".into(),
+            kind: CliTargetKind::Stdin,
+        },
+        CliTargetScenario {
+            scenario_id: "cli-position".into(),
+            target: "fixture/main.rs:3:5".into(),
+            kind: CliTargetKind::Position,
+        },
+        CliTargetScenario {
+            scenario_id: "cli-workspace".into(),
+            target: "fixture/project.ttt".into(),
+            kind: CliTargetKind::Workspace,
+        },
+        CliTargetScenario {
+            scenario_id: "cli-invalid-target".into(),
+            target: "fixture/missing.rs".into(),
+            kind: CliTargetKind::Invalid,
+        },
+    ]
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ResultClass {
     Success,
     BehaviorFailure,
@@ -748,5 +800,27 @@ mod tests {
         assert_eq!(failed_clipboard.read(), Err("denied".into()));
         assert!(!clock.log.events.is_empty());
         assert!(!files.log.events.is_empty());
+    }
+
+    #[test]
+    fn cli_target_forms_have_stable_ids_and_fixture_side_effects() {
+        let scenarios = cli_target_scenarios();
+        assert_eq!(scenarios.len(), 6);
+        assert_eq!(scenarios[0].scenario_id, "cli-file");
+        assert_eq!(scenarios[1].scenario_id, "cli-directory");
+        assert_eq!(scenarios[2].scenario_id, "cli-stdin");
+        assert_eq!(scenarios[3].scenario_id, "cli-position");
+        assert_eq!(scenarios[4].scenario_id, "cli-workspace");
+        assert_eq!(scenarios[5].kind, CliTargetKind::Invalid);
+
+        let mut files = FileFixture::new("/fixture");
+        files.write("main.rs", "fn main() {}\n").expect("seed");
+        files
+            .write("main.rs", "fn main() { println!(\"saved\"); }\n")
+            .expect("save");
+        assert_eq!(
+            files.read("main.rs").expect("read"),
+            "fn main() { println!(\"saved\"); }\n"
+        );
     }
 }
