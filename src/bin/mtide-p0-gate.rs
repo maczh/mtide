@@ -2,7 +2,16 @@ use mtide::compat::{
     run_definition, DifferentialResult, ResultClass, ScenarioDefinition, SNAPSHOT_SCHEMA,
     TTT_ORACLE_COMMIT,
 };
-use std::{env, fs, path::PathBuf, process::ExitCode};
+use std::{collections::BTreeMap, env, fs, path::PathBuf, process::ExitCode};
+
+#[derive(serde::Serialize)]
+struct PlatformSummary {
+    status: &'static str,
+    executable: usize,
+    passed: usize,
+    failed: usize,
+    environment_failures: usize,
+}
 
 #[derive(serde::Serialize)]
 struct GateReport {
@@ -19,6 +28,17 @@ struct GateReport {
     environment_failures: usize,
     failed: usize,
     flaky: usize,
+    platforms: BTreeMap<String, PlatformSummary>,
+    capability_coverage: BTreeMap<String, CapabilitySummary>,
+    dependency_classes: BTreeMap<String, usize>,
+}
+
+#[derive(serde::Serialize)]
+struct CapabilitySummary {
+    executable: usize,
+    passed: usize,
+    failed: usize,
+    environment_failures: usize,
 }
 
 fn main() -> ExitCode {
@@ -66,6 +86,50 @@ fn main() -> ExitCode {
         .count()
         + environment_failures
         + load_failures;
+    let mut capability_coverage = BTreeMap::new();
+    let mut dependency_classes = BTreeMap::new();
+    for result in &scenarios {
+        let entry = capability_coverage
+            .entry(result.capability.clone())
+            .or_insert(CapabilitySummary {
+                executable: 0,
+                passed: 0,
+                failed: 0,
+                environment_failures: 0,
+            });
+        entry.executable += 1;
+        match result.classification {
+            ResultClass::Success => entry.passed += 1,
+            ResultClass::EnvironmentFailure => entry.environment_failures += 1,
+            ResultClass::BehaviorFailure | ResultClass::ProcessFailure => entry.failed += 1,
+        }
+        *dependency_classes
+            .entry(result.dependency_class.clone())
+            .or_insert(0) += 1;
+    }
+    let current_platform = std::env::consts::OS.to_owned();
+    let mut platforms = ["linux", "macos", "windows"]
+        .into_iter()
+        .map(|platform| {
+            (
+                platform.to_owned(),
+                PlatformSummary {
+                    status: "not-run",
+                    executable: 0,
+                    passed: 0,
+                    failed: 0,
+                    environment_failures: 0,
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    if let Some(summary) = platforms.get_mut(&current_platform) {
+        summary.status = "completed";
+        summary.executable = executable;
+        summary.passed = passed;
+        summary.failed = failed;
+        summary.environment_failures = environment_failures;
+    }
     let report = GateReport {
         report_schema: "mtide.compat.gate.v1",
         oracle_commit: TTT_ORACLE_COMMIT,
@@ -80,6 +144,9 @@ fn main() -> ExitCode {
         environment_failures,
         failed,
         flaky: 0,
+        platforms,
+        capability_coverage,
+        dependency_classes,
     };
     let json = serde_json::to_string_pretty(&report).expect("gate report serializes");
     if let Some(output) = argument("--output") {
