@@ -1017,4 +1017,23 @@ mod tests {
             .iter()
             .all(|diff| diff.path != "lifecycle.stale_callbacks"));
     }
+
+    #[test]
+    fn git_workflow_keeps_commit_and_dirty_side_effects_observable() {
+        let mut oracle = SemanticSnapshot::empty();
+        oracle.app = serde_json::json!({"dirty": false, "branch": "main"});
+        oracle.side_effects = serde_json::json!({"commit": "abc123", "staged": ["src/main.rs"]});
+        let mut candidate = oracle.clone();
+        candidate.side_effects["commit"] = serde_json::json!("def456");
+        let manifest = ScenarioManifest::new(
+            "git-workflow",
+            TerminalSize {
+                columns: 120,
+                rows: 40,
+            },
+        );
+        let diffs = diff_snapshots(&oracle, &candidate, &manifest, ResultClass::BehaviorFailure);
+        assert!(diffs.iter().any(|diff| diff.path == "side_effects.commit"));
+        assert!(diffs.iter().all(|diff| diff.path != "app.dirty"));
+    }
 }
