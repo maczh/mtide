@@ -1036,4 +1036,13 @@ mod tests {
         assert!(diffs.iter().any(|diff| diff.path == "side_effects.commit"));
         assert!(diffs.iter().all(|diff| diff.path != "app.dirty"));
     }
+
+    #[test]
+    fn pty_transcript_preserves_ansi_bytes_and_cancellation() {
+        let mut process = ProcessFixture::new("\u{1b}[31m界面\u{1b}[0m", 0);
+        assert_eq!(process.stdout(), "\u{1b}[31m界面\u{1b}[0m");
+        process.cancel();
+        assert!(process.is_cancelled());
+        assert!(!process.log.events.is_empty());
+    }
 }
