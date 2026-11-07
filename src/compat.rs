@@ -1100,4 +1100,24 @@ mod tests {
         assert!(diffs.iter().any(|diff| diff.path == "app.session_id"));
         assert!(diffs.iter().all(|diff| diff.path != "protocol.permission"));
     }
+
+    #[test]
+    fn output_observability_keeps_source_and_link_security_visible() {
+        let mut oracle = SemanticSnapshot::empty();
+        oracle.screen = serde_json::json!({"markdown": "# Notes", "source": "editor"});
+        oracle.protocol =
+            serde_json::json!({"link": "workspace://README.md", "security": "allowed"});
+        let mut candidate = oracle.clone();
+        candidate.protocol["security"] = serde_json::json!("rejected");
+        let manifest = ScenarioManifest::new(
+            "markdown-output",
+            TerminalSize {
+                columns: 120,
+                rows: 40,
+            },
+        );
+        let diffs = diff_snapshots(&oracle, &candidate, &manifest, ResultClass::BehaviorFailure);
+        assert!(diffs.iter().any(|diff| diff.path == "protocol.security"));
+        assert!(diffs.iter().all(|diff| diff.path != "screen.markdown"));
+    }
 }
