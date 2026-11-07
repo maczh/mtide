@@ -1,3 +1,4 @@
+use std::net::IpAddr;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -203,11 +204,43 @@ fn secure_plugin_endpoint(endpoint: &str) -> bool {
     let Ok(url) = reqwest::Url::parse(endpoint) else {
         return false;
     };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let host_allowed = !host.is_empty()
+        && !host.eq_ignore_ascii_case("localhost")
+        && host
+            .parse::<IpAddr>()
+            .map(|address| is_public_ip(address))
+            .unwrap_or(true);
     url.scheme() == "https"
-        && url.host_str().is_some_and(|host| !host.is_empty())
+        && host_allowed
         && url.username().is_empty()
         && url.password().is_none()
         && url.port().is_none_or(|port| port == 443)
+}
+
+fn is_public_ip(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => {
+            !(address.is_private()
+                || address.is_loopback()
+                || address.is_link_local()
+                || address.is_broadcast()
+                || address.is_unspecified()
+                || address.is_documentation()
+                || address.octets()[0] == 0
+                || (address.octets()[0] == 100 && (64..=127).contains(&address.octets()[1]))
+                || (address.octets()[0] == 198 && (18..=19).contains(&address.octets()[1])))
+        }
+        IpAddr::V6(address) => {
+            !(address.is_loopback()
+                || address.is_unspecified()
+                || address.is_unique_local()
+                || address.is_unicast_link_local()
+                || address.segments()[0] == 0x2001 && address.segments()[1] == 0x0db8)
+        }
+    }
 }
 
 #[allow(dead_code)]
@@ -14397,6 +14430,15 @@ assert(line.active() == true)
             fetch_plugin_registry("https://user:secret@registry.example/plugins.json").is_err()
         );
         assert!(fetch_plugin_registry("https://registry.example:8443/plugins.json").is_err());
+        for host in [
+            "localhost",
+            "127.0.0.1",
+            "10.0.0.1",
+            "[::1]",
+            "169.254.169.254",
+        ] {
+            assert!(fetch_plugin_registry(&format!("https://{host}/plugins.json")).is_err());
+        }
     }
 
     #[test]
