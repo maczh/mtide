@@ -11,6 +11,14 @@ struct PlatformSummary {
     passed: usize,
     failed: usize,
     environment_failures: usize,
+    dependency_classes: BTreeMap<String, usize>,
+}
+
+#[derive(serde::Serialize)]
+struct LoadFailure {
+    path: String,
+    error: String,
+    class: &'static str,
 }
 
 #[derive(serde::Serialize)]
@@ -31,6 +39,7 @@ struct GateReport {
     platforms: BTreeMap<String, PlatformSummary>,
     capability_coverage: BTreeMap<String, CapabilitySummary>,
     dependency_classes: BTreeMap<String, usize>,
+    load_failures: Vec<LoadFailure>,
 }
 
 #[derive(serde::Serialize)]
@@ -56,12 +65,16 @@ fn main() -> ExitCode {
     };
     paths.sort();
     let mut scenarios = Vec::new();
-    let mut load_failures = 0;
+    let mut load_failures = Vec::new();
     for path in paths {
         match load_and_run(&path) {
             Ok(result) => scenarios.push(result),
             Err(error) => {
-                load_failures += 1;
+                load_failures.push(LoadFailure {
+                    path: path.display().to_string(),
+                    error: error.clone(),
+                    class: "environment-failure",
+                });
                 eprintln!("scenario {}: {error}", path.display());
             }
         }
@@ -85,7 +98,7 @@ fn main() -> ExitCode {
         })
         .count()
         + environment_failures
-        + load_failures;
+        + load_failures.len();
     let mut capability_coverage = BTreeMap::new();
     let mut dependency_classes = BTreeMap::new();
     for result in &scenarios {
@@ -119,16 +132,30 @@ fn main() -> ExitCode {
                     passed: 0,
                     failed: 0,
                     environment_failures: 0,
+                    dependency_classes: BTreeMap::new(),
                 },
             )
         })
         .collect::<BTreeMap<_, _>>();
     if let Some(summary) = platforms.get_mut(&current_platform) {
         summary.status = "completed";
-        summary.executable = executable;
-        summary.passed = passed;
-        summary.failed = failed;
-        summary.environment_failures = environment_failures;
+        for result in &scenarios {
+            if result.dependency_class == "none" && !result.gui_terminal {
+                summary.executable += 1;
+                match result.classification {
+                    ResultClass::Success => summary.passed += 1,
+                    ResultClass::EnvironmentFailure => summary.environment_failures += 1,
+                    ResultClass::BehaviorFailure | ResultClass::ProcessFailure => {
+                        summary.failed += 1
+                    }
+                }
+            } else {
+                *summary
+                    .dependency_classes
+                    .entry(result.dependency_class.clone())
+                    .or_insert(0) += 1;
+            }
+        }
     }
     let report = GateReport {
         report_schema: "mtide.compat.gate.v1",
@@ -147,10 +174,14 @@ fn main() -> ExitCode {
         platforms,
         capability_coverage,
         dependency_classes,
+        load_failures,
     };
     let json = serde_json::to_string_pretty(&report).expect("gate report serializes");
     if let Some(output) = argument("--output") {
-        fs::write(output, &json).expect("gate report writes");
+        if let Err(error) = fs::write(&output, &json) {
+            eprintln!("cannot write gate report {output}: {error}");
+            return ExitCode::from(2);
+        }
     } else {
         println!("{json}");
     }
