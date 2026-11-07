@@ -36,10 +36,14 @@ fn main() -> ExitCode {
     };
     paths.sort();
     let mut scenarios = Vec::new();
+    let mut load_failures = 0;
     for path in paths {
         match load_and_run(&path) {
             Ok(result) => scenarios.push(result),
-            Err(error) => eprintln!("scenario {}: {error}", path.display()),
+            Err(error) => {
+                load_failures += 1;
+                eprintln!("scenario {}: {error}", path.display());
+            }
         }
     }
     let executable = scenarios.len();
@@ -59,7 +63,9 @@ fn main() -> ExitCode {
                 ResultClass::BehaviorFailure | ResultClass::ProcessFailure
             )
         })
-        .count();
+        .count()
+        + environment_failures
+        + load_failures;
     let report = GateReport {
         report_schema: "mtide.compat.gate.v1",
         oracle_commit: TTT_ORACLE_COMMIT,
@@ -81,7 +87,7 @@ fn main() -> ExitCode {
     } else {
         println!("{json}");
     }
-    if failed > 0 || report.flaky > 0 {
+    if executable == 0 || failed > 0 || report.flaky > 0 {
         ExitCode::from(1)
     } else {
         ExitCode::SUCCESS

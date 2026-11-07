@@ -180,7 +180,14 @@ impl ProcessFixture {
         self.log.record("process.cancel", serde_json::Value::Null);
     }
     pub fn bounded_output(&self, max_bytes: usize) -> &str {
-        &self.stdout[..self.stdout.len().min(max_bytes)]
+        let end = self
+            .stdout
+            .char_indices()
+            .map(|(index, _)| index)
+            .take_while(|index| *index <= max_bytes)
+            .last()
+            .unwrap_or(0);
+        &self.stdout[..end]
     }
 }
 
@@ -793,6 +800,8 @@ mod tests {
         process.cancel();
         assert!(process.cancelled);
         assert_eq!(process.bounded_output(3), "012");
+        let unicode_process = ProcessFixture::new("界面", 0);
+        assert_eq!(unicode_process.bounded_output(1), "");
 
         let mut clipboard = ClipboardFixture::success("copied");
         assert_eq!(clipboard.read(), Ok("copied"));
