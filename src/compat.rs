@@ -4,12 +4,217 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     env,
+    path::{Path, PathBuf},
     process::{Command, ExitStatus, Stdio},
+    time::Duration,
 };
 
 pub const TTT_ORACLE_COMMIT: &str = "afa48edc0b35539423062bafef747dca610fbd5b";
 pub const MANIFEST_SCHEMA: &str = "mtide.compat.manifest.v1";
 pub const SNAPSHOT_SCHEMA: &str = "mtide.compat.snapshot.v1";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FixtureEvent {
+    pub kind: String,
+    pub value: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FixtureLog {
+    pub events: Vec<FixtureEvent>,
+}
+
+impl FixtureLog {
+    pub fn record(&mut self, kind: impl Into<String>, value: serde_json::Value) {
+        self.events.push(FixtureEvent {
+            kind: kind.into(),
+            value,
+        });
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManualClock {
+    now_ms: u64,
+    pub log: FixtureLog,
+}
+
+impl ManualClock {
+    pub fn new() -> Self {
+        Self {
+            now_ms: 0,
+            log: FixtureLog::default(),
+        }
+    }
+    pub fn now_ms(&self) -> u64 {
+        self.now_ms
+    }
+    pub fn advance(&mut self, duration: Duration) {
+        self.now_ms = self.now_ms.saturating_add(duration.as_millis() as u64);
+        self.log
+            .record("clock.advance", serde_json::json!({"now_ms": self.now_ms}));
+    }
+}
+
+impl Default for ManualClock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManualScheduler {
+    next_id: u64,
+    timers: BTreeMap<u64, u64>,
+    pub log: FixtureLog,
+}
+
+impl ManualScheduler {
+    pub fn new() -> Self {
+        Self {
+            next_id: 1,
+            timers: BTreeMap::new(),
+            log: FixtureLog::default(),
+        }
+    }
+    pub fn schedule(&mut self, clock: &ManualClock, delay: Duration) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.timers
+            .insert(id, clock.now_ms().saturating_add(delay.as_millis() as u64));
+        self.log
+            .record("timer.schedule", serde_json::json!({"id": id}));
+        id
+    }
+    pub fn due(&self, clock: &ManualClock, id: u64) -> bool {
+        self.timers
+            .get(&id)
+            .is_some_and(|deadline| *deadline <= clock.now_ms())
+    }
+    pub fn cancel(&mut self, id: u64) -> bool {
+        self.timers.remove(&id).is_some()
+    }
+}
+
+impl Default for ManualScheduler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FileFixture {
+    root: PathBuf,
+    files: BTreeMap<PathBuf, String>,
+    pub log: FixtureLog,
+}
+
+impl FileFixture {
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self {
+            root: root.into(),
+            files: BTreeMap::new(),
+            log: FixtureLog::default(),
+        }
+    }
+    pub fn write(
+        &mut self,
+        path: impl AsRef<Path>,
+        contents: impl Into<String>,
+    ) -> Result<(), String> {
+        let path = self.scoped(path)?;
+        self.files.insert(path.clone(), contents.into());
+        self.log
+            .record("fs.write", serde_json::json!({"path": path}));
+        Ok(())
+    }
+    pub fn read(&self, path: impl AsRef<Path>) -> Result<&str, String> {
+        let path = self.scoped(path)?;
+        self.files
+            .get(&path)
+            .map(String::as_str)
+            .ok_or_else(|| "not found".into())
+    }
+    pub fn rename(&mut self, from: impl AsRef<Path>, to: impl AsRef<Path>) -> Result<(), String> {
+        let from = self.scoped(from)?;
+        let to = self.scoped(to)?;
+        let contents = self
+            .files
+            .remove(&from)
+            .ok_or_else(|| "not found".to_owned())?;
+        self.files.insert(to.clone(), contents);
+        self.log
+            .record("fs.rename", serde_json::json!({"from": from, "to": to}));
+        Ok(())
+    }
+    fn scoped(&self, path: impl AsRef<Path>) -> Result<PathBuf, String> {
+        let path = path.as_ref();
+        if path.is_absolute() || path.components().any(|part| part.as_os_str() == "..") {
+            return Err("path outside fixture root".into());
+        }
+        Ok(self.root.join(path))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProcessFixture {
+    pub stdout: String,
+    pub stderr: String,
+    pub exit_code: Option<i32>,
+    pub cancelled: bool,
+    pub log: FixtureLog,
+}
+
+impl ProcessFixture {
+    pub fn new(stdout: impl Into<String>, exit_code: i32) -> Self {
+        Self {
+            stdout: stdout.into(),
+            stderr: String::new(),
+            exit_code: Some(exit_code),
+            cancelled: false,
+            log: FixtureLog::default(),
+        }
+    }
+    pub fn cancel(&mut self) {
+        self.cancelled = true;
+        self.log.record("process.cancel", serde_json::Value::Null);
+    }
+    pub fn bounded_output(&self, max_bytes: usize) -> &str {
+        &self.stdout[..self.stdout.len().min(max_bytes)]
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClipboardFixture {
+    text: Option<String>,
+    failure: Option<String>,
+    pub log: FixtureLog,
+}
+
+impl ClipboardFixture {
+    pub fn success(text: impl Into<String>) -> Self {
+        Self {
+            text: Some(text.into()),
+            failure: None,
+            log: FixtureLog::default(),
+        }
+    }
+    pub fn failure(message: impl Into<String>) -> Self {
+        Self {
+            text: None,
+            failure: Some(message.into()),
+            log: FixtureLog::default(),
+        }
+    }
+    pub fn read(&mut self) -> Result<&str, String> {
+        self.log.record("clipboard.read", serde_json::Value::Null);
+        match (&self.text, &self.failure) {
+            (Some(text), _) => Ok(text),
+            (_, Some(error)) => Err(error.clone()),
+            _ => Err("clipboard empty".into()),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ScenarioManifest {
@@ -515,5 +720,33 @@ mod tests {
         ] {
             assert!(encoded.get(layer).is_some());
         }
+    }
+
+    #[test]
+    fn manual_clock_scheduler_and_fixtures_are_replayable() {
+        let mut clock = ManualClock::new();
+        let mut scheduler = ManualScheduler::new();
+        let timer = scheduler.schedule(&clock, Duration::from_millis(100));
+        assert!(!scheduler.due(&clock, timer));
+        clock.advance(Duration::from_millis(100));
+        assert!(scheduler.due(&clock, timer));
+
+        let mut files = FileFixture::new("/fixture");
+        files.write("a.txt", "hello").expect("write");
+        files.rename("a.txt", "b.txt").expect("rename");
+        assert_eq!(files.read("b.txt"), Ok("hello"));
+        assert!(files.read("../escape").is_err());
+
+        let mut process = ProcessFixture::new("012345", 0);
+        process.cancel();
+        assert!(process.cancelled);
+        assert_eq!(process.bounded_output(3), "012");
+
+        let mut clipboard = ClipboardFixture::success("copied");
+        assert_eq!(clipboard.read(), Ok("copied"));
+        let mut failed_clipboard = ClipboardFixture::failure("denied");
+        assert_eq!(failed_clipboard.read(), Err("denied".into()));
+        assert!(!clock.log.events.is_empty());
+        assert!(!files.log.events.is_empty());
     }
 }
